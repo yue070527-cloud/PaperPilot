@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.spec
+venv/
+.venv/
+*.so
+
+# IDE
+.vscode/
+.idea/
+
+# Testing
+*.db
+*.sqlite3
+
+# Cache
+*.cache/
+diskcache_cache/
+*.pkl
+
+# Local config
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
