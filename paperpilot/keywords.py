@@ -1,7 +1,18 @@
-"""关键词提取接口 —— 搭档实现。
+"""关键词提取接口。
 
 Phase 1 用 KeyBERT，后续可扩展其他方案。
 """
+
+from keybert import KeyBERT
+
+_kw_model = None
+
+
+def _get_model() -> KeyBERT:
+    global _kw_model
+    if _kw_model is None:
+        _kw_model = KeyBERT()
+    return _kw_model
 
 
 def extract_keywords(topic_description: str, top_n: int = 10) -> list[str]:
@@ -14,7 +25,13 @@ def extract_keywords(topic_description: str, top_n: int = 10) -> list[str]:
     Returns:
         关键词字符串列表，如 ["perovskite", "stability", "solar cell"]
     """
-    raise NotImplementedError("搭档实现")
+    model = _get_model()
+    results = model.extract_keywords(
+        topic_description,
+        top_n=top_n,
+        stop_words="english",
+    )
+    return [kw for kw, _ in results]
 
 
 def merge_keywords(auto_keywords: list[str], manual_keywords: list[str]) -> list[str]:
