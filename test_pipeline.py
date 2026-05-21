@@ -104,7 +104,7 @@ print("[PASS] 去重逻辑正确")
 
 # ── 6. 向量索引测试 ──
 print("\n" + "=" * 50)
-print("6. 向量索引测试")
+print("6. 向量索引测试（本地多语言模型）")
 print("=" * 50)
 
 test_papers = [
@@ -114,25 +114,21 @@ test_papers = [
     {"title": "Federated learning survey", "abstract": "A comprehensive survey of federated learning approaches for privacy-preserving machine learning."},
 ]
 
-# 先试离线模式（MiniLM）
-print("  尝试离线模式（MiniLM）...")
 try:
-    idx, indexed_papers = build_index(test_papers, mode="offline")
-    print(f"[PASS] 离线索引构建成功: {len(indexed_papers)} 篇论文")
+    idx, indexed_papers = build_index(test_papers)
+    print(f"[PASS] 索引构建成功: {len(indexed_papers)} 篇论文")
 
     results = search_similar(
         "钙钛矿太阳能电池稳定性",
-        idx, indexed_papers, top_k=2, mode="offline"
+        idx, indexed_papers, top_k=2
     )
     print(f"  检索 Top 2:")
     for i, (paper, score) in enumerate(results):
         print(f"    {i+1}. [{score:.3f}] {paper['title'][:50]}...")
 
-    # 验证第一篇应该是钙钛矿相关的
     assert "perovskite" in results[0][0]["title"].lower() or "perovskite" in results[0][0]["abstract"].lower()
-    print("[PASS] 离线排序结果正确：钙钛矿相关论文排在最前")
+    print("[PASS] 排序结果正确：钙钛矿相关论文排在最前")
 
-    # 持久化测试
     from paperpilot.indexer import save_index, load_index
     save_index(idx, "test_index.faiss")
     loaded = load_index("test_index.faiss")
@@ -140,19 +136,7 @@ try:
     os.remove("test_index.faiss")
 
 except Exception as e:
-    print(f"[WARN] 离线模式失败（MiniLM 模型可能需下载）: {e}")
-
-# 再试在线模式（DeepSeek）
-print("  尝试在线模式（DeepSeek）...")
-try:
-    idx2, indexed2 = build_index(test_papers, mode="online")
-    results2 = search_similar(
-        "钙钛矿太阳能电池稳定性",
-        idx2, indexed2, top_k=2, mode="online"
-    )
-    print(f"  [PASS] 在线检索成功: Top 1 = {results2[0][0]['title'][:50]}... [{results2[0][1]:.3f}]")
-except Exception as e:
-    print(f"[WARN] 在线模式失败（需 DEEPSEEK_API_KEY）: {str(e)[:80]}")
+    print(f"[FAIL] 向量索引失败: {e}")
 
 # ── 7. 清理 ──
 print("\n" + "=" * 50)

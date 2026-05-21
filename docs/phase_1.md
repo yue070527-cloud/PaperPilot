@@ -21,9 +21,8 @@
 
 ### 4. 向量流水线
 - FAISS IndexFlatIP 构建索引
-- **本地多语言模型**：paraphrase-multilingual-MiniLM-L12-v2，离线运行，支持中英文跨语言匹配（默认方案）
-- **在线可选**：Google Gemini text-embedding-004，免费 1500 req/min，需 GEMINI_API_KEY（备选方案）
-- 注意：DeepSeek 无 Embedding API（仅 chat 模型），Embedding 不使用 DeepSeek
+- 本地 paraphrase-multilingual-MiniLM-L12-v2（384维），中英文跨语言匹配
+- 纯离线运行，无需 API Key，无需网络
 - 相同摘要 Embedding 本地缓存（numpy .npy）
 
 ### 5. 排序展示
