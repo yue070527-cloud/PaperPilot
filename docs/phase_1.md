@@ -21,9 +21,10 @@
 
 ### 4. 向量流水线
 - FAISS IndexFlatIP 构建索引
-- DeepSeek Embedding API 在线向量化
-- 本地 MiniLM（sentence-transformers）离线兜底
-- 相同摘要 Embedding 本地缓存（pickle/diskcache）
+- **本地多语言模型**：paraphrase-multilingual-MiniLM-L12-v2，离线运行，支持中英文跨语言匹配（默认方案）
+- **在线可选**：Google Gemini text-embedding-004，免费 1500 req/min，需 GEMINI_API_KEY（备选方案）
+- 注意：DeepSeek 无 Embedding API（仅 chat 模型），Embedding 不使用 DeepSeek
+- 相同摘要 Embedding 本地缓存（numpy .npy）
 
 ### 5. 排序展示
 - 向量相似度排序，终端输出 Top10（标题 + 得分 + 摘要首句）

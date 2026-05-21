@@ -1,12 +1,17 @@
 # PaperPilot 配置文件
 # 所有敏感信息通过环境变量覆盖，不要硬编码
 
+# DeepSeek API（仅用于 Phase 2 的 Chat 论文分析，不做 Embedding）
 deepseek:
   api_key: ${DEEPSEEK_API_KEY}
-  embedding_model: deepseek-embedding
+
+# Google Gemini Embedding（在线模式的免费替代，1500 req/min）
+gemini:
+  api_key: ${GEMINI_API_KEY}
 
 embedding:
-  mode: online              # online | offline | auto（auto: 在线优先，断网自动切离线）
+  mode: offline              # offline（默认本地多语言模型）| online（Gemini API）
+  local_model: paraphrase-multilingual-MiniLM-L12-v2
   cache_dir: ./cache/embedding
 
 data_sources:

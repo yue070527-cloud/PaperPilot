@@ -1,7 +1,11 @@
 """向量索引与检索接口。
 
 Phase 1 核心流水线：
-    论文摘要 → Embedding（DeepSeek / MiniLM）→ FAISS IndexFlatIP → 相似度检索
+    论文摘要 → Embedding（本地多语言模型 / Google Gemini）→ FAISS IndexFlatIP → 相似度检索
+
+Embedding 策略：
+    - offline（默认）: paraphrase-multilingual-MiniLM-L12-v2，本地运行，中英文跨语言匹配
+    - online: Google Gemini text-embedding-004，免费 1500 req/min，需 GEMINI_API_KEY
 """
 
 import hashlib
@@ -15,22 +19,26 @@ from sentence_transformers import SentenceTransformer
 
 from paperpilot.config import config
 
+# 默认本地模型：多语言版 MiniLM，支持中英文跨语言检索
+_LOCAL_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+_GEMINI_MODEL = "text-embedding-004"
+_GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/"
+
 _cache_dir = Path(config.get("cache", {}).get("dir", "./cache/api"))
 _embedding_model = None
-_embedding_dim = None
 
 
 def _get_offline_model() -> SentenceTransformer:
     global _embedding_model
     if _embedding_model is None:
-        _embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+        _embedding_model = SentenceTransformer(_LOCAL_MODEL_NAME)
     return _embedding_model
 
 
 def _resolve_mode(mode: str) -> str:
     if mode == "auto":
-        auto_cfg = config.get("embedding", {}).get("mode", "online")
-        return auto_cfg if auto_cfg != "auto" else "online"
+        auto_cfg = config.get("embedding", {}).get("mode", "offline")
+        return auto_cfg if auto_cfg != "auto" else "offline"
     return mode
 
 
@@ -53,17 +61,25 @@ def _save_cache(text: str, mode: str, vec: np.ndarray) -> None:
 
 
 def _embed_online_batch(texts: list[str]) -> np.ndarray:
-    api_key = os.environ.get("DEEPSEEK_API_KEY") or config.get("deepseek", {}).get("api_key", "")
-    model = config.get("deepseek", {}).get("embedding_model", "deepseek-embedding")
+    """Google Gemini Embedding API（免费 1500 req/min）。"""
+    api_key = os.environ.get("GEMINI_API_KEY") or config.get("gemini", {}).get("api_key", "")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY 未设置，请设置环境变量或在 config.yaml 中配置")
+
+    url = f"{_GEMINI_URL}{_GEMINI_MODEL}:batchEmbedText"
+    payload = {"requests": [{"model": f"models/{_GEMINI_MODEL}", "text": t} for t in texts]}
     resp = requests.post(
-        "https://api.deepseek.com/v1/embeddings",
-        json={"input": texts, "model": model},
-        headers={"Authorization": f"Bearer {api_key}"},
+        url,
+        json=payload,
+        params={"key": api_key},
         timeout=60,
     )
     resp.raise_for_status()
     data = resp.json()
-    vecs = [d["embedding"] for d in data["data"]]
+    vecs = [
+        e["values"]
+        for e in sorted(data.get("embeddings", []), key=lambda x: x.get("index", 0))
+    ]
     return np.array(vecs, dtype=np.float32)
 
 
