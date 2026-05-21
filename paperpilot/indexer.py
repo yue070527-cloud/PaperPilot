@@ -118,8 +118,6 @@ def build_index(papers: list[dict], mode: str = "online"):
     dim = vecs.shape[1]
     idx = faiss.IndexFlatIP(dim)
     idx.add(vecs)
-    ids = np.arange(len(papers))
-    faiss_idx_ids = faiss.IndexIDMap(idx) if hasattr(faiss, 'IndexIDMap') else idx
     return idx, papers
 
 
