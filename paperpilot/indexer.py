@@ -8,7 +8,11 @@ Phase 1 核心流水线：
 """
 
 import hashlib
+import os
 from pathlib import Path
+
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 import faiss
 import numpy as np
@@ -16,7 +20,7 @@ from sentence_transformers import SentenceTransformer
 
 from paperpilot.config import config
 
-_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+_MODEL_NAME = str(Path.home() / ".cache/modelscope/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 _cache_dir = Path(config.get("cache", {}).get("dir", "./cache/api"))
 _model: SentenceTransformer | None = None
 

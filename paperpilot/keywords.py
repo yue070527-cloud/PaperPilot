@@ -3,6 +3,11 @@
 Phase 1 用 KeyBERT，后续可扩展其他方案。
 """
 
+import os
+
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 from keybert import KeyBERT
 
 _kw_model = None
