@@ -11,14 +11,17 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 from keybert import KeyBERT
 
-_LOCAL_MODEL = str(Path.home() / ".cache/modelscope/sentence-transformers/all-MiniLM-L6-v2")
+_MODEL_PATH = str(Path.home() / ".cache/modelscope/sentence-transformers/all-MiniLM-L6-v2")
+_MODEL_NAME = "all-MiniLM-L6-v2"
+# 优先 ModelScope 本地缓存，回退到 HuggingFace 缓存
+_MODEL = _MODEL_PATH if Path(_MODEL_PATH).exists() else _MODEL_NAME
 _kw_model = None
 
 
 def _get_model() -> KeyBERT:
     global _kw_model
     if _kw_model is None:
-        _kw_model = KeyBERT(model=_LOCAL_MODEL)
+        _kw_model = KeyBERT(model=_MODEL)
     return _kw_model
 
 

@@ -20,7 +20,10 @@ from sentence_transformers import SentenceTransformer
 
 from paperpilot.config import config
 
+_MODEL_PATH = str(Path.home() / ".cache/modelscope/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 _MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+# 优先 ModelScope 本地缓存，回退到 HuggingFace 缓存
+_MODEL = _MODEL_PATH if Path(_MODEL_PATH).exists() else _MODEL_NAME
 _cache_dir = Path(config.get("cache", {}).get("dir", "./cache/api"))
 _model: SentenceTransformer | None = None
 
@@ -28,7 +31,7 @@ _model: SentenceTransformer | None = None
 def _get_model() -> SentenceTransformer:
     global _model
     if _model is None:
-        _model = SentenceTransformer(_MODEL_NAME)
+        _model = SentenceTransformer(_MODEL)
     return _model
 
 
