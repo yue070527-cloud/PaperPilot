@@ -378,13 +378,15 @@ def refresh_results_table(scored=None):
             ft.DataRow(
                 cells=[
                     ft.DataCell(ft.Text(str(i + 1))),
-                    ft.DataCell(ft.Text(paper.get("title", "")[:80])),
+                    ft.DataCell(ft.Container(
+                        ft.Text(paper.get("title", "")[:80]),
+                        on_click=lambda e, p=paper: show_paper_detail(p),
+                    )),
                     ft.DataCell(ft.Text((paper.get("authors") or "")[:40])),
                     ft.DataCell(ft.Text(year_str)),
                     ft.DataCell(ft.Text(src)),
                     ft.DataCell(score_widget),
                 ],
-                on_select_changed=lambda e, p=paper: show_paper_detail(p),
             )
         )
     results_table.update()
