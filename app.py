@@ -11,6 +11,12 @@ from paperpilot.fetcher import fetch_arxiv, fetch_openalex, deduplicate
 from paperpilot.indexer import build_index, search_similar
 
 
+def _border(color):
+    """Flet 0.85 兼容的边框辅助函数。"""
+    side = ft.BorderSide(1, color)
+    return ft.Border(side, side, side, side)
+
+
 # ── 全局状态 ──
 class AppState:
     def __init__(self):
@@ -262,7 +268,7 @@ results_table = ft.DataTable(
     rows=[],
     sort_column_index=5,
     sort_ascending=False,
-    border=ft.border.all(1, ft.colors.OUTLINE_VARIANT),
+    border=_border(ft.colors.OUTLINE_VARIANT),
     expand=True,
 )
 _sort_ascending = False
@@ -327,7 +333,7 @@ paper_detail = ft.Container(
         ft.Text(""),
     ], spacing=8),
     padding=16,
-    border=ft.border.all(1, ft.colors.OUTLINE_VARIANT),
+    border=_border(ft.colors.OUTLINE_VARIANT),
     border_radius=8,
     visible=False,
 )
