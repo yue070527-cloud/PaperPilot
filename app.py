@@ -2,7 +2,7 @@
 Phase 1: 课题输入 → 关键词提取 → 论文抓取 → 排序展示
 """
 
-import threading
+import asyncio
 
 import flet as ft
 
@@ -30,6 +30,33 @@ class AppState:
 
 
 state = AppState()
+_page: ft.Page | None = None
+results_summary: ft.Text | None = None
+
+
+def _run_pipeline():
+    """在后台线程中运行完整的搜索流水线。"""
+    papers = []
+    if arxiv_switch.value:
+        state.status_text = "arXiv 抓取中..."
+        papers += fetch_arxiv(state.keywords, max_results=int(max_results_slider.value))
+    if openalex_switch.value:
+        state.status_text = "OpenAlex 抓取中..."
+        papers += fetch_openalex(state.keywords, max_results=int(max_results_slider.value))
+
+    state.status_text = "去重中..."
+    papers = deduplicate(papers)
+
+    if not papers:
+        return [], []
+
+    state.status_text = f"构建索引中（{len(papers)} 篇）..."
+    idx, indexed_papers = build_index(papers)
+
+    state.status_text = "排序中..."
+    scores = search_similar(state.topic_desc, idx, indexed_papers, top_k=20)
+
+    return papers, scores
 
 
 # ── 导航栏 ──
@@ -143,7 +170,6 @@ def build_project_page():
         state.papers = []
         state.scores = []
 
-        # 显示进度
         progress_bar.visible = True
         search_btn.disabled = True
         status_text.value = "正在抓取论文..."
@@ -151,35 +177,29 @@ def build_project_page():
         search_btn.update()
         status_text.update()
 
-        def do_search():
+        async def _do_search():
+            loop = asyncio.get_running_loop()
             try:
-                papers = []
-                if arxiv_switch.value:
-                    state.status_text = "arXiv 抓取中..."
-                    papers += fetch_arxiv(state.keywords, max_results=int(max_results_slider.value))
-                if openalex_switch.value:
-                    state.status_text = "OpenAlex 抓取中..."
-                    papers += fetch_openalex(state.keywords, max_results=int(max_results_slider.value))
-
-                state.status_text = "去重中..."
-                papers = deduplicate(papers)
-                state.papers = papers
+                papers, scores = await loop.run_in_executor(None, _run_pipeline)
 
                 if not papers:
                     state.status_text = "未找到相关论文"
-                    return
-
-                state.status_text = f"构建索引中（{len(papers)} 篇）..."
-                idx, indexed_papers = build_index(papers)
-
-                state.status_text = "排序中..."
-                state.scores = search_similar(state.topic_desc, idx, indexed_papers, top_k=20)
-
-                state.status_text = f"完成！共 {len(state.scores)} 篇"
-                # 切到推荐页
-                refresh_results_table()
-                page_switcher(1)
-
+                    state.papers = []
+                    state.scores = []
+                    results_table.rows.clear()
+                    results_table.update()
+                    if results_summary and results_summary.page:
+                        results_summary.value = f"课题：{state.topic_name}  |  检索到 0 篇论文  |  关键词：{', '.join(state.keywords[:5])}"
+                        results_summary.update()
+                else:
+                    state.papers = papers
+                    state.scores = scores
+                    state.status_text = f"完成！共 {len(scores)} 篇"
+                    refresh_results_table()
+                    if results_summary and results_summary.page:
+                        results_summary.value = f"课题：{state.topic_name}  |  检索到 {len(state.scores)} 篇论文  |  关键词：{', '.join(state.keywords[:5])}"
+                        results_summary.update()
+                    page_switcher(1)
             except Exception as ex:
                 state.status_text = f"检索失败: {ex}"
             finally:
@@ -191,7 +211,7 @@ def build_project_page():
                 search_btn.update()
                 status_text.update()
 
-        threading.Thread(target=do_search, daemon=True).start()
+        page.run_task(_do_search)
 
     search_btn = ft.FilledButton(
         content=ft.Text("开始检索"), icon=ft.Icons.SEARCH, on_click=on_start_search,
@@ -331,6 +351,7 @@ paper_detail = ft.Container(
         ft.Text("", size=20, weight=ft.FontWeight.BOLD),
         ft.Text(""),
         ft.Text(""),
+        ft.Text("", size=12, color=ft.Colors.PRIMARY),
     ], spacing=8),
     padding=16,
     border=_border(ft.Colors.OUTLINE_VARIANT),
@@ -343,12 +364,7 @@ def show_paper_detail(paper: dict):
     paper_detail.content.controls[0].value = paper.get("title", "")
     paper_detail.content.controls[1].value = f"作者: {paper.get('authors', '未知')}  |  年份: {paper.get('year', '—')}  |  来源: {paper.get('source', '')}"
     paper_detail.content.controls[2].value = paper.get("abstract", "") or "（无摘要）"
-    if paper.get("url"):
-        paper_detail.content.controls.append(
-            ft.Text(f"链接: {paper['url']}", size=12, color=ft.Colors.PRIMARY)
-        )
-        if len(paper_detail.content.controls) > 3:
-            paper_detail.content.controls.pop()
+    paper_detail.content.controls[3].value = f"链接: {paper['url']}" if paper.get("url") else ""
     paper_detail.visible = True
     paper_detail.update()
 
@@ -356,7 +372,9 @@ def show_paper_detail(paper: dict):
 def build_results_page():
     def _summary_text():
         return f"课题：{state.topic_name}  |  检索到 {len(state.scores)} 篇论文  |  关键词：{', '.join(state.keywords[:5])}"
+    global results_summary
     summary = ft.Text(_summary_text(), size=14)
+    results_summary = summary
 
     def refresh_summary():
         summary.value = _summary_text()
@@ -401,6 +419,8 @@ def build_settings_page():
 
 # ── 应用入口 ──
 def main(page: ft.Page):
+    global _page
+    _page = page
     page.title = "PaperPilot"
     page.window.width = 1100
     page.window.height = 750
