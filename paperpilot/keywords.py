@@ -4,19 +4,21 @@ Phase 1 用 KeyBERT，后续可扩展其他方案。
 """
 
 import os
+from pathlib import Path
 
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 from keybert import KeyBERT
 
+_LOCAL_MODEL = str(Path.home() / ".cache/modelscope/sentence-transformers/all-MiniLM-L6-v2")
 _kw_model = None
 
 
 def _get_model() -> KeyBERT:
     global _kw_model
     if _kw_model is None:
-        _kw_model = KeyBERT()
+        _kw_model = KeyBERT(model=_LOCAL_MODEL)
     return _kw_model
 
 
