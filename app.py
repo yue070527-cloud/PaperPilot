@@ -55,8 +55,8 @@ def build_nav(page_index: int) -> ft.Container:
                 data=i,
                 on_click=on_tab_click,
                 style=ft.ButtonStyle(
-                    bgcolor=ft.colors.PRIMARY_CONTAINER if is_active else None,
-                    color=ft.colors.ON_PRIMARY_CONTAINER if is_active else None,
+                    bgcolor=ft.Colors.PRIMARY_CONTAINER if is_active else None,
+                    color=ft.Colors.ON_PRIMARY_CONTAINER if is_active else None,
                 ),
             )
         )
@@ -268,7 +268,7 @@ results_table = ft.DataTable(
     rows=[],
     sort_column_index=5,
     sort_ascending=False,
-    border=_border(ft.colors.OUTLINE_VARIANT),
+    border=_border(ft.Colors.OUTLINE_VARIANT),
     expand=True,
 )
 _sort_ascending = False
@@ -304,9 +304,9 @@ def refresh_results_table(scored=None):
         src = source_label.get(paper.get("source", ""), paper.get("source", ""))
 
         color = (
-            ft.colors.GREEN if score >= 0.4
-            else ft.colors.ORANGE if score >= 0.2
-            else ft.colors.OUTLINE
+            ft.Colors.GREEN if score >= 0.4
+            else ft.Colors.ORANGE if score >= 0.2
+            else ft.Colors.OUTLINE
         )
         score_widget = ft.Text(f"{score:.3f}", color=color, weight=ft.FontWeight.BOLD)
 
@@ -333,7 +333,7 @@ paper_detail = ft.Container(
         ft.Text(""),
     ], spacing=8),
     padding=16,
-    border=_border(ft.colors.OUTLINE_VARIANT),
+    border=_border(ft.Colors.OUTLINE_VARIANT),
     border_radius=8,
     visible=False,
 )
@@ -345,7 +345,7 @@ def show_paper_detail(paper: dict):
     paper_detail.content.controls[2].value = paper.get("abstract", "") or "（无摘要）"
     if paper.get("url"):
         paper_detail.content.controls.append(
-            ft.Text(f"链接: {paper['url']}", size=12, color=ft.colors.PRIMARY)
+            ft.Text(f"链接: {paper['url']}", size=12, color=ft.Colors.PRIMARY)
         )
         if len(paper_detail.content.controls) > 3:
             paper_detail.content.controls.pop()
@@ -393,7 +393,7 @@ def build_settings_page():
         ft.Divider(height=16),
         ft.Text("离线模式", size=16, weight=ft.FontWeight.W_500),
         ft.Text("Embedding 模型：paraphrase-multilingual-MiniLM-L12-v2", size=13),
-        ft.Text("已下载至本地缓存，无需联网", size=13, color=ft.colors.GREEN),
+        ft.Text("已下载至本地缓存，无需联网", size=13, color=ft.Colors.GREEN),
     ], spacing=8, scroll=ft.ScrollMode.AUTO)
 
 
