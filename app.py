@@ -211,7 +211,7 @@ def build_project_page():
                 search_btn.update()
                 status_text.update()
 
-        page.run_task(_do_search)
+        _page.run_task(_do_search)
 
     search_btn = ft.FilledButton(
         content=ft.Text("开始检索"), icon=ft.Icons.SEARCH, on_click=on_start_search,
