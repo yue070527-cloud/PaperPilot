@@ -24,7 +24,7 @@ import requests
 
 
 def _build_arxiv_query(keywords: list[str]) -> str:
-    return " AND ".join(f'"{kw}"' for kw in keywords)
+    return " OR ".join(f'"{kw}"' for kw in keywords)
 
 
 def _parse_arxiv_result(r) -> dict:

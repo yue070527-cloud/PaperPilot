@@ -37,15 +37,59 @@ results_summary: ft.Text | None = None
 def _run_pipeline():
     """在后台线程中运行完整的搜索流水线。"""
     papers = []
+    max_per = int(max_results_slider.value)
+
+    print(f"\n[PaperPilot] 开始检索，关键词: {state.keywords}")
+    print(f"[PaperPilot] 课题描述: {state.topic_desc[:80]}...")
+
+    # arXiv 搜索：用 OR 连接关键词（比 AND 更广）
+    kw_query = " OR ".join(state.keywords)
     if arxiv_switch.value:
         state.status_text = "arXiv 抓取中..."
-        papers += fetch_arxiv(state.keywords, max_results=int(max_results_slider.value))
+        print(f"[PaperPilot] arXiv 查询: {kw_query}")
+        try:
+            results = fetch_arxiv(state.keywords, max_results=max_per)
+            print(f"[PaperPilot] arXiv 返回: {len(results)} 篇")
+            papers += results
+        except Exception as e:
+            print(f"[PaperPilot] arXiv 失败: {e}")
+
     if openalex_switch.value:
         state.status_text = "OpenAlex 抓取中..."
-        papers += fetch_openalex(state.keywords, max_results=int(max_results_slider.value))
+        print(f"[PaperPilot] OpenAlex 查询: {kw_query}")
+        try:
+            results = fetch_openalex(state.keywords, max_results=max_per)
+            print(f"[PaperPilot] OpenAlex 返回: {len(results)} 篇")
+            papers += results
+        except Exception as e:
+            print(f"[PaperPilot] OpenAlex 失败: {e}")
 
     state.status_text = "去重中..."
     papers = deduplicate(papers)
+    print(f"[PaperPilot] 去重后: {len(papers)} 篇")
+
+    if not papers:
+        print("[PaperPilot] 未找到论文，尝试用课题描述直接搜索...")
+        if arxiv_switch.value or openalex_switch.value:
+            desc = state.topic_desc.strip()
+            # 只取前 200 字符，避免查询过长
+            desc_kw = [desc[:200]]
+            if arxiv_switch.value:
+                try:
+                    results = fetch_arxiv(desc_kw, max_results=max_per)
+                    print(f"[PaperPilot] 描述搜索 arXiv: {len(results)} 篇")
+                    papers += results
+                except Exception as e:
+                    print(f"[PaperPilot] 描述搜索 arXiv 失败: {e}")
+            if openalex_switch.value:
+                try:
+                    results = fetch_openalex(desc_kw, max_results=max_per)
+                    print(f"[PaperPilot] 描述搜索 OpenAlex: {len(results)} 篇")
+                    papers += results
+                except Exception as e:
+                    print(f"[PaperPilot] 描述搜索 OpenAlex 失败: {e}")
+            papers = deduplicate(papers)
+            print(f"[PaperPilot] 描述搜索去重后: {len(papers)} 篇")
 
     if not papers:
         return [], []
