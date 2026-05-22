@@ -20,7 +20,7 @@ from sentence_transformers import SentenceTransformer
 
 from paperpilot.config import config
 
-_MODEL_NAME = str(Path.home() / ".cache/modelscope/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
 _cache_dir = Path(config.get("cache", {}).get("dir", "./cache/api"))
 _model: SentenceTransformer | None = None
 
