@@ -36,9 +36,9 @@ state = AppState()
 def build_nav(page_index: int) -> ft.Container:
     """顶部导航栏，点击切换页面。"""
     tabs = [
-        ("课题", ft.icons.EDIT_NOTE),
-        ("推荐", ft.icons.FORMAT_LIST_NUMBERED),
-        ("设置", ft.icons.SETTINGS),
+        ("课题", ft.Icons.EDIT_NOTE),
+        ("推荐", ft.Icons.FORMAT_LIST_NUMBERED),
+        ("设置", ft.Icons.SETTINGS),
     ]
 
     def on_tab_click(e):
@@ -84,18 +84,18 @@ def page_switcher(idx: int):
 def build_project_page():
     topic_name_field = ft.TextField(
         label="课题名称", hint_text="例如：钙钛矿太阳能电池稳定性",
-        prefix_icon=ft.icons.TITLE, expand=True,
+        prefix_icon=ft.Icons.TITLE, expand=True,
     )
     topic_desc_field = ft.TextField(
         label="课题描述", hint_text="输入 1-3 句描述研究方向，用于论文匹配",
-        prefix_icon=ft.icons.DESCRIPTION, multiline=True, min_lines=3, max_lines=5,
+        prefix_icon=ft.Icons.DESCRIPTION, multiline=True, min_lines=3, max_lines=5,
         expand=True,
     )
 
     keywords_row = ft.Row(wrap=True, spacing=6)
     manual_kw_field = ft.TextField(
         label="手动添加关键词", hint_text="输入后回车添加",
-        prefix_icon=ft.icons.ADD, expand=True,
+        prefix_icon=ft.Icons.ADD, expand=True,
     )
     progress_bar = ft.ProgressBar(visible=False, expand=True)
     status_text = ft.Text("", size=13, italic=True)
@@ -194,7 +194,7 @@ def build_project_page():
         threading.Thread(target=do_search, daemon=True).start()
 
     search_btn = ft.FilledButton(
-        text="开始检索", icon=ft.icons.SEARCH, on_click=on_start_search,
+        text="开始检索", icon=ft.Icons.SEARCH, on_click=on_start_search,
         style=ft.ButtonStyle(padding=ft.padding.symmetric(horizontal=32, vertical=16)),
     )
 
@@ -225,7 +225,7 @@ def build_project_page():
         topic_name_field,
         topic_desc_field,
         ft.Row([
-            ft.FilledTonalButton("提取关键词", icon=ft.icons.AUTO_AWESOME, on_click=on_extract),
+            ft.FilledTonalButton("提取关键词", icon=ft.Icons.AUTO_AWESOME, on_click=on_extract),
             manual_kw_field,
         ], spacing=8),
         keywords_row,
