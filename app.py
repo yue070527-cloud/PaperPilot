@@ -49,7 +49,7 @@ def build_nav(page_index: int) -> ft.Container:
     for i, (label, icon) in enumerate(tabs):
         is_active = i == page_index
         buttons.append(
-            ft.ElevatedButton(
+            ft.Button(
                 content=ft.Text(label),
                 icon=icon,
                 data=i,
@@ -354,13 +354,15 @@ def show_paper_detail(paper: dict):
 
 
 def build_results_page():
-    summary = ft.Text("", size=14)
+    def _summary_text():
+        return f"课题：{state.topic_name}  |  检索到 {len(state.scores)} 篇论文  |  关键词：{', '.join(state.keywords[:5])}"
+    summary = ft.Text(_summary_text(), size=14)
 
     def refresh_summary():
-        summary.value = f"课题：{state.topic_name}  |  检索到 {len(state.scores)} 篇论文  |  关键词：{', '.join(state.keywords[:5])}"
-        summary.update()
+        summary.value = _summary_text()
+        if summary.page:
+            summary.update()
 
-    refresh_summary()
     return ft.Column([
         ft.Text("检索结果", size=22, weight=ft.FontWeight.BOLD),
         summary,
