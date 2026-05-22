@@ -50,7 +50,7 @@ def build_nav(page_index: int) -> ft.Container:
         is_active = i == page_index
         buttons.append(
             ft.ElevatedButton(
-                text=label,
+                content=ft.Text(label),
                 icon=icon,
                 data=i,
                 on_click=on_tab_click,
@@ -62,7 +62,7 @@ def build_nav(page_index: int) -> ft.Container:
         )
     return ft.Container(
         content=ft.Row(buttons, spacing=8, alignment=ft.MainAxisAlignment.CENTER),
-        padding=ft.padding.only(top=16, bottom=8),
+        padding=ft.padding.Padding(top=16, bottom=8),
     )
 
 
@@ -194,8 +194,8 @@ def build_project_page():
         threading.Thread(target=do_search, daemon=True).start()
 
     search_btn = ft.FilledButton(
-        text="开始检索", icon=ft.Icons.SEARCH, on_click=on_start_search,
-        style=ft.ButtonStyle(padding=ft.padding.symmetric(horizontal=32, vertical=16)),
+        content=ft.Text("开始检索"), icon=ft.Icons.SEARCH, on_click=on_start_search,
+        style=ft.ButtonStyle(padding=ft.padding.Padding(left=32, top=16, right=32, bottom=16)),
     )
 
     def refresh_keyword_chips(row: ft.Row, kw_field: ft.TextField):
@@ -225,7 +225,7 @@ def build_project_page():
         topic_name_field,
         topic_desc_field,
         ft.Row([
-            ft.FilledTonalButton("提取关键词", icon=ft.Icons.AUTO_AWESOME, on_click=on_extract),
+            ft.FilledTonalButton(content=ft.Text("提取关键词"), icon=ft.Icons.AUTO_AWESOME, on_click=on_extract),
             manual_kw_field,
         ], spacing=8),
         keywords_row,
@@ -433,4 +433,4 @@ def main(page: ft.Page):
 
 
 if __name__ == "__main__":
-    ft.app(target=main)
+    ft.run(target=main)
