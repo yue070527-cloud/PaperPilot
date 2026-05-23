@@ -1,55 +1,27 @@
 """中文关键词 → 英文术语翻译模块。
 
-使用 Hunyuan-MT 1.5 (1.8B) 模型进行翻译，替代原有的三层映射架构。
-模型从 ModelScope 下载，本地离线推理。
-
-加载时机: 首次调用 translate_terms() 时懒加载，全局单例。
+通过 DeepSeek API 进行学术关键词翻译，替代原有的 Hunyuan-MT 本地模型。
+API Key 从 config.yaml 的 deepseek.api_key 读取，支持用户自有 Key。
 """
 
-import os
-from pathlib import Path
+import json
+import re
+import urllib.request
+import urllib.error
+from paperpilot.config import load_config
 
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+_API_URL = "https://api.deepseek.com/v1/chat/completions"
+_MODEL = "deepseek-chat"
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-_MODEL_DIR = str(
-    Path.home()
-    / ".cache/modelscope/models/Tencent-Hunyuan/HY-MT1___5-1___8B"
+_SYSTEM_PROMPT = (
+    "You are a scientific translator. Translate Chinese academic keywords into "
+    "precise English technical terms. For each input, output only the English "
+    "translation. Use domain-appropriate terminology. Never add explanations."
 )
-
-# Chinese → English prompt: 告诉模型只输出翻译结果，不加额外解释
-_TRANSLATE_PROMPT = (
-    "将以下文本翻译为英文，注意只需要输出翻译后的结果，不要额外解释：\n\n"
-    "{text}"
-)
-
-_model = None
-_tokenizer = None
-
-
-def _get_model_and_tokenizer():
-    global _model, _tokenizer
-    if _model is None:
-        _tokenizer = AutoTokenizer.from_pretrained(
-            _MODEL_DIR,
-            trust_remote_code=True,
-            local_files_only=True,
-        )
-        _model = AutoModelForCausalLM.from_pretrained(
-            _MODEL_DIR,
-            trust_remote_code=True,
-            local_files_only=True,
-            dtype=torch.float32,
-        )
-        _model.eval()
-    return _model, _tokenizer
 
 
 def translate_terms(chinese_terms: list[str]) -> list[str]:
-    """将中文关键词列表翻译为英文术语列表。
+    """将中文关键词列表翻译为英文术语列表（批量调用 DeepSeek API）。
 
     Args:
         chinese_terms: 中文关键词列表（如 ["钙钛矿太阳能电池", "基因治疗"]）
@@ -60,52 +32,97 @@ def translate_terms(chinese_terms: list[str]) -> list[str]:
     if not chinese_terms:
         return []
 
-    model, tokenizer = _get_model_and_tokenizer()
+    config = load_config()
+    api_key = config.get("deepseek", {}).get("api_key", "").strip()
+    if not api_key:
+        return [""] * len(chinese_terms)
 
-    results = []
-    for term in chinese_terms:
-        # 如果输入已是纯 ASCII（英文字母/数字/符号），直接保留
+    # Separate: already-ASCII terms pass through, Chinese terms need translation
+    to_translate = []
+    indices = []
+    results = [""] * len(chinese_terms)
+
+    for i, term in enumerate(chinese_terms):
         stripped = term.strip()
         if not stripped:
-            results.append("")
+            results[i] = ""
             continue
         if all(ord(c) < 128 for c in stripped):
-            results.append(stripped)
+            results[i] = stripped
             continue
+        to_translate.append(stripped)
+        indices.append(i)
 
-        prompt = _TRANSLATE_PROMPT.format(text=stripped)
-        messages = [{"role": "user", "content": prompt}]
+    if not to_translate:
+        return results
 
-        encoded = tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
+    # Build numbered list for reliable parsing
+    numbered = "\n".join(f"{j+1}. {t}" for j, t in enumerate(to_translate))
+    user_msg = (
+        "Translate these Chinese academic keywords to English. "
+        "Output one translation per line in the format: number. English term\n\n"
+        f"{numbered}"
+    )
+
+    payload = {
+        "model": _MODEL,
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+        "temperature": 0.1,
+        "max_tokens": len(to_translate) * 50,
+        "stream": False,
+    }
+
+    try:
+        req = urllib.request.Request(
+            _API_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
         )
-        input_ids = encoded['input_ids']
-        with torch.no_grad():
-            outputs = model.generate(
-                input_ids,
-                max_new_tokens=64,
-                do_sample=False,
-                temperature=None,
-                top_p=None,
-            )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError):
+        return results
 
-        # 解码时跳过 prompt 部分，只取生成的新 token
-        generated = outputs[0][input_ids.shape[1]:]
-        translation = tokenizer.decode(generated, skip_special_tokens=True).strip()
+    content = body.get("choices", [{}])[0].get("message", {}).get("content", "")
+    translations = _parse_batch_response(content, len(to_translate))
 
-        # 后处理：去除模型可能残留的填充标记
-        translation = translation.replace("<|hy_place|>", "")
-        translation = translation.replace("holder", "")
-        translation = translation.replace("no_", "")
-        translation = translation.strip()
-
-        # 如果翻译失败（结果仍包含中文或空），返回空
-        if not translation or any("一" <= c <= "鿿" for c in translation):
-            results.append("")
-        else:
-            results.append(translation)
+    for j, translation in enumerate(translations):
+        if translation:
+            results[indices[j]] = translation
 
     return results
+
+
+def _parse_batch_response(content: str, expected_count: int) -> list[str]:
+    """Parse numbered translation output into ordered list."""
+    lines = content.strip().split("\n")
+    parsed = {}
+
+    for line in lines:
+        line = line.strip()
+        # Match "1. English term" or "1 English term" or "1、English term"
+        m = re.match(r"^(\d+)[\.\、\)\s]\s*(.+)", line)
+        if m:
+            idx = int(m.group(1)) - 1
+            term = m.group(2).strip()
+            # Remove trailing descriptions (模型偶尔会多话)
+            term = re.sub(r"\s*[\(（].*[\)）]\s*$", "", term)
+            term = term.rstrip(".,;:!。，；：！")
+            if 0 <= idx < expected_count:
+                parsed[idx] = term
+
+    # Build result in order
+    result = []
+    for i in range(expected_count):
+        t = parsed.get(i, "")
+        # Reject if still contains Chinese
+        if t and any("一" <= c <= "鿿" for c in t):
+            t = ""
+        result.append(t)
+    return result
