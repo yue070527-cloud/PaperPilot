@@ -154,13 +154,83 @@ def extract_keywords(topic_description: str, top_n: int = 10) -> list[str]:
     return _english_extract(topic_description, top_n)
 
 
-def merge_keywords(auto_keywords: list[str], manual_keywords: list[str]) -> list[str]:
-    """合并自动提取和手动输入的关键词，去重、去空、保持手动优先。"""
+def extract_all_keywords(topic: str, top_n: int = 10) -> list[tuple[str, float]]:
+    """提取带权重的关键词列表：核心关键词（权重高）+ 普通关键词（权重低）。
+
+    核心关键词通过 DeepSeek API 按提取指南生成，普通关键词沿用 jieba TF-IDF。
+    核心关键词置于列表前部，权重 1.0；普通关键词权重 0.6。
+
+    Args:
+        topic: 课题描述文本
+        top_n: 普通关键词数量
+
+    Returns:
+        [(keyword, weight), ...] 列表，核心在前
+    """
+    from paperpilot.core_extractor import extract_core_keywords
+
+    core_keywords = extract_core_keywords(topic)
+    regular_keywords = extract_keywords(topic, top_n=top_n)
+
+    # Remove regular keywords that overlap with core keywords
+    core_lower = {kw.lower() for kw in core_keywords}
+    regular_keywords = [kw for kw in regular_keywords if kw.lower() not in core_lower]
+
+    result = []
+    # Core keywords first, weight 1.0
+    for kw in core_keywords:
+        result.append((kw, 1.0))
+    # Regular keywords after, weight 0.6
+    for kw in regular_keywords:
+        result.append((kw, 0.6))
+    return result
+
+
+def merge_keywords(
+    auto_keywords: list[str] | list[tuple[str, float]],
+    manual_keywords: list[str],
+) -> list[str]:
+    """合并自动提取和手动输入的关键词，去重、去空、保持手动优先。
+
+    支持带权重的自动关键词：手动关键词默认权重最高，置顶排列。
+    返回纯字符串列表（向后兼容）。
+    """
     seen = set()
     merged = []
-    for kw in manual_keywords + auto_keywords:
-        kw = kw.strip().lower()
-        if kw and kw not in seen:
-            seen.add(kw)
-            merged.append(kw)
+    for kw in manual_keywords:
+        kw_clean = kw.strip().lower()
+        if kw_clean and kw_clean not in seen:
+            seen.add(kw_clean)
+            merged.append(kw_clean)
+
+    # Handle both weighted [(str, float)] and plain [str] formats
+    for item in auto_keywords:
+        if isinstance(item, tuple):
+            kw = item[0]
+        else:
+            kw = item
+        kw_clean = kw.strip().lower()
+        if kw_clean and kw_clean not in seen:
+            seen.add(kw_clean)
+            merged.append(kw_clean)
     return merged
+
+
+def merge_keywords_weighted(
+    auto_keywords: list[tuple[str, float]],
+    manual_keywords: list[str],
+) -> list[tuple[str, float]]:
+    """合并带权重关键词，手动关键词权重最高（1.0），保留权重排序。"""
+    seen = set()
+    result = []
+    for kw in manual_keywords:
+        kw_clean = kw.strip().lower()
+        if kw_clean and kw_clean not in seen:
+            seen.add(kw_clean)
+            result.append((kw_clean, 1.0))
+    for kw, weight in auto_keywords:
+        kw_clean = kw.strip().lower()
+        if kw_clean and kw_clean not in seen:
+            seen.add(kw_clean)
+            result.append((kw_clean, weight))
+    return result
