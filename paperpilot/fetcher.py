@@ -23,8 +23,9 @@ import fitz
 import requests
 
 
-def _build_arxiv_query(keywords: list[str]) -> str:
-    return " AND ".join(f'"{kw}"' for kw in keywords)
+def _build_search_query(keywords: list[str]) -> str:
+    """Build quoted-phrase OR query for search APIs (arXiv, OpenAlex)."""
+    return " OR ".join(f'"{kw}"' for kw in keywords)
 
 
 def _parse_arxiv_result(r) -> dict:
@@ -54,7 +55,7 @@ def fetch_arxiv(keywords: list[str], max_results: int = 30) -> list[dict]:
     Returns:
         paper dict 列表
     """
-    query = _build_arxiv_query(keywords)
+    query = _build_search_query(keywords)
     client = arxiv.Client()
     search = arxiv.Search(
         query=query,
@@ -114,19 +115,27 @@ def fetch_openalex(keywords: list[str], max_results: int = 30) -> list[dict]:
     Returns:
         paper dict 列表
     """
-    query = " ".join(keywords)
+    query = _build_search_query(keywords)
     url = "https://api.openalex.org/works"
     papers = []
     per_page = min(50, max_results)
     pages = (max_results + per_page - 1) // per_page
+    headers = {"User-Agent": "PaperPilot/1.0 (mailto:paperpilot@example.com)"}
     for page in range(1, pages + 1):
         params = {
             "search": query,
             "per_page": per_page,
             "page": page,
+            "mailto": "paperpilot@example.com",
         }
         try:
-            resp = requests.get(url, params=params, timeout=15)
+            resp = requests.get(url, params=params, headers=headers, timeout=15)
+            # Retry with backoff on rate limit
+            for retry in range(3):
+                if resp.status_code != 429:
+                    break
+                time.sleep(1 * (retry + 1))
+                resp = requests.get(url, params=params, headers=headers, timeout=15)
             resp.raise_for_status()
             data = resp.json()
             for w in data.get("results", []):
