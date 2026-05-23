@@ -519,7 +519,7 @@ def build_results_page():
 # ── 设置页 ──
 arxiv_switch = ft.Switch(label="arXiv", value=True)
 openalex_switch = ft.Switch(label="OpenAlex", value=True)
-max_results_slider = ft.Slider(min=10, max=50, value=30, divisions=8,
+max_results_slider = ft.Slider(min=10, max=200, value=30, divisions=19,
                                 label="{value} 篇")
 
 
