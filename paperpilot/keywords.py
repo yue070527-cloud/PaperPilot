@@ -178,7 +178,13 @@ def extract_all_keywords(topic: str, top_n: int = 10) -> list[tuple[str, float]]
     """
     from paperpilot.core_extractor import extract_core_keywords, extract_regular_keywords
 
-    core_keywords = extract_core_keywords(topic)
+    # 核心关键词提取仅对中文输入生效：其系统 prompt 是中文的，
+    # 对英文输入会错误返回中文关键词，污染搜索结果。
+    if _has_chinese(topic):
+        core_keywords = extract_core_keywords(topic)
+    else:
+        core_keywords = []
+
     regular_keywords = extract_regular_keywords(topic)
     if not regular_keywords:
         # Fallback to jieba if DeepSeek API fails

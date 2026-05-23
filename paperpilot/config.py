@@ -36,5 +36,28 @@ def load_config(path: str | Path | None = None) -> dict:
     return walk(raw)
 
 
+def save_config(updates: dict, path: str | Path | None = None) -> None:
+    """保存配置到 config.yaml，保留已有结构，仅更新指定字段。"""
+    path = Path(path or CONFIG_PATH)
+
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
+            current = yaml.safe_load(f) or {}
+    else:
+        current = {}
+
+    def deep_merge(base: dict, updates: dict) -> None:
+        for k, v in updates.items():
+            if isinstance(v, dict) and isinstance(base.get(k), dict):
+                deep_merge(base[k], v)
+            else:
+                base[k] = v
+
+    deep_merge(current, updates)
+
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(current, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+
+
 # 全局配置实例（进程启动时加载一次）
 config = load_config()
