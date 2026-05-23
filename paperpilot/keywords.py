@@ -17,6 +17,46 @@ import numpy as np
 from keybert import KeyBERT
 from sentence_transformers import SentenceTransformer
 
+# ── jieba 专业术语自定义词典 ──
+# 防止 TF-IDF 阶段将复合术语错误切分（如"硅基高动态"被拆成无意义词元）
+_JIEBA_CUSTOM_TERMS = [
+    # 通信/网络
+    "确定性时延", "天地一体化", "视联网", "低空智联网", "认知组网",
+    "光交换网络", "智算中心", "量子密钥分发", "低轨卫星", "水声通信",
+    "脑机接口", "深空探测", "多维复用", "硅基光子", "异质集成",
+    # 光电/传感器
+    "硅基高动态", "单光子全彩夜视", "光电融合计算", "光电探测芯片",
+    "固态激光雷达", "紫外光电晶体管", "宽禁带半导体", "单光子探测",
+    "光子类脑计算", "图像传感器", "太赫兹激光器", "光纤激光器",
+    "光声光谱", "数字全息", "编码孔径", "红外热辐射",
+    # 医学/生命科学
+    "巨噬细胞极化", "线粒体功能障碍", "肿瘤免疫微环境", "铁死亡",
+    "细胞焦亡", "细胞间通讯", "肠道菌群", "宿主代谢", "空间组学",
+    "核酸适配体", "靶向递送", "光声成像", "光疗", "超构表面",
+    "高分辨成像", "多组学整合", "数字染色", "心衰预警",
+    "代谢性疾病", "心血管疾病", "神经退行性疾病", "急性肺损伤",
+    "遗传性疾病", "医学影像诊断", "毒性预测", "骨关节炎",
+    # 控制/机器人
+    "无人集群", "态势评估", "协同控制", "避碰控制", "任务分配",
+    "三维感知", "柔顺作业", "水陆自适应", "抗干扰控制",
+    "迁移强化学习", "多模态控制", "类脑智能决策", "自主导航",
+    # 能源/环境
+    "电氢耦合", "碳排放", "黄河流域", "产业结构", "微塑料",
+    "精准农业", "多源污染", "传感器网络", "多时间尺度",
+    # 计算机/AI
+    "神经符号数据库", "幻觉检测", "异构芯片", "安全测试",
+    "故障根因", "可视分析", "图数据", "逼近理论",
+    "认知激活", "参数高效微调", "持续演进",
+    # 社科
+    "乡村旅游", "县域经济", "产业融合", "政府监管", "公共安全",
+    "特大城市", "韧性治理", "社会保障", "医疗体制改革",
+    "共同富裕", "粮食安全", "马克思主义", "中国式现代化",
+    "拔尖创新人才", "心理健康", "红色基因", "跨文化传播",
+    "国际中文教育", "碎片化学习", "沉浸式学习",
+]
+for _term in _JIEBA_CUSTOM_TERMS:
+    jieba.add_word(_term, freq=100, tag="nz")
+
 _EMBED_MODEL_PATH = str(Path.home() / ".cache/modelscope/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 _EMBED_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
 _EMBED_MODEL_SRC = _EMBED_MODEL_PATH if Path(_EMBED_MODEL_PATH).exists() else _EMBED_MODEL_NAME
@@ -37,6 +77,12 @@ _CHINESE_STOP = {
     "特性", "结构", "设计", "制备", "计算", "理论", "实践",
     "特征", "策略", "机制", "综述", "进展", "挑战", "现状", "趋势",
     "关键", "主要", "重要", "不同", "相关", "相应", "显著",
+    # 从 100 课题测试中发现的泛化词（非技术术语，无跨语言映射价值）
+    "中心", "条件", "体系", "全国", "属性", "变革", "传承", "革命",
+    "文明", "基础", "实现", "测试", "构建",
+    "治理", "保护", "利用", "面向", "建设", "促进", "提升", "模式",
+    "路径", "目标", "重点", "功能", "融合", "协同", "优化", "调控",
+    "干预", "预警", "诊断", "预测",
 }
 _MIN_LEN = 2
 _CANDIDATE_COUNT = 30
@@ -108,13 +154,83 @@ def extract_keywords(topic_description: str, top_n: int = 10) -> list[str]:
     return _english_extract(topic_description, top_n)
 
 
-def merge_keywords(auto_keywords: list[str], manual_keywords: list[str]) -> list[str]:
-    """合并自动提取和手动输入的关键词，去重、去空、保持手动优先。"""
+def extract_all_keywords(topic: str, top_n: int = 10) -> list[tuple[str, float]]:
+    """提取带权重的关键词列表：核心关键词（权重高）+ 普通关键词（权重低）。
+
+    核心关键词通过 DeepSeek API 按提取指南生成，普通关键词沿用 jieba TF-IDF。
+    核心关键词置于列表前部，权重 1.0；普通关键词权重 0.6。
+
+    Args:
+        topic: 课题描述文本
+        top_n: 普通关键词数量
+
+    Returns:
+        [(keyword, weight), ...] 列表，核心在前
+    """
+    from paperpilot.core_extractor import extract_core_keywords
+
+    core_keywords = extract_core_keywords(topic)
+    regular_keywords = extract_keywords(topic, top_n=top_n)
+
+    # Remove regular keywords that overlap with core keywords
+    core_lower = {kw.lower() for kw in core_keywords}
+    regular_keywords = [kw for kw in regular_keywords if kw.lower() not in core_lower]
+
+    result = []
+    # Core keywords first, weight 1.0
+    for kw in core_keywords:
+        result.append((kw, 1.0))
+    # Regular keywords after, weight 0.6
+    for kw in regular_keywords:
+        result.append((kw, 0.6))
+    return result
+
+
+def merge_keywords(
+    auto_keywords: list[str] | list[tuple[str, float]],
+    manual_keywords: list[str],
+) -> list[str]:
+    """合并自动提取和手动输入的关键词，去重、去空、保持手动优先。
+
+    支持带权重的自动关键词：手动关键词默认权重最高，置顶排列。
+    返回纯字符串列表（向后兼容）。
+    """
     seen = set()
     merged = []
-    for kw in manual_keywords + auto_keywords:
-        kw = kw.strip().lower()
-        if kw and kw not in seen:
-            seen.add(kw)
-            merged.append(kw)
+    for kw in manual_keywords:
+        kw_clean = kw.strip().lower()
+        if kw_clean and kw_clean not in seen:
+            seen.add(kw_clean)
+            merged.append(kw_clean)
+
+    # Handle both weighted [(str, float)] and plain [str] formats
+    for item in auto_keywords:
+        if isinstance(item, tuple):
+            kw = item[0]
+        else:
+            kw = item
+        kw_clean = kw.strip().lower()
+        if kw_clean and kw_clean not in seen:
+            seen.add(kw_clean)
+            merged.append(kw_clean)
     return merged
+
+
+def merge_keywords_weighted(
+    auto_keywords: list[tuple[str, float]],
+    manual_keywords: list[str],
+) -> list[tuple[str, float]]:
+    """合并带权重关键词，手动关键词权重最高（1.0），保留权重排序。"""
+    seen = set()
+    result = []
+    for kw in manual_keywords:
+        kw_clean = kw.strip().lower()
+        if kw_clean and kw_clean not in seen:
+            seen.add(kw_clean)
+            result.append((kw_clean, 1.0))
+    for kw, weight in auto_keywords:
+        kw_clean = kw.strip().lower()
+        if kw_clean and kw_clean not in seen:
+            seen.add(kw_clean)
+            result.append((kw_clean, weight))
+    return result
