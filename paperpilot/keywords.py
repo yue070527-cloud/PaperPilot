@@ -140,15 +140,24 @@ def _english_extract(text: str, top_n: int) -> list[str]:
 
 
 def extract_keywords(topic_description: str, top_n: int = 10) -> list[str]:
-    """从课题描述中自动提取技术术语。中英文自适应。
+    """从课题描述中自动提取技术术语。
+
+    优先使用 DeepSeek API 进行细粒度中文关键词提取，
+    API 不可用时回退到 jieba TF-IDF / KeyBERT。
 
     Args:
         topic_description: 课题描述文本（1-3 句话）
-        top_n: 返回关键词数量
+        top_n: 返回关键词数量（仅回退模式生效）
 
     Returns:
         关键词字符串列表
     """
+    from paperpilot.core_extractor import extract_regular_keywords
+
+    keywords = extract_regular_keywords(topic_description)
+    if keywords:
+        return keywords[:top_n]
+    # Fallback to jieba / KeyBERT
     if _has_chinese(topic_description):
         return _chinese_extract(topic_description, top_n)
     return _english_extract(topic_description, top_n)
@@ -157,32 +166,33 @@ def extract_keywords(topic_description: str, top_n: int = 10) -> list[str]:
 def extract_all_keywords(topic: str, top_n: int = 10) -> list[tuple[str, float]]:
     """提取带权重的关键词列表：核心关键词（权重高）+ 普通关键词（权重低）。
 
-    核心关键词通过 DeepSeek API 按提取指南生成，普通关键词沿用 jieba TF-IDF。
-    核心关键词置于列表前部，权重 1.0；普通关键词权重 0.6。
+    核心关键词和普通关键词均通过 DeepSeek API 提取。
+    核心关键词置于列表前部，权重 1.0；普通关键词权重 0.75。
 
     Args:
         topic: 课题描述文本
-        top_n: 普通关键词数量
+        top_n: 普通关键词数量（仅 fallback 时生效）
 
     Returns:
         [(keyword, weight), ...] 列表，核心在前
     """
-    from paperpilot.core_extractor import extract_core_keywords
+    from paperpilot.core_extractor import extract_core_keywords, extract_regular_keywords
 
     core_keywords = extract_core_keywords(topic)
-    regular_keywords = extract_keywords(topic, top_n=top_n)
+    regular_keywords = extract_regular_keywords(topic)
+    if not regular_keywords:
+        # Fallback to jieba if DeepSeek API fails
+        regular_keywords = extract_keywords(topic, top_n=top_n)
 
     # Remove regular keywords that overlap with core keywords
     core_lower = {kw.lower() for kw in core_keywords}
     regular_keywords = [kw for kw in regular_keywords if kw.lower() not in core_lower]
 
     result = []
-    # Core keywords first, weight 1.0
     for kw in core_keywords:
         result.append((kw, 1.0))
-    # Regular keywords after, weight 0.6
     for kw in regular_keywords:
-        result.append((kw, 0.6))
+        result.append((kw, 0.75))
     return result
 
 

@@ -16,7 +16,7 @@ from paperpilot.config import load_config
 
 # DeepSeek API endpoint (OpenAI-compatible)
 _API_URL = "https://api.deepseek.com/v1/chat/completions"
-_MODEL = "deepseek-v4-flash"
+_MODEL = "deepseek-chat"
 
 _SYSTEM_PROMPT = (
     "你是一个科研关键词提取专家。你的任务是从科研课题标题中提取1-3个最核心、"
@@ -78,22 +78,80 @@ def extract_core_keywords(topic: str) -> list[str]:
         return []
 
     content = body.get("choices", [{}])[0].get("message", {}).get("content", "")
-    return _parse_response(content)
+    return _parse_response(content, max_results=3)
 
 
-def _parse_response(content: str) -> list[str]:
+_REGULAR_SYSTEM_PROMPT = (
+    "你是一个科研关键词提取专家。你的任务是从科研课题标题中提取5-8个有搜索价值的"
+    "细分技术术语，用于补充文献检索。\n\n"
+    "严格遵循以下规则：\n"
+    "1. 提取所有有意义的技术子概念，粒度要细（如课题含'高熵电解质材料'，"
+    "应拆分提取'高熵'和'电解质材料'，确保关键区分词不丢失）\n"
+    "2. 提取核心材料、方法、技术、科学问题、应用场景——每个词都应有独立的搜索价值\n"
+    "3. 保留复合专有名词的完整性（如钙钛矿量子点、CRISPR-Cas12a不可拆分）\n"
+    "4. 删除无搜索价值的词语：研究、方法、分析、应用、性能、优化、设计、运用等\n"
+    "5. 输入可能是中文或英文，但你必须始终输出中文关键词\n"
+    "6. 输出5-8个关键词，用顿号（、）分隔，不要解释、不要编号、不要换行\n\n"
+    "输出格式示例：\n"
+    "高熵、电解质材料、水系锌电池、锌离子电池、电化学性能、界面调控、循环稳定性"
+)
+
+
+def extract_regular_keywords(topic: str) -> list[str]:
+    """从科研课题中提取细分普通关键词（细粒度、有搜索价值）。
+
+    与 core 关键词不同：regular 追求覆盖面，拆分复合词中的关键子概念。
+
+    Args:
+        topic: 科研课题标题（中文或英文）
+
+    Returns:
+        细分关键词列表（5-8个），失败时返回空列表
+    """
+    config = load_config()
+    api_key = config.get("deepseek", {}).get("api_key", "").strip()
+    if not api_key:
+        return []
+
+    payload = {
+        "model": _MODEL,
+        "messages": [
+            {"role": "system", "content": _REGULAR_SYSTEM_PROMPT},
+            {"role": "user", "content": topic},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 80,
+        "stream": False,
+    }
+
+    try:
+        req = urllib.request.Request(
+            _API_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError):
+        return []
+
+    content = body.get("choices", [{}])[0].get("message", {}).get("content", "")
+    return _parse_response(content, max_results=8)
+
+
+def _parse_response(content: str, max_results: int = 10) -> list[str]:
     """Parse model output into a clean keyword list."""
     import re
-    # Split by common delimiters
     keywords = [k.strip() for k in re.split(r"[、,，/\n]", content) if k.strip()]
-    # Filter: must have Chinese or meaningful ASCII, at least 2 chars
     result = []
     for k in keywords:
         has_cjk = any("一" <= c <= "鿿" for c in k)
         has_alpha = any(c.isascii() and c.isalpha() for c in k)
         if len(k) >= 2 and (has_cjk or has_alpha):
-            # Remove common trailing punctuation
             k = k.rstrip("。，,、.!！?？;；：:")
             if len(k) >= 2:
                 result.append(k)
-    return result[:3]
+    return result[:max_results]

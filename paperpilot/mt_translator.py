@@ -11,7 +11,7 @@ import urllib.error
 from paperpilot.config import load_config
 
 _API_URL = "https://api.deepseek.com/v1/chat/completions"
-_MODEL = "deepseek-v4-flash"
+_MODEL = "deepseek-chat"
 
 _SYSTEM_PROMPT = (
     "You are a scientific translator. Translate Chinese academic keywords into "
