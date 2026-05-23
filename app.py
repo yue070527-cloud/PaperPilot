@@ -85,9 +85,14 @@ def _run_pipeline():
 
     if openalex_switch.value:
         state.status_text = "OpenAlex 抓取中..."
-        print(f"[PaperPilot] OpenAlex 查询: {' '.join(en_search_terms)}")
+        # OpenAlex: 过滤掉单字泛词（Battery/Ion/Aqueous），保留词组
+        oa_terms = [t for t in en_search_terms if " " in t or "-" in t]
+        if not oa_terms:
+            oa_terms = en_search_terms
+        oa_query = " OR ".join(f'"{kw}"' for kw in oa_terms)
+        print(f"[PaperPilot] OpenAlex 查询: {oa_query[:200]}")
         try:
-            results = fetch_openalex(en_search_terms, max_results=max_per)
+            results = fetch_openalex([oa_query], max_results=max_per)
             print(f"[PaperPilot] OpenAlex 返回: {len(results)} 篇")
             papers += results
         except Exception as e:
