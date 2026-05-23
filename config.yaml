@@ -1,7 +1,7 @@
 # PaperPilot 配置文件
 # 所有敏感信息通过环境变量覆盖，不要硬编码
 
-# DeepSeek API（仅用于 Phase 2 的 Chat 论文分析）
+# DeepSeek API（核心关键词提取 + 中→英翻译）
 deepseek:
   api_key: ${DEEPSEEK_API_KEY}
 

@@ -16,7 +16,7 @@ from paperpilot.config import load_config
 
 # DeepSeek API endpoint (OpenAI-compatible)
 _API_URL = "https://api.deepseek.com/v1/chat/completions"
-_MODEL = "deepseek-chat"
+_MODEL = "deepseek-v4-flash"
 
 _SYSTEM_PROMPT = (
     "你是一个科研关键词提取专家。你的任务是从科研课题标题中提取1-3个最核心、"
