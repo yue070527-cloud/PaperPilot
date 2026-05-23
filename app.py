@@ -58,12 +58,16 @@ def _run_pipeline():
                 seen.add(t.lower())
                 search_terms.append(t)
         print(f"[PaperPilot] 翻译: {len(valid_en)} 个英文术语")
+    else:
+        print("[PaperPilot] 警告: 翻译失败，所有英文术语为空（检查 API Key 或网络）")
 
-    # 为英文数据源过滤掉中文关键词，避免 OpenAlex 搜不到、arXiv 噪声
+    # 为英文数据源过滤掉中文关键词
     en_search_terms = [t for t in search_terms if t and not _has_cjk(t)]
     if not en_search_terms:
-        # 翻译完全失败时的降级：用原始关键词硬搜（arXiv 勉强兼容，OpenAlex 可能 0 结果）
-        en_search_terms = search_terms
+        # 翻译完全失败，没有可用的英文搜索词 → 直接跳过数据源检索
+        print("[PaperPilot] 错误: 没有可用的英文搜索词，跳过 arXiv 和 OpenAlex 检索")
+        print("[PaperPilot] 提示: 请在设置页配置有效的 DeepSeek API Key")
+        return [], []
 
     print(f"\n[PaperPilot] 开始检索，关键词: {state.keywords}")
     print(f"[PaperPilot] 英文搜索词: {en_search_terms[:10]}...")
@@ -95,25 +99,38 @@ def _run_pipeline():
 
     if not papers:
         print("[PaperPilot] 未找到论文，尝试用课题描述直接搜索...")
-        if arxiv_switch.value or openalex_switch.value:
-            desc = state.topic_desc.strip()
-            desc_kw = [desc[:200]]
-            if arxiv_switch.value:
-                try:
-                    results = fetch_arxiv(desc_kw, max_results=max_per)
-                    print(f"[PaperPilot] 描述搜索 arXiv: {len(results)} 篇")
-                    papers += results
-                except Exception as e:
-                    print(f"[PaperPilot] 描述搜索 arXiv 失败: {e}")
-            if openalex_switch.value:
-                try:
-                    results = fetch_openalex(desc_kw, max_results=max_per)
-                    print(f"[PaperPilot] 描述搜索 OpenAlex: {len(results)} 篇")
-                    papers += results
-                except Exception as e:
-                    print(f"[PaperPilot] 描述搜索 OpenAlex 失败: {e}")
-            papers = deduplicate(papers)
-            print(f"[PaperPilot] 描述搜索去重后: {len(papers)} 篇")
+        # 翻译课题描述用于兜底搜索
+        desc = state.topic_desc.strip()
+        desc_en_terms = translate_terms([desc])
+        desc_en = [t for t in desc_en_terms if t and not _has_cjk(t)]
+        if desc_en:
+            desc_kw = desc_en
+            print(f"[PaperPilot] 描述兜底搜索（英文）: {desc_kw[0][:80]}...")
+        else:
+            # 翻译也失败了，课题描述中若纯英文可用，否则无计可施
+            if not _has_cjk(desc):
+                desc_kw = [desc[:200]]
+                print(f"[PaperPilot] 描述兜底搜索（原文）: {desc_kw[0][:80]}...")
+            else:
+                print("[PaperPilot] 无法生成英文兜底查询，放弃搜索")
+                return [], []
+
+        if arxiv_switch.value:
+            try:
+                results = fetch_arxiv(desc_kw, max_results=max_per)
+                print(f"[PaperPilot] 描述搜索 arXiv: {len(results)} 篇")
+                papers += results
+            except Exception as e:
+                print(f"[PaperPilot] 描述搜索 arXiv 失败: {e}")
+        if openalex_switch.value:
+            try:
+                results = fetch_openalex(desc_kw, max_results=max_per)
+                print(f"[PaperPilot] 描述搜索 OpenAlex: {len(results)} 篇")
+                papers += results
+            except Exception as e:
+                print(f"[PaperPilot] 描述搜索 OpenAlex 失败: {e}")
+        papers = deduplicate(papers)
+        print(f"[PaperPilot] 描述搜索去重后: {len(papers)} 篇")
 
     if not papers:
         return [], []
