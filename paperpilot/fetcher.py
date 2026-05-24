@@ -187,6 +187,20 @@ def _fetch_openalex_raw(query: str, max_results: int = 30) -> list[dict]:
             time.sleep(0.1)
         except requests.RequestException:
             continue
+    # Normalize api_score to [0, 1] — OpenAlex relevance_score may exceed [0, 1]
+    api_scores = [p.get("api_score") for p in papers if p.get("api_score") is not None]
+    if api_scores:
+        min_s, max_s = min(api_scores), max(api_scores)
+        if max_s > 1.0 or min_s < 0.0:
+            if max_s > min_s:
+                for p in papers:
+                    if p.get("api_score") is not None:
+                        p["api_score"] = (p["api_score"] - min_s) / (max_s - min_s)
+            else:
+                for p in papers:
+                    if p.get("api_score") is not None:
+                        p["api_score"] = 0.5
+    # Fill remaining None with position-based scores
     total = max(len(papers), 1)
     for i, p in enumerate(papers):
         if p.get("api_score") is None:
