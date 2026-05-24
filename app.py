@@ -64,14 +64,26 @@ def _run_pipeline():
     # 为英文数据源过滤掉中文关键词
     en_search_terms = [t for t in search_terms if t and not _has_cjk(t)]
     if not en_search_terms:
-        # 翻译完全失败，没有可用的英文搜索词 → 直接跳过数据源检索
         print("[PaperPilot] 错误: 没有可用的英文搜索词，跳过 arXiv 和 OpenAlex 检索")
         print("[PaperPilot] 提示: 请在设置页配置有效的 DeepSeek API Key")
         return [], []
 
+    # 翻译课题描述为英文，用于并行语义检索和后续打分（同语言匹配区分度更高）
+    desc_en_query = None
+    desc = state.topic_desc.strip()
+    desc_en_terms = translate_terms([desc])
+    desc_en = [t for t in desc_en_terms if t and not _has_cjk(t)]
+    if desc_en:
+        desc_en_query = desc_en[0]
+        print(f"[PaperPilot] 课题描述翻译: {desc_en_query[:80]}...")
+    elif not _has_cjk(desc):
+        desc_en_query = desc
+        print(f"[PaperPilot] 课题描述原文即英文: {desc_en_query[:80]}...")
+
     print(f"\n[PaperPilot] 开始检索，关键词: {state.keywords}")
     print(f"[PaperPilot] 英文搜索词: {en_search_terms[:10]}...")
-    print(f"[PaperPilot] 课题描述: {state.topic_desc[:80]}...")
+    if desc_en_query:
+        print(f"[PaperPilot] 英文课题查询: {desc_en_query[:80]}...")
 
     if arxiv_switch.value:
         state.status_text = "arXiv 抓取中..."
@@ -82,69 +94,45 @@ def _run_pipeline():
             papers += results
         except Exception as e:
             print(f"[PaperPilot] arXiv 失败: {e}")
+        if desc_en_query:
+            try:
+                results_desc = fetch_arxiv([desc_en_query], max_results=max_per)
+                print(f"[PaperPilot] arXiv（描述）返回: {len(results_desc)} 篇")
+                papers += results_desc
+            except Exception as e:
+                print(f"[PaperPilot] arXiv（描述）失败: {e}")
 
     if openalex_switch.value:
         state.status_text = "OpenAlex 抓取中..."
-        # OpenAlex: 过滤掉单字泛词（Battery/Ion/Aqueous），保留词组
-        oa_terms = [t for t in en_search_terms if " " in t or "-" in t]
-        if not oa_terms:
-            oa_terms = en_search_terms
-        oa_query = " OR ".join(f'"{kw}"' for kw in oa_terms)
-        print(f"[PaperPilot] OpenAlex 查询: {oa_query[:200]}")
+        print(f"[PaperPilot] OpenAlex 查询: {' AND '.join(en_search_terms)}")
         try:
-            results = fetch_openalex([oa_query], max_results=max_per)
+            results = fetch_openalex(en_search_terms, max_results=max_per)
             print(f"[PaperPilot] OpenAlex 返回: {len(results)} 篇")
             papers += results
         except Exception as e:
             print(f"[PaperPilot] OpenAlex 失败: {e}")
+        if desc_en_query:
+            try:
+                results_desc = fetch_openalex([desc_en_query], max_results=max_per)
+                print(f"[PaperPilot] OpenAlex（描述）返回: {len(results_desc)} 篇")
+                papers += results_desc
+            except Exception as e:
+                print(f"[PaperPilot] OpenAlex（描述）失败: {e}")
 
     state.status_text = "去重中..."
     papers = deduplicate(papers)
     print(f"[PaperPilot] 去重后: {len(papers)} 篇")
 
     if not papers:
-        print("[PaperPilot] 未找到论文，尝试用课题描述直接搜索...")
-        # 翻译课题描述用于兜底搜索
-        desc = state.topic_desc.strip()
-        desc_en_terms = translate_terms([desc])
-        desc_en = [t for t in desc_en_terms if t and not _has_cjk(t)]
-        if desc_en:
-            desc_kw = desc_en
-            print(f"[PaperPilot] 描述兜底搜索（英文）: {desc_kw[0][:80]}...")
-        else:
-            # 翻译也失败了，课题描述中若纯英文可用，否则无计可施
-            if not _has_cjk(desc):
-                desc_kw = [desc[:200]]
-                print(f"[PaperPilot] 描述兜底搜索（原文）: {desc_kw[0][:80]}...")
-            else:
-                print("[PaperPilot] 无法生成英文兜底查询，放弃搜索")
-                return [], []
-
-        if arxiv_switch.value:
-            try:
-                results = fetch_arxiv(desc_kw, max_results=max_per)
-                print(f"[PaperPilot] 描述搜索 arXiv: {len(results)} 篇")
-                papers += results
-            except Exception as e:
-                print(f"[PaperPilot] 描述搜索 arXiv 失败: {e}")
-        if openalex_switch.value:
-            try:
-                results = fetch_openalex(desc_kw, max_results=max_per)
-                print(f"[PaperPilot] 描述搜索 OpenAlex: {len(results)} 篇")
-                papers += results
-            except Exception as e:
-                print(f"[PaperPilot] 描述搜索 OpenAlex 失败: {e}")
-        papers = deduplicate(papers)
-        print(f"[PaperPilot] 描述搜索去重后: {len(papers)} 篇")
-
-    if not papers:
+        print("[PaperPilot] 未找到论文")
         return [], []
 
     state.status_text = f"构建索引中（{len(papers)} 篇）..."
     idx, indexed_papers = build_index(papers)
 
     state.status_text = "排序中..."
-    scores = search_similar(state.topic_desc, idx, indexed_papers, top_k=20)
+    query_for_scoring = desc_en_query if desc_en_query else state.topic_desc
+    scores = search_similar(query_for_scoring, idx, indexed_papers, top_k=20)
 
     return papers, scores
 
