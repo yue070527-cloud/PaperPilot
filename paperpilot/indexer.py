@@ -15,6 +15,7 @@ from pathlib import Path
 
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 import faiss
 import numpy as np
