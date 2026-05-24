@@ -219,13 +219,51 @@ def rerank_with_cross_encoder(
     return reranked[:top_k]
 
 
+# ── 关键词匹配加分 ──
+
+def keyword_match_bonus(
+    paper: dict,
+    primary_kw: str | None,
+    secondary_kw: list[str],
+    regular_kw: list[str],
+    w_primary: float = 1.0,
+    w_secondary: float = 0.7,
+    w_regular: float = 0.4,
+) -> float:
+    """计算论文的关键词命中加分（逐层二分：命中一层即得分，不重复计数）。
+
+    在 title + abstract 中搜索关键词，每层最多计一次。
+    返回原始加分值，范围 0 到 w_primary + w_secondary + w_regular (max 2.1)。
+    """
+    title = (paper.get("title") or "").lower()
+    abstract = (paper.get("abstract") or "").lower()
+    text = f"{title} {abstract}"
+
+    bonus = 0.0
+    if primary_kw and primary_kw.lower() in text:
+        bonus += w_primary
+    for kw in secondary_kw:
+        if kw.lower() in text:
+            bonus += w_secondary
+            break
+    for kw in regular_kw:
+        if kw.lower() in text:
+            bonus += w_regular
+            break
+    return bonus
+
+
 # ── 分数融合 ──
 
 def fuse_scores(
     results: list[tuple[dict, float]],
     api_weight: float = 0.7,
+    primary_kw: str | None = None,
+    secondary_kw: list[str] | None = None,
+    regular_kw: list[str] | None = None,
+    kw_bonus_scale: float = 0.05,
 ) -> list[tuple[dict, float]]:
-    """融合 API 排序分（主）和语义分（辅）。
+    """融合 API 排序分（主）和语义分（辅）+ 关键词匹配加分。
 
     每篇论文的 api_score 来自 fetcher 层（arXiv/OpenAlex 排序位置归一化），
     semantic_score 来自 cross-encoder 或 FAISS bi-encoder。
@@ -233,19 +271,28 @@ def fuse_scores(
     Args:
         results: [(paper, semantic_score), ...] 列表
         api_weight: API 分数权重，默认 0.7
+        primary_kw: 主关键词（可选，用于匹配加分）
+        secondary_kw: 副关键词列表
+        regular_kw: 普通关键词列表
+        kw_bonus_scale: 关键词加分缩放系数，默认 0.05
 
     Returns:
         [(paper, fused_score), ...]，按融合分数降序
     """
+    secondary_kw = secondary_kw or []
+    regular_kw = regular_kw or []
+
     fused = []
     has_api = any(p.get("api_score") is not None for p, _ in results)
     for paper, sem_score in results:
         api_score = paper.get("api_score")
         if api_score is None:
             api_score = 0.5  # neutral default for sources w/o API score (local PDFs)
-        # Fall back to semantic-only if no API scores exist
         weight = api_weight if has_api else 0.0
         final = weight * api_score + (1 - weight) * sem_score
+        # Add keyword match bonus (small tiebreaker)
+        kw_bonus = keyword_match_bonus(paper, primary_kw, secondary_kw, regular_kw)
+        final += kw_bonus * kw_bonus_scale
         fused.append((paper, final))
     fused.sort(key=lambda x: -x[1])
     return fused
@@ -256,6 +303,10 @@ def rank_papers(
     papers: list[dict],
     top_k: int = 20,
     api_weight: float = 0.7,
+    primary_kw: str | None = None,
+    secondary_kw: list[str] | None = None,
+    regular_kw: list[str] | None = None,
+    kw_bonus_scale: float = 0.05,
 ) -> list[tuple[dict, float]]:
     """完整的论文排序流水线：FAISS 粗筛 → cross-encoder 精排 → API 分数融合。
 
@@ -264,6 +315,10 @@ def rank_papers(
         papers: 去重后的论文列表
         top_k: 最终返回数量
         api_weight: API 分数融合权重
+        primary_kw: 主关键词（可选，用于关键词匹配加分）
+        secondary_kw: 副关键词列表
+        regular_kw: 普通关键词列表
+        kw_bonus_scale: 关键词加分缩放系数
 
     Returns:
         [(paper, final_score), ...]，按分数降序
@@ -280,7 +335,14 @@ def rank_papers(
     # Stage 2: Cross-encoder 精排
     reranked = rerank_with_cross_encoder(query, candidates, top_k=top_k)
 
-    # Stage 3: API 分数融合
-    final = fuse_scores(reranked, api_weight=api_weight)
+    # Stage 3: API 分数融合 + 关键词匹配加分
+    final = fuse_scores(
+        reranked,
+        api_weight=api_weight,
+        primary_kw=primary_kw,
+        secondary_kw=secondary_kw,
+        regular_kw=regular_kw,
+        kw_bonus_scale=kw_bonus_scale,
+    )
 
     return final[:top_k]

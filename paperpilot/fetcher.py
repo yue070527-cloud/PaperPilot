@@ -35,6 +35,30 @@ def _build_search_query(keywords: list[str], logic: str = "OR") -> str:
     return joiner.join(f'"{kw}"' for kw in keywords)
 
 
+def _build_mixed_query(and_kw: list[str], or_kw: list[str]) -> str:
+    """Build mixed boolean query: must-match terms (AND) + should-match terms (OR).
+
+    Examples:
+        and_kw=["core1","core2"], or_kw=["reg1","reg2"]
+        → "core1" AND "core2" AND ("reg1" OR "reg2")
+
+        and_kw=[], or_kw=["kw1","kw2"]
+        → "kw1" OR "kw2"
+
+        and_kw=["primary"], or_kw=[]
+        → "primary"
+    """
+    if and_kw and or_kw:
+        and_part = " AND ".join(f'"{kw}"' for kw in and_kw)
+        or_part = " OR ".join(f'"{kw}"' for kw in or_kw)
+        return f'{and_part} AND ({or_part})'
+    elif and_kw:
+        return " AND ".join(f'"{kw}"' for kw in and_kw)
+    elif or_kw:
+        return " OR ".join(f'"{kw}"' for kw in or_kw)
+    return ""
+
+
 def _parse_arxiv_result(r) -> dict:
     authors = ", ".join(a.name for a in r.authors[:10])
     year = r.published.year if r.published else None
@@ -52,6 +76,23 @@ def _parse_arxiv_result(r) -> dict:
     }
 
 
+def _fetch_arxiv_raw(query: str, max_results: int = 30) -> list[dict]:
+    """Fetch papers from arXiv with a raw query string (internal helper)."""
+    client = arxiv.Client()
+    search = arxiv.Search(
+        query=query,
+        max_results=max_results,
+        sort_by=arxiv.SortCriterion.Relevance,
+    )
+    papers = []
+    for r in client.results(search):
+        papers.append(_parse_arxiv_result(r))
+    total = max(len(papers), 1)
+    for i, p in enumerate(papers):
+        p["api_score"] = 1.0 - (i / total)
+    return papers
+
+
 def fetch_arxiv(keywords: list[str], max_results: int = 30,
                 logic: str = "OR") -> list[dict]:
     """通过 arXiv API 检索论文。
@@ -67,20 +108,7 @@ def fetch_arxiv(keywords: list[str], max_results: int = 30,
     if not keywords:
         return []
     query = _build_search_query(keywords, logic=logic)
-    client = arxiv.Client()
-    search = arxiv.Search(
-        query=query,
-        max_results=max_results,
-        sort_by=arxiv.SortCriterion.Relevance,
-    )
-    papers = []
-    for r in client.results(search):
-        papers.append(_parse_arxiv_result(r))
-    # Attach position-based API relevance score
-    total = max(len(papers), 1)
-    for i, p in enumerate(papers):
-        p["api_score"] = 1.0 - (i / total)
-    return papers
+    return _fetch_arxiv_raw(query, max_results)
 
 
 def _parse_openalex_work(w: dict) -> dict | None:
@@ -120,6 +148,52 @@ def _decode_inverted_index(inv: dict) -> str:
     return " ".join(words)
 
 
+def _fetch_openalex_raw(query: str, max_results: int = 30) -> list[dict]:
+    """Fetch papers from OpenAlex with a raw query string (internal helper)."""
+    url = "https://api.openalex.org/works"
+    papers = []
+    per_page = min(50, max_results)
+    pages = (max_results + per_page - 1) // per_page
+    headers = {"User-Agent": "PaperPilot/1.0 (mailto:paperpilot@example.com)"}
+    for page in range(1, pages + 1):
+        params = {
+            "search": query,
+            "per_page": per_page,
+            "page": page,
+            "mailto": "paperpilot@example.com",
+        }
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=15)
+            for retry in range(3):
+                if resp.status_code != 429:
+                    break
+                time.sleep(1 * (retry + 1))
+                resp = requests.get(url, params=params, headers=headers, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            results = data.get("results", [])
+            page_total = len(results)
+            for i, w in enumerate(results):
+                paper = _parse_openalex_work(w)
+                if paper:
+                    api_rel = w.get("relevance_score")
+                    if api_rel is not None:
+                        paper["api_score"] = float(api_rel)
+                    else:
+                        paper["api_score"] = 1.0 - (i / max(page_total, 1))
+                    papers.append(paper)
+            if len(papers) >= max_results:
+                break
+            time.sleep(0.1)
+        except requests.RequestException:
+            continue
+    total = max(len(papers), 1)
+    for i, p in enumerate(papers):
+        if p.get("api_score") is None:
+            p["api_score"] = 1.0 - (i / total)
+    return papers[:max_results]
+
+
 def fetch_openalex(keywords: list[str], max_results: int = 30,
                    logic: str = "OR") -> list[dict]:
     """通过 OpenAlex API 检索论文（免 Key）。
@@ -135,51 +209,63 @@ def fetch_openalex(keywords: list[str], max_results: int = 30,
     if not keywords:
         return []
     query = _build_search_query(keywords, logic=logic)
-    url = "https://api.openalex.org/works"
-    papers = []
-    per_page = min(50, max_results)
-    pages = (max_results + per_page - 1) // per_page
-    headers = {"User-Agent": "PaperPilot/1.0 (mailto:paperpilot@example.com)"}
-    for page in range(1, pages + 1):
-        params = {
-            "search": query,
-            "per_page": per_page,
-            "page": page,
-            "mailto": "paperpilot@example.com",
-        }
-        try:
-            resp = requests.get(url, params=params, headers=headers, timeout=15)
-            # Retry with backoff on rate limit
-            for retry in range(3):
-                if resp.status_code != 429:
-                    break
-                time.sleep(1 * (retry + 1))
-                resp = requests.get(url, params=params, headers=headers, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-            results = data.get("results", [])
-            page_total = len(results)
-            for i, w in enumerate(results):
-                paper = _parse_openalex_work(w)
-                if paper:
-                    # OpenAlex relevance_score from API if available, else position-based
-                    api_rel = w.get("relevance_score")
-                    if api_rel is not None:
-                        paper["api_score"] = float(api_rel)
-                    else:
-                        paper["api_score"] = 1.0 - (i / max(page_total, 1))
-                    papers.append(paper)
-            if len(papers) >= max_results:
-                break
-            time.sleep(0.1)
-        except requests.RequestException:
+    return _fetch_openalex_raw(query, max_results)
+
+
+def fetch_with_cascade(
+    primary_kw: str | None,
+    secondary_kw: list[str],
+    regular_kw: list[str],
+    source: str = "arxiv",
+    max_results: int = 30,
+    min_results: int = 3,
+) -> tuple[list[dict], int]:
+    """三级级联检索：核心AND → 主关键词AND → 全部OR。
+
+    Strategy 0: 全部核心词 AND + 普通词 OR（最严，需用户未选主关键词时核心词全命中）
+    Strategy 1: (主关键词) AND (所有其他词 OR)（仅主关键词必须命中）
+    Strategy 2: 全部 OR（保底宽召回）
+
+    Args:
+        primary_kw: 用户选择的主关键词，None 表示未选择
+        secondary_kw: 副关键词（核心词中未被选为主关键词的）
+        regular_kw: 普通关键词
+        source: "arxiv" 或 "openalex"
+        max_results: 每次尝试的最大返回数
+        min_results: 触发降级的结果数阈值
+
+    Returns:
+        (papers, strategy_level): papers 含 api_score，strategy_level 0/1/2
+    """
+    fetch_raw = _fetch_arxiv_raw if source == "arxiv" else _fetch_openalex_raw
+    all_kw = ([primary_kw] if primary_kw else []) + secondary_kw + regular_kw
+    all_core = ([primary_kw] if primary_kw else []) + secondary_kw
+
+    strategies = []
+
+    # Strategy 0: all core AND + regular OR
+    if all_core:
+        q0 = _build_mixed_query(and_kw=all_core, or_kw=regular_kw)
+        strategies.append((0, q0))
+
+    # Strategy 1: primary AND + all others OR (only if primary is set)
+    if primary_kw:
+        others = secondary_kw + regular_kw
+        q1 = _build_mixed_query(and_kw=[primary_kw], or_kw=others)
+        strategies.append((1, q1))
+
+    # Strategy 2: all OR (safety net)
+    q2 = _build_mixed_query(and_kw=[], or_kw=all_kw)
+    strategies.append((2, q2))
+
+    for level, query in strategies:
+        if not query:
             continue
-    # Re-normalize position-based scores across all pages
-    total = max(len(papers), 1)
-    for i, p in enumerate(papers):
-        if p.get("api_score") is None:
-            p["api_score"] = 1.0 - (i / total)
-    return papers[:max_results]
+        papers = fetch_raw(query, max_results)
+        if len(papers) >= min_results or level == strategies[-1][0]:
+            return papers, level
+
+    return [], -1
 
 
 def _extract_text_from_page(page, max_chars: int = 3000) -> str:
