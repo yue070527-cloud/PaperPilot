@@ -10,6 +10,7 @@
         "source": str,        # "arxiv" | "openalex" | "local_pdf"
         "url": str | None,
         "doi": str | None,
+        "api_score": float,   # 0.0-1.0, API 原始排序位置归一化
     }
 """
 
@@ -23,9 +24,15 @@ import fitz
 import requests
 
 
-def _build_search_query(keywords: list[str]) -> str:
-    """Build quoted-phrase OR query for search APIs (arXiv, OpenAlex)."""
-    return " OR ".join(f'"{kw}"' for kw in keywords)
+def _build_search_query(keywords: list[str], logic: str = "OR") -> str:
+    """Build quoted-phrase query for search APIs (arXiv, OpenAlex).
+
+    Args:
+        keywords: list of keyword phrases
+        logic: "OR" (default, broad recall) or "AND" (strict, all must match)
+    """
+    joiner = " AND " if logic == "AND" else " OR "
+    return joiner.join(f'"{kw}"' for kw in keywords)
 
 
 def _parse_arxiv_result(r) -> dict:
@@ -45,17 +52,21 @@ def _parse_arxiv_result(r) -> dict:
     }
 
 
-def fetch_arxiv(keywords: list[str], max_results: int = 30) -> list[dict]:
+def fetch_arxiv(keywords: list[str], max_results: int = 30,
+                logic: str = "OR") -> list[dict]:
     """通过 arXiv API 检索论文。
 
     Args:
-        keywords: 关键词列表，多词用 AND 逻辑
+        keywords: 关键词列表
         max_results: 最大返回数
+        logic: "OR"（宽召回，默认）或 "AND"（核心词全部命中）
 
     Returns:
-        paper dict 列表
+        paper dict 列表，含 api_score 字段（0.0-1.0，API 排序位置归一化）
     """
-    query = _build_search_query(keywords)
+    if not keywords:
+        return []
+    query = _build_search_query(keywords, logic=logic)
     client = arxiv.Client()
     search = arxiv.Search(
         query=query,
@@ -65,6 +76,10 @@ def fetch_arxiv(keywords: list[str], max_results: int = 30) -> list[dict]:
     papers = []
     for r in client.results(search):
         papers.append(_parse_arxiv_result(r))
+    # Attach position-based API relevance score
+    total = max(len(papers), 1)
+    for i, p in enumerate(papers):
+        p["api_score"] = 1.0 - (i / total)
     return papers
 
 
@@ -105,17 +120,21 @@ def _decode_inverted_index(inv: dict) -> str:
     return " ".join(words)
 
 
-def fetch_openalex(keywords: list[str], max_results: int = 30) -> list[dict]:
+def fetch_openalex(keywords: list[str], max_results: int = 30,
+                   logic: str = "OR") -> list[dict]:
     """通过 OpenAlex API 检索论文（免 Key）。
 
     Args:
         keywords: 关键词列表
         max_results: 最大返回数
+        logic: "OR"（宽召回，默认）或 "AND"（核心词全部命中）
 
     Returns:
-        paper dict 列表
+        paper dict 列表，含 api_score 字段（0.0-1.0，API 排序位置归一化）
     """
-    query = _build_search_query(keywords)
+    if not keywords:
+        return []
+    query = _build_search_query(keywords, logic=logic)
     url = "https://api.openalex.org/works"
     papers = []
     per_page = min(50, max_results)
@@ -138,15 +157,28 @@ def fetch_openalex(keywords: list[str], max_results: int = 30) -> list[dict]:
                 resp = requests.get(url, params=params, headers=headers, timeout=15)
             resp.raise_for_status()
             data = resp.json()
-            for w in data.get("results", []):
+            results = data.get("results", [])
+            page_total = len(results)
+            for i, w in enumerate(results):
                 paper = _parse_openalex_work(w)
                 if paper:
+                    # OpenAlex relevance_score from API if available, else position-based
+                    api_rel = w.get("relevance_score")
+                    if api_rel is not None:
+                        paper["api_score"] = float(api_rel)
+                    else:
+                        paper["api_score"] = 1.0 - (i / max(page_total, 1))
                     papers.append(paper)
             if len(papers) >= max_results:
                 break
             time.sleep(0.1)
         except requests.RequestException:
             continue
+    # Re-normalize position-based scores across all pages
+    total = max(len(papers), 1)
+    for i, p in enumerate(papers):
+        if p.get("api_score") is None:
+            p["api_score"] = 1.0 - (i / total)
     return papers[:max_results]
 
 
