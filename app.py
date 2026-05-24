@@ -8,8 +8,8 @@ import flet as ft
 
 from paperpilot.keywords import extract_all_keywords, merge_keywords
 from paperpilot.mt_translator import translate_terms
-from paperpilot.fetcher import fetch_arxiv, fetch_openalex, deduplicate
-from paperpilot.indexer import build_index, search_similar
+from paperpilot.fetcher import fetch_arxiv, fetch_openalex, fetch_with_cascade, deduplicate
+from paperpilot.indexer import rank_papers
 
 
 # ── 主题定义 ──
@@ -44,9 +44,11 @@ class AppState:
     def __init__(self):
         self.topic_name: str = ""
         self.topic_desc: str = ""
-        self.keywords: list[str] = []
-        self.weighted_keywords: list[tuple[str, float]] = []
-        self.primary_keywords: list[str] = []
+        # 三层关键词结构（全部手工拖拽归类）
+        self.keywords: list[str] = []               # 扁平列表，向后兼容
+        self.primary_keywords: list[str] = []         # 主关键词（拖入）
+        self.secondary_keywords: list[str] = []       # 副关键词（拖入）
+        self.regular_keywords: list[str] = []         # 普通关键词（默认归属）
         self.papers: list[dict] = []
         self.scores: list[tuple[dict, float]] = []
         self.is_searching: bool = False
@@ -68,45 +70,14 @@ def _has_cjk(text: str) -> bool:
 
 
 def _run_pipeline():
-    """在后台线程中运行完整的搜索流水线。"""
+    """在后台线程中运行完整的搜索流水线。
+
+    使用三级级联检索 + cross-encoder 精排 + API 分数融合 + 关键词匹配加分。
+    """
     papers = []
     max_per = int(max_results_slider.value)
 
-    # ── 构建分层关键词：核心（AND 连接）+ 普通（OR 连接） ──
-    core_terms: list[str] = list(state.primary_keywords)
-    core_lower = {k.lower() for k in core_terms}
-    regular_terms: list[str] = []
-
-    for kw, weight in state.weighted_keywords:
-        if kw.lower() in core_lower:
-            continue
-        if weight >= 1.0:
-            core_terms.append(kw)
-            core_lower.add(kw.lower())
-        else:
-            regular_terms.append(kw)
-
-    print(f"[PaperPilot] 核心关键词 ({len(core_terms)}): {core_terms}")
-    print(f"[PaperPilot] 普通关键词 ({len(regular_terms)}): {regular_terms}")
-
-    # 分别翻译核心和普通关键词
-    core_en_raw = translate_terms(core_terms) if core_terms else []
-    regular_en_raw = translate_terms(regular_terms) if regular_terms else []
-
-    en_core_terms = [t for t in core_en_raw if t and not _has_cjk(t)]
-    en_regular_terms = [t for t in regular_en_raw if t and not _has_cjk(t)]
-
-    # 合并为扁平列表（当前 fetcher 接口，等 A 更新后改为分层传参）
-    en_search_terms = en_core_terms + en_regular_terms
-    if not en_search_terms:
-        print("[PaperPilot] 错误: 没有可用的英文搜索词，跳过 arXiv 和 OpenAlex 检索")
-        print("[PaperPilot] 提示: 请在设置页配置有效的 DeepSeek API Key")
-        return [], []
-
-    print(f"[PaperPilot] 英文核心 ({len(en_core_terms)}): {en_core_terms}")
-    print(f"[PaperPilot] 英文普通 ({len(en_regular_terms)}): {en_regular_terms}")
-
-    # 翻译课题描述为英文，用于并行语义检索和后续打分（同语言匹配区分度更高）
+    # 1. 翻译课题描述（用于打分 + 并行描述检索）
     desc_en_query = None
     desc = state.topic_desc.strip()
     desc_en_terms = translate_terms([desc])
@@ -118,45 +89,76 @@ def _run_pipeline():
         desc_en_query = desc
         print(f"[PaperPilot] 课题描述原文即英文: {desc_en_query[:80]}...")
 
-    print(f"\n[PaperPilot] 开始检索，关键词: {state.keywords}")
-    print(f"[PaperPilot] 英文搜索词: {en_search_terms[:10]}...")
-    if desc_en_query:
-        print(f"[PaperPilot] 英文课题查询: {desc_en_query[:80]}...")
+    # 2. 翻译三层关键词
+    primary_en_list = [t for t in translate_terms(state.primary_keywords)
+                       if t and not _has_cjk(t)]
+    secondary_en = [t for t in translate_terms(state.secondary_keywords)
+                    if t and not _has_cjk(t)]
+    regular_en = [t for t in translate_terms(state.regular_keywords)
+                  if t and not _has_cjk(t)]
 
+    # fetch_with_cascade 的 primary_kw 是单选，取第一个主关键词
+    primary_en = primary_en_list[0] if primary_en_list else None
+    # 其余主关键词并入副关键词（均参与 AND 组）
+    secondary_en = primary_en_list[1:] + secondary_en
+
+    print(f"\n[PaperPilot] 开始检索")
+    print(f"[PaperPilot] 主关键词: {primary_en}")
+    print(f"[PaperPilot] 副关键词: {secondary_en}")
+    print(f"[PaperPilot] 普通关键词: {regular_en}")
+
+    # 3. 级联检索
     if arxiv_switch.value:
         state.status_text = "arXiv 抓取中..."
-        print(f"[PaperPilot] arXiv 查询: {en_search_terms}")
         try:
-            results = fetch_arxiv(en_search_terms, max_results=max_per)
-            print(f"[PaperPilot] arXiv 返回: {len(results)} 篇")
-            papers += results
+            arxiv_papers, level = fetch_with_cascade(
+                primary_kw=primary_en,
+                secondary_kw=secondary_en,
+                regular_kw=regular_en,
+                source="arxiv",
+                max_results=max_per,
+                min_results=3,
+            )
+            print(f"[PaperPilot] arXiv 返回: {len(arxiv_papers)} 篇 (策略{level})")
+            papers += arxiv_papers
         except Exception as e:
             print(f"[PaperPilot] arXiv 失败: {e}")
+
+        # 课题描述并行检索（补充召回）
         if desc_en_query:
             try:
-                results_desc = fetch_arxiv([desc_en_query], max_results=max_per)
-                print(f"[PaperPilot] arXiv（描述）返回: {len(results_desc)} 篇")
-                papers += results_desc
+                desc_papers = fetch_arxiv([desc_en_query], max_results=max_per, logic="OR")
+                print(f"[PaperPilot] arXiv（描述）返回: {len(desc_papers)} 篇")
+                papers += desc_papers
             except Exception as e:
                 print(f"[PaperPilot] arXiv（描述）失败: {e}")
 
     if openalex_switch.value:
         state.status_text = "OpenAlex 抓取中..."
-        print(f"[PaperPilot] OpenAlex 查询: {en_search_terms}")
         try:
-            results = fetch_openalex(en_search_terms, max_results=max_per)
-            print(f"[PaperPilot] OpenAlex 返回: {len(results)} 篇")
-            papers += results
+            oa_papers, oa_level = fetch_with_cascade(
+                primary_kw=primary_en,
+                secondary_kw=secondary_en,
+                regular_kw=regular_en,
+                source="openalex",
+                max_results=max_per,
+                min_results=3,
+            )
+            print(f"[PaperPilot] OpenAlex 返回: {len(oa_papers)} 篇 (策略{oa_level})")
+            papers += oa_papers
         except Exception as e:
             print(f"[PaperPilot] OpenAlex 失败: {e}")
+
+        # 课题描述并行检索
         if desc_en_query:
             try:
-                results_desc = fetch_openalex([desc_en_query], max_results=max_per)
-                print(f"[PaperPilot] OpenAlex（描述）返回: {len(results_desc)} 篇")
-                papers += results_desc
+                desc_papers = fetch_openalex([desc_en_query], max_results=max_per, logic="OR")
+                print(f"[PaperPilot] OpenAlex（描述）返回: {len(desc_papers)} 篇")
+                papers += desc_papers
             except Exception as e:
                 print(f"[PaperPilot] OpenAlex（描述）失败: {e}")
 
+    # 4. 去重
     state.status_text = "去重中..."
     papers = deduplicate(papers)
     print(f"[PaperPilot] 去重后: {len(papers)} 篇")
@@ -165,12 +167,18 @@ def _run_pipeline():
         print("[PaperPilot] 未找到论文")
         return [], []
 
-    state.status_text = f"构建索引中（{len(papers)} 篇）..."
-    idx, indexed_papers = build_index(papers)
-
-    state.status_text = "排序中..."
+    # 5. 排序打分（FAISS -> cross-encoder -> fusion + 关键词加分）
+    state.status_text = f"排序中（{len(papers)} 篇）..."
     query_for_scoring = desc_en_query if desc_en_query else state.topic_desc
-    scores = search_similar(query_for_scoring, idx, indexed_papers, top_k=20)
+    scores = rank_papers(
+        query=query_for_scoring,
+        papers=papers,
+        top_k=20,
+        api_weight=0.7,
+        primary_kw=primary_en,
+        secondary_kw=secondary_en,
+        regular_kw=regular_en,
+    )
 
     return papers, scores
 
@@ -246,15 +254,129 @@ def build_project_page():
         expand=True,
     )
 
-    keywords_row = ft.Row(wrap=True, spacing=6)
-    primary_chips_row = ft.Row(wrap=True, spacing=6)
+    # ── 三个拖拽区 ──
+    primary_zone_row = ft.Row(wrap=True, spacing=6)
+    secondary_zone_row = ft.Row(wrap=True, spacing=6)
+    regular_zone_row = ft.Row(wrap=True, spacing=6)
+
+    def _make_draggable_chip(kw: str, zone: str, icon, color):
+        """创建可拖拽的关键词 Chip。"""
+        chip = ft.Chip(
+            label=ft.Text(kw, weight=ft.FontWeight.BOLD if zone == "primary" else None),
+            leading=ft.Icon(icon, size=14, color=color) if icon else None,
+            bgcolor=ft.Colors.PRIMARY_CONTAINER if zone == "primary" else None,
+            on_delete=lambda e, k=kw: _on_delete_keyword(k),
+        )
+        return ft.Draggable(
+            content=chip,
+            data={"kw": kw, "from": zone},
+            group="kw",
+            content_feedback=ft.Chip(
+                label=ft.Text(kw),
+                bgcolor=ft.Colors.SURFACE,
+            ),
+        )
+
+    def _on_delete_keyword(kw: str):
+        """从所有区域中删除关键词。"""
+        state.primary_keywords = [k for k in state.primary_keywords if k != kw]
+        state.secondary_keywords = [k for k in state.secondary_keywords if k != kw]
+        state.regular_keywords = [k for k in state.regular_keywords if k != kw]
+        state.keywords = [k for k in state.keywords if k != kw]
+        refresh_all_zones()
+
+    def _make_on_accept(target_zone: str):
+        """创建 DragTarget on_accept 回调。"""
+        def on_accept(e: ft.DragTargetEvent):
+            kw = e.src.data["kw"]
+            from_zone = e.src.data["from"]
+            if from_zone == target_zone:
+                return
+            # 从原区域移除
+            for attr in ["primary_keywords", "secondary_keywords", "regular_keywords"]:
+                lst = getattr(state, attr)
+                if kw in lst:
+                    lst.remove(kw)
+                    break
+            # 添加到目标区域
+            if target_zone == "primary":
+                state.primary_keywords.append(kw)
+            elif target_zone == "secondary":
+                state.secondary_keywords.append(kw)
+            else:
+                state.regular_keywords.append(kw)
+            refresh_all_zones()
+        return on_accept
+
+    _drop_border = ft.BorderSide(2, ft.Colors.PRIMARY)
+
+    def _make_zone(label: str, hint: str, chip_row: ft.Row,
+                   zone_name: str, icon, color):
+        """构建拖拽区：标题 + DragTarget。"""
+        def on_will_accept(e: ft.DragTargetEvent):
+            if e.src.data and e.src.data.get("from") != zone_name:
+                zone_container.border = ft.Border(
+                    _drop_border, _drop_border, _drop_border, _drop_border
+                )
+                zone_container.update()
+                return True
+            return False
+
+        def on_leave(e: ft.DragTargetEvent):
+            zone_container.border = _border(ft.Colors.OUTLINE_VARIANT)
+            zone_container.update()
+
+        zone_container = ft.Container(
+            content=chip_row,
+            border=_border(ft.Colors.OUTLINE_VARIANT),
+            border_radius=8,
+            padding=8,
+            bgcolor=ft.Colors.SURFACE if hasattr(ft.Colors, 'SURFACE') else None,
+        )
+
+        drag_target = ft.DragTarget(
+            content=zone_container,
+            group="kw",
+            on_will_accept=on_will_accept,
+            on_accept=_make_on_accept(zone_name),
+            on_leave=on_leave,
+        )
+
+        return ft.Column([
+            ft.Row([
+                ft.Icon(icon, size=16, color=color) if icon else ft.Text(""),
+                ft.Text(label, size=13, weight=ft.FontWeight.W_500),
+            ], spacing=4),
+            drag_target,
+            ft.Text(hint, size=11, italic=True, color=ft.Colors.OUTLINE),
+        ], spacing=4)
+
+    def refresh_all_zones():
+        """刷新三个拖拽区的 Chip 显示。"""
+        zones = [
+            ("primary",   state.primary_keywords,   primary_zone_row,
+             ft.Icons.STAR, ft.Colors.AMBER, "拖拽关键词至此设为「主关键词」"),
+            ("secondary", state.secondary_keywords, secondary_zone_row,
+             ft.Icons.ARROW_FORWARD, ft.Colors.PRIMARY, "拖拽关键词至此设为「副关键词」"),
+            ("regular",   state.regular_keywords,   regular_zone_row,
+             None, None, "拖拽关键词至此设为「普通关键词」"),
+        ]
+        for zone_name, keywords, row, icon, color, hint in zones:
+            row.controls.clear()
+            for kw in keywords:
+                row.controls.append(_make_draggable_chip(kw, zone_name, icon, color))
+            if not keywords:
+                row.controls.append(
+                    ft.Text(hint, size=12, italic=True, color=ft.Colors.OUTLINE)
+                )
+            try:
+                row.update()
+            except RuntimeError:
+                pass  # 控件尚未挂载到页面，跳过更新
+
     manual_kw_field = ft.TextField(
         label="手动添加关键词", hint_text="输入后回车添加",
         prefix_icon=ft.Icons.ADD, expand=True,
-    )
-    primary_kw_field = ft.TextField(
-        label="主关键词（可选）", hint_text="核心词，逗号分隔，回车添加；检索时强制命中",
-        prefix_icon=ft.Icons.STAR, expand=True,
     )
     progress_bar = ft.ProgressBar(visible=False, expand=True)
     status_text = ft.Text("", size=13, italic=True)
@@ -328,9 +450,13 @@ def build_project_page():
         status_text.update()
         try:
             weighted = extract_all_keywords(desc, top_n=8)
+            core_kw = [kw for kw, w in weighted if w >= 1.0]
+            regular_kw = [kw for kw, w in weighted if 0 < w < 1.0]
+            state.primary_keywords = []
+            state.secondary_keywords = core_kw   # AI 认定的核心词初始放入副关键词
+            state.regular_keywords = regular_kw  # 普通词放普通区
             state.keywords = [kw for kw, _ in weighted]
-            state.weighted_keywords = weighted
-            refresh_keyword_chips(keywords_row, manual_kw_field, primary_chips_row)
+            refresh_all_zones()
             status_text.value = f"已提取 {len(state.keywords)} 个关键词"
         except Exception as ex:
             status_text.value = f"提取失败: {ex}"
@@ -339,34 +465,21 @@ def build_project_page():
     def on_add_keyword(e):
         kw = (e.control.value or "").strip()
         if kw:
+            state.regular_keywords.append(kw)
             state.keywords = merge_keywords(state.keywords, [kw])
-            state.weighted_keywords.append((kw.lower(), 0.5))
             manual_kw_field.value = ""
             manual_kw_field.update()
-            refresh_keyword_chips(keywords_row, manual_kw_field, primary_chips_row)
+            refresh_all_zones()
 
     manual_kw_field.on_submit = on_add_keyword
-
-    def on_add_primary(e):
-        text = (e.control.value or "").strip()
-        if text:
-            for kw in text.split(","):
-                kw = kw.strip()
-                if kw and kw not in state.primary_keywords:
-                    state.primary_keywords.append(kw)
-            primary_kw_field.value = ""
-            primary_kw_field.update()
-            refresh_keyword_chips(keywords_row, manual_kw_field, primary_chips_row)
-
-    primary_kw_field.on_submit = on_add_primary
 
     def on_start_search(e):
         if not topic_desc_field.value.strip():
             status_text.value = "请先输入课题描述"
             status_text.update()
             return
-        if not state.keywords and not state.primary_keywords:
-            status_text.value = "请先提取关键词或设置主关键词"
+        if not state.keywords:
+            status_text.value = "请先提取关键词"
             status_text.update()
             return
 
@@ -423,6 +536,9 @@ def build_project_page():
         style=ft.ButtonStyle(padding=ft.padding.Padding(left=32, top=16, right=32, bottom=16)),
     )
 
+    # 初始化分区（恢复已有状态）
+    refresh_all_zones()
+
     return ft.Column([
         ft.Text("PaperPilot", size=28, weight=ft.FontWeight.BOLD),
         ft.Text("课题驱动的智能文献筛选", size=14, italic=True),
@@ -437,63 +553,20 @@ def build_project_page():
             ),
             manual_kw_field,
         ], spacing=8),
-        primary_kw_field,
-        primary_chips_row,
-        keywords_row,
+        _make_zone("主关键词", "拖拽关键词至此设为「主关键词」",
+                   primary_zone_row, "primary",
+                   ft.Icons.STAR, ft.Colors.AMBER),
+        _make_zone("副关键词", "拖拽关键词至此设为「副关键词」",
+                   secondary_zone_row, "secondary",
+                   ft.Icons.ARROW_FORWARD, ft.Colors.PRIMARY),
+        _make_zone("普通关键词", "拖拽关键词至此设为「普通关键词」",
+                   regular_zone_row, "regular",
+                   None, None),
         ft.Divider(height=12),
         ft.Row([search_btn, progress_bar], spacing=16),
         status_text,
         results_area,
     ], spacing=8, scroll=ft.ScrollMode.AUTO)
-
-
-def refresh_keyword_chips(kw_row: ft.Row, kw_field: ft.TextField,
-                          primary_row: ft.Row | None = None):
-    """刷新关键词标签列表，主关键词以星标区分。"""
-    # 主关键词行
-    if primary_row is not None:
-        primary_row.controls.clear()
-        for kw in state.primary_keywords:
-            def make_primary_delete(k=kw):
-                def on_delete(e):
-                    state.primary_keywords = [p for p in state.primary_keywords if p != k]
-                    refresh_keyword_chips(kw_row, kw_field, primary_row)
-                    primary_row.update()
-                return on_delete
-            primary_row.controls.append(
-                ft.Chip(
-                    label=ft.Text(kw, weight=ft.FontWeight.BOLD),
-                    leading=ft.Icon(ft.Icons.STAR, size=14, color=ft.Colors.AMBER),
-                    on_delete=make_primary_delete(),
-                )
-            )
-        if state.primary_keywords:
-            primary_row.controls.append(
-                ft.Text(f"（{len(state.primary_keywords)} 个核心）", size=12, italic=True)
-            )
-        primary_row.update()
-
-    # 普通关键词行
-    kw_row.controls.clear()
-    primary_set = {p.lower() for p in state.primary_keywords}
-    for kw in state.keywords:
-        if kw.lower() in primary_set:
-            continue  # 已在主关键词行显示
-
-        def make_delete(k=kw):
-            def on_delete(e):
-                state.keywords = [k2 for k2 in state.keywords if k2 != k]
-                refresh_keyword_chips(kw_row, kw_field, primary_row)
-                kw_row.update()
-            return on_delete
-
-        kw_row.controls.append(
-            ft.Chip(label=ft.Text(kw), on_delete=make_delete())
-        )
-    regular_count = len([k for k in state.keywords if k.lower() not in primary_set])
-    if regular_count:
-        kw_row.controls.append(ft.Text(f"（{regular_count} 个）", size=12, italic=True))
-    kw_row.update()
 
 
 # ── 文献详情 ──
