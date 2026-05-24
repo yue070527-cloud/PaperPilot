@@ -197,7 +197,15 @@ def rerank_with_cross_encoder(
     """
     ce = _get_cross_encoder()
     if ce is None or not results:
-        return results[:top_k]
+        # Cross-encoder unavailable — normalize FAISS scores to [0, 1]
+        scores_arr = np.array([s for _, s in results])
+        min_s, max_s = scores_arr.min(), scores_arr.max()
+        if max_s > min_s:
+            normalized = [(p, float((s - min_s) / (max_s - min_s))) for p, s in results]
+        else:
+            normalized = [(p, 0.5) for p, _ in results]
+        normalized.sort(key=lambda x: -x[1])
+        return normalized[:top_k]
 
     pairs = [(query, p.get("abstract", "") or "") for p, _ in results]
     try:
@@ -288,6 +296,9 @@ def fuse_scores(
         api_score = paper.get("api_score")
         if api_score is None:
             api_score = 0.5  # neutral default for sources w/o API score (local PDFs)
+        # Safety clamp: ensure both scores are in [0, 1]
+        api_score = max(0.0, min(1.0, float(api_score)))
+        sem_score = max(0.0, min(1.0, float(sem_score)))
         weight = api_weight if has_api else 0.0
         final = weight * api_score + (1 - weight) * sem_score
         # Add keyword match bonus (small tiebreaker)
