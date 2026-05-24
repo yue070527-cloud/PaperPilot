@@ -1,28 +1,21 @@
-# PaperPilot 配置文件
-# 所有敏感信息通过环境变量覆盖，不要硬编码
-
-# DeepSeek API（核心关键词提取 + 中→英翻译）
 deepseek:
   api_key: ${DEEPSEEK_API_KEY}
-
 embedding:
   local_model: paraphrase-multilingual-MiniLM-L12-v2
   cache_dir: ./cache/embedding
-
 data_sources:
   arxiv: true
   openalex: true
   local_pdf: true
-
 search:
   max_results_per_source: 30
   default_top_k: 20
-
 cache:
   dir: ./cache/api
   ttl_hours: 24
-
 ui:
   window_width: 1100
   window_height: 750
   title: PaperPilot
+  theme: sand
+  dark_mode: true

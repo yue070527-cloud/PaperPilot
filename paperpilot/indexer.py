@@ -2,12 +2,14 @@
 
 Phase 1 核心流水线：
     论文摘要 → 本地多语言 Embedding → FAISS IndexFlatIP → 相似度检索
+    → Cross-Encoder 精排 → API 分数融合 → 最终排序
 
 使用 paraphrase-multilingual-MiniLM-L12-v2（384维），
 本地运行，中英文跨语言匹配，无需网络。
 """
 
 import hashlib
+import logging
 import os
 from pathlib import Path
 
@@ -20,12 +22,19 @@ from sentence_transformers import SentenceTransformer
 
 from paperpilot.config import config
 
+logger = logging.getLogger(__name__)
+
 _MODEL_PATH = str(Path.home() / ".cache/modelscope/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 _MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
 # 优先 ModelScope 本地缓存，回退到 HuggingFace 缓存
 _MODEL = _MODEL_PATH if Path(_MODEL_PATH).exists() else _MODEL_NAME
 _cache_dir = Path(config.get("cache", {}).get("dir", "./cache/api"))
 _model: SentenceTransformer | None = None
+
+# Cross-encoder 模型路径（与 bi-encoder 同级缓存目录）
+_CE_MODEL_PATH = str(Path.home() / ".cache/modelscope/sentence-transformers/cross-encoder/ms-marco-MiniLM-L-6-v2")
+_CE_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+_cross_encoder = None
 
 
 def _get_model() -> SentenceTransformer:
@@ -133,3 +142,218 @@ def save_index(index, path: str) -> None:
 def load_index(path: str):
     """从磁盘加载 FAISS 索引。"""
     return faiss.read_index(str(path))
+
+
+# ── Cross-Encoder 重排序 ──
+
+def _get_cross_encoder():
+    """加载 cross-encoder 模型（懒加载 + 本地缓存优先）。"""
+    global _cross_encoder
+    if _cross_encoder is not None:
+        return _cross_encoder
+
+    from sentence_transformers import CrossEncoder
+
+    # 优先本地缓存
+    if Path(_CE_MODEL_PATH).exists():
+        logger.info(f"Loading cross-encoder from cache: {_CE_MODEL_PATH}")
+        _cross_encoder = CrossEncoder(_CE_MODEL_PATH)
+        return _cross_encoder
+
+    # 尝试在线下载（覆盖 OFFLINE 标志）
+    logger.info("Cross-encoder not cached, attempting download...")
+    try:
+        old_hf = os.environ.pop("HF_HUB_OFFLINE", None)
+        old_tr = os.environ.pop("TRANSFORMERS_OFFLINE", None)
+        _cross_encoder = CrossEncoder(_CE_MODEL_NAME)
+    except Exception as e:
+        logger.warning(f"Cross-encoder download failed: {e}")
+        _cross_encoder = None
+    finally:
+        if old_hf is not None:
+            os.environ["HF_HUB_OFFLINE"] = old_hf
+        if old_tr is not None:
+            os.environ["TRANSFORMERS_OFFLINE"] = old_tr
+
+    return _cross_encoder
+
+
+def rerank_with_cross_encoder(
+    query: str,
+    results: list[tuple[dict, float]],
+    top_k: int = 20,
+) -> list[tuple[dict, float]]:
+    """用 cross-encoder 对 FAISS 粗筛结果精排。
+
+    bi-encoder 召回 → cross-encoder 精排，IR 经典两阶段范式。
+
+    Args:
+        query: 课题描述（英文，同语言匹配区分度更高）
+        results: FAISS 返回的 [(paper, faiss_score), ...] 列表
+        top_k: 最终返回数量
+
+    Returns:
+        [(paper, cross_encoder_score), ...]，按分数降序
+    """
+    ce = _get_cross_encoder()
+    if ce is None or not results:
+        # Cross-encoder unavailable — normalize FAISS scores to [0, 1]
+        scores_arr = np.array([s for _, s in results])
+        min_s, max_s = scores_arr.min(), scores_arr.max()
+        if max_s > min_s:
+            normalized = [(p, float((s - min_s) / (max_s - min_s))) for p, s in results]
+        else:
+            normalized = [(p, 0.5) for p, _ in results]
+        normalized.sort(key=lambda x: -x[1])
+        return normalized[:top_k]
+
+    pairs = [(query, p.get("abstract", "") or "") for p, _ in results]
+    try:
+        scores = ce.predict(pairs, show_progress_bar=False)
+        # Normalize to [0, 1]
+        min_s, max_s = scores.min(), scores.max()
+        if max_s > min_s:
+            scores = (scores - min_s) / (max_s - min_s)
+        else:
+            scores = np.zeros_like(scores)
+    except Exception as e:
+        logger.warning(f"Cross-encoder prediction failed: {e}")
+        return results[:top_k]
+
+    reranked = sorted(
+        zip([p for p, _ in results], scores),
+        key=lambda x: -x[1],
+    )
+    return reranked[:top_k]
+
+
+# ── 关键词匹配加分 ──
+
+def keyword_match_bonus(
+    paper: dict,
+    primary_kw: str | None,
+    secondary_kw: list[str],
+    regular_kw: list[str],
+    w_primary: float = 1.0,
+    w_secondary: float = 0.7,
+    w_regular: float = 0.4,
+) -> float:
+    """计算论文的关键词命中加分（逐层二分：命中一层即得分，不重复计数）。
+
+    在 title + abstract 中搜索关键词，每层最多计一次。
+    返回原始加分值，范围 0 到 w_primary + w_secondary + w_regular (max 2.1)。
+    """
+    title = (paper.get("title") or "").lower()
+    abstract = (paper.get("abstract") or "").lower()
+    text = f"{title} {abstract}"
+
+    bonus = 0.0
+    if primary_kw and primary_kw.lower() in text:
+        bonus += w_primary
+    for kw in secondary_kw:
+        if kw.lower() in text:
+            bonus += w_secondary
+            break
+    for kw in regular_kw:
+        if kw.lower() in text:
+            bonus += w_regular
+            break
+    return bonus
+
+
+# ── 分数融合 ──
+
+def fuse_scores(
+    results: list[tuple[dict, float]],
+    api_weight: float = 0.7,
+    primary_kw: str | None = None,
+    secondary_kw: list[str] | None = None,
+    regular_kw: list[str] | None = None,
+    kw_bonus_scale: float = 0.05,
+) -> list[tuple[dict, float]]:
+    """融合 API 排序分（主）和语义分（辅）+ 关键词匹配加分。
+
+    每篇论文的 api_score 来自 fetcher 层（arXiv/OpenAlex 排序位置归一化），
+    semantic_score 来自 cross-encoder 或 FAISS bi-encoder。
+
+    Args:
+        results: [(paper, semantic_score), ...] 列表
+        api_weight: API 分数权重，默认 0.7
+        primary_kw: 主关键词（可选，用于匹配加分）
+        secondary_kw: 副关键词列表
+        regular_kw: 普通关键词列表
+        kw_bonus_scale: 关键词加分缩放系数，默认 0.05
+
+    Returns:
+        [(paper, fused_score), ...]，按融合分数降序
+    """
+    secondary_kw = secondary_kw or []
+    regular_kw = regular_kw or []
+
+    fused = []
+    has_api = any(p.get("api_score") is not None for p, _ in results)
+    for paper, sem_score in results:
+        api_score = paper.get("api_score")
+        if api_score is None:
+            api_score = 0.5  # neutral default for sources w/o API score (local PDFs)
+        # Safety clamp: ensure both scores are in [0, 1]
+        api_score = max(0.0, min(1.0, float(api_score)))
+        sem_score = max(0.0, min(1.0, float(sem_score)))
+        weight = api_weight if has_api else 0.0
+        final = weight * api_score + (1 - weight) * sem_score
+        # Add keyword match bonus (small tiebreaker)
+        kw_bonus = keyword_match_bonus(paper, primary_kw, secondary_kw, regular_kw)
+        final += kw_bonus * kw_bonus_scale
+        fused.append((paper, final))
+    fused.sort(key=lambda x: -x[1])
+    return fused
+
+
+def rank_papers(
+    query: str,
+    papers: list[dict],
+    top_k: int = 20,
+    api_weight: float = 0.7,
+    primary_kw: str | None = None,
+    secondary_kw: list[str] | None = None,
+    regular_kw: list[str] | None = None,
+    kw_bonus_scale: float = 0.05,
+) -> list[tuple[dict, float]]:
+    """完整的论文排序流水线：FAISS 粗筛 → cross-encoder 精排 → API 分数融合。
+
+    Args:
+        query: 课题描述文本
+        papers: 去重后的论文列表
+        top_k: 最终返回数量
+        api_weight: API 分数融合权重
+        primary_kw: 主关键词（可选，用于关键词匹配加分）
+        secondary_kw: 副关键词列表
+        regular_kw: 普通关键词列表
+        kw_bonus_scale: 关键词加分缩放系数
+
+    Returns:
+        [(paper, final_score), ...]，按分数降序
+    """
+    if not papers:
+        return []
+
+    # Stage 1: FAISS bi-encoder 粗筛
+    idx, indexed_papers = build_index(papers)
+    # 取 top-K 候选，K = min(2 * top_k, total) 给 cross-encoder 留余量
+    candidates_k = min(top_k * 2, len(papers))
+    candidates = search_similar(query, idx, indexed_papers, top_k=candidates_k)
+
+    # Stage 2: Cross-encoder 精排
+    reranked = rerank_with_cross_encoder(query, candidates, top_k=top_k)
+
+    # Stage 3: API 分数融合 + 关键词匹配加分
+    final = fuse_scores(
+        reranked,
+        api_weight=api_weight,
+        primary_kw=primary_kw,
+        secondary_kw=secondary_kw,
+        regular_kw=regular_kw,
+        kw_bonus_scale=kw_bonus_scale,
+    )
+
+    return final[:top_k]
