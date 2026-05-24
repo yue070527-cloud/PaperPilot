@@ -12,6 +12,27 @@ from paperpilot.fetcher import fetch_arxiv, fetch_openalex, deduplicate
 from paperpilot.indexer import build_index, search_similar
 
 
+# ── 主题定义 ──
+THEMES = {
+    "mint":  {"label": "薄荷绿", "seed": "#00A86B", "light_bg": "#E5FFF7", "dark_bg": "#0D1F17"},
+    "ocean": {"label": "海蓝",   "seed": "#1565C0", "light_bg": "#E8F0FE", "dark_bg": "#0D1B2A"},
+    "sand":  {"label": "暖沙",   "seed": "#E65100", "light_bg": "#FFF5F0", "dark_bg": "#1E1610"},
+    "dusk":  {"label": "暮紫",   "seed": "#7B1FA2", "light_bg": "#F5F0FF", "dark_bg": "#1A1020"},
+}
+DEFAULT_THEME = "mint"
+
+
+def apply_theme(page: ft.Page, theme_name: str, dark_mode: bool):
+    """应用配色主题和夜间模式。"""
+    theme = THEMES.get(theme_name, THEMES[DEFAULT_THEME])
+    seed = theme["seed"]
+    bg = theme["dark_bg"] if dark_mode else theme["light_bg"]
+    page.theme = ft.Theme(color_scheme_seed=seed, scaffold_bgcolor=bg)
+    page.dark_theme = ft.Theme(color_scheme_seed=seed, scaffold_bgcolor=theme["dark_bg"])
+    page.theme_mode = ft.ThemeMode.DARK if dark_mode else ft.ThemeMode.LIGHT
+    page.update()
+
+
 def _border(color):
     """Flet 0.85 兼容的边框辅助函数。"""
     side = ft.BorderSide(1, color)
@@ -24,11 +45,15 @@ class AppState:
         self.topic_name: str = ""
         self.topic_desc: str = ""
         self.keywords: list[str] = []
+        self.weighted_keywords: list[tuple[str, float]] = []
+        self.primary_keywords: list[str] = []
         self.papers: list[dict] = []
         self.scores: list[tuple[dict, float]] = []
         self.is_searching: bool = False
         self.status_text: str = ""
         self.selected_paper: dict | None = None
+        self.theme_name: str = DEFAULT_THEME
+        self.dark_mode: bool = False
 
 
 state = AppState()
@@ -47,26 +72,39 @@ def _run_pipeline():
     papers = []
     max_per = int(max_results_slider.value)
 
-    # 翻译中文关键词为英文
-    search_terms = list(state.keywords)
-    en_terms = translate_terms(state.keywords)
-    valid_en = [t for t in en_terms if t]
-    if valid_en:
-        seen = set(search_terms)
-        for t in valid_en:
-            if t.lower() not in seen:
-                seen.add(t.lower())
-                search_terms.append(t)
-        print(f"[PaperPilot] 翻译: {len(valid_en)} 个英文术语")
-    else:
-        print("[PaperPilot] 警告: 翻译失败，所有英文术语为空（检查 API Key 或网络）")
+    # ── 构建分层关键词：核心（AND 连接）+ 普通（OR 连接） ──
+    core_terms: list[str] = list(state.primary_keywords)
+    core_lower = {k.lower() for k in core_terms}
+    regular_terms: list[str] = []
 
-    # 为英文数据源过滤掉中文关键词
-    en_search_terms = [t for t in search_terms if t and not _has_cjk(t)]
+    for kw, weight in state.weighted_keywords:
+        if kw.lower() in core_lower:
+            continue
+        if weight >= 1.0:
+            core_terms.append(kw)
+            core_lower.add(kw.lower())
+        else:
+            regular_terms.append(kw)
+
+    print(f"[PaperPilot] 核心关键词 ({len(core_terms)}): {core_terms}")
+    print(f"[PaperPilot] 普通关键词 ({len(regular_terms)}): {regular_terms}")
+
+    # 分别翻译核心和普通关键词
+    core_en_raw = translate_terms(core_terms) if core_terms else []
+    regular_en_raw = translate_terms(regular_terms) if regular_terms else []
+
+    en_core_terms = [t for t in core_en_raw if t and not _has_cjk(t)]
+    en_regular_terms = [t for t in regular_en_raw if t and not _has_cjk(t)]
+
+    # 合并为扁平列表（当前 fetcher 接口，等 A 更新后改为分层传参）
+    en_search_terms = en_core_terms + en_regular_terms
     if not en_search_terms:
         print("[PaperPilot] 错误: 没有可用的英文搜索词，跳过 arXiv 和 OpenAlex 检索")
         print("[PaperPilot] 提示: 请在设置页配置有效的 DeepSeek API Key")
         return [], []
+
+    print(f"[PaperPilot] 英文核心 ({len(en_core_terms)}): {en_core_terms}")
+    print(f"[PaperPilot] 英文普通 ({len(en_regular_terms)}): {en_regular_terms}")
 
     # 翻译课题描述为英文，用于并行语义检索和后续打分（同语言匹配区分度更高）
     desc_en_query = None
@@ -87,7 +125,7 @@ def _run_pipeline():
 
     if arxiv_switch.value:
         state.status_text = "arXiv 抓取中..."
-        print(f"[PaperPilot] arXiv 查询: {' AND '.join(en_search_terms)}")
+        print(f"[PaperPilot] arXiv 查询: {en_search_terms}")
         try:
             results = fetch_arxiv(en_search_terms, max_results=max_per)
             print(f"[PaperPilot] arXiv 返回: {len(results)} 篇")
@@ -104,7 +142,7 @@ def _run_pipeline():
 
     if openalex_switch.value:
         state.status_text = "OpenAlex 抓取中..."
-        print(f"[PaperPilot] OpenAlex 查询: {' AND '.join(en_search_terms)}")
+        print(f"[PaperPilot] OpenAlex 查询: {en_search_terms}")
         try:
             results = fetch_openalex(en_search_terms, max_results=max_per)
             print(f"[PaperPilot] OpenAlex 返回: {len(results)} 篇")
@@ -209,9 +247,14 @@ def build_project_page():
     )
 
     keywords_row = ft.Row(wrap=True, spacing=6)
+    primary_chips_row = ft.Row(wrap=True, spacing=6)
     manual_kw_field = ft.TextField(
         label="手动添加关键词", hint_text="输入后回车添加",
         prefix_icon=ft.Icons.ADD, expand=True,
+    )
+    primary_kw_field = ft.TextField(
+        label="主关键词（可选）", hint_text="核心词，逗号分隔，回车添加；检索时强制命中",
+        prefix_icon=ft.Icons.STAR, expand=True,
     )
     progress_bar = ft.ProgressBar(visible=False, expand=True)
     status_text = ft.Text("", size=13, italic=True)
@@ -286,7 +329,8 @@ def build_project_page():
         try:
             weighted = extract_all_keywords(desc, top_n=8)
             state.keywords = [kw for kw, _ in weighted]
-            refresh_keyword_chips(keywords_row, manual_kw_field)
+            state.weighted_keywords = weighted
+            refresh_keyword_chips(keywords_row, manual_kw_field, primary_chips_row)
             status_text.value = f"已提取 {len(state.keywords)} 个关键词"
         except Exception as ex:
             status_text.value = f"提取失败: {ex}"
@@ -296,19 +340,33 @@ def build_project_page():
         kw = (e.control.value or "").strip()
         if kw:
             state.keywords = merge_keywords(state.keywords, [kw])
+            state.weighted_keywords.append((kw.lower(), 0.5))
             manual_kw_field.value = ""
             manual_kw_field.update()
-            refresh_keyword_chips(keywords_row, manual_kw_field)
+            refresh_keyword_chips(keywords_row, manual_kw_field, primary_chips_row)
 
     manual_kw_field.on_submit = on_add_keyword
+
+    def on_add_primary(e):
+        text = (e.control.value or "").strip()
+        if text:
+            for kw in text.split(","):
+                kw = kw.strip()
+                if kw and kw not in state.primary_keywords:
+                    state.primary_keywords.append(kw)
+            primary_kw_field.value = ""
+            primary_kw_field.update()
+            refresh_keyword_chips(keywords_row, manual_kw_field, primary_chips_row)
+
+    primary_kw_field.on_submit = on_add_primary
 
     def on_start_search(e):
         if not topic_desc_field.value.strip():
             status_text.value = "请先输入课题描述"
             status_text.update()
             return
-        if not state.keywords:
-            status_text.value = "请先提取关键词"
+        if not state.keywords and not state.primary_keywords:
+            status_text.value = "请先提取关键词或设置主关键词"
             status_text.update()
             return
 
@@ -379,6 +437,8 @@ def build_project_page():
             ),
             manual_kw_field,
         ], spacing=8),
+        primary_kw_field,
+        primary_chips_row,
         keywords_row,
         ft.Divider(height=12),
         ft.Row([search_btn, progress_bar], spacing=16),
@@ -387,24 +447,53 @@ def build_project_page():
     ], spacing=8, scroll=ft.ScrollMode.AUTO)
 
 
-def refresh_keyword_chips(row: ft.Row, kw_field: ft.TextField):
-    """刷新关键词标签列表。"""
-    row.controls.clear()
+def refresh_keyword_chips(kw_row: ft.Row, kw_field: ft.TextField,
+                          primary_row: ft.Row | None = None):
+    """刷新关键词标签列表，主关键词以星标区分。"""
+    # 主关键词行
+    if primary_row is not None:
+        primary_row.controls.clear()
+        for kw in state.primary_keywords:
+            def make_primary_delete(k=kw):
+                def on_delete(e):
+                    state.primary_keywords = [p for p in state.primary_keywords if p != k]
+                    refresh_keyword_chips(kw_row, kw_field, primary_row)
+                    primary_row.update()
+                return on_delete
+            primary_row.controls.append(
+                ft.Chip(
+                    label=ft.Text(kw, weight=ft.FontWeight.BOLD),
+                    leading=ft.Icon(ft.Icons.STAR, size=14, color=ft.Colors.AMBER),
+                    on_delete=make_primary_delete(),
+                )
+            )
+        if state.primary_keywords:
+            primary_row.controls.append(
+                ft.Text(f"（{len(state.primary_keywords)} 个核心）", size=12, italic=True)
+            )
+        primary_row.update()
+
+    # 普通关键词行
+    kw_row.controls.clear()
+    primary_set = {p.lower() for p in state.primary_keywords}
     for kw in state.keywords:
+        if kw.lower() in primary_set:
+            continue  # 已在主关键词行显示
 
         def make_delete(k=kw):
             def on_delete(e):
                 state.keywords = [k2 for k2 in state.keywords if k2 != k]
-                refresh_keyword_chips(row, kw_field)
-                row.update()
+                refresh_keyword_chips(kw_row, kw_field, primary_row)
+                kw_row.update()
             return on_delete
 
-        row.controls.append(
+        kw_row.controls.append(
             ft.Chip(label=ft.Text(kw), on_delete=make_delete())
         )
-    if state.keywords:
-        row.controls.append(ft.Text(f"（{len(state.keywords)} 个）", size=12, italic=True))
-    row.update()
+    regular_count = len([k for k in state.keywords if k.lower() not in primary_set])
+    if regular_count:
+        kw_row.controls.append(ft.Text(f"（{regular_count} 个）", size=12, italic=True))
+    kw_row.update()
 
 
 # ── 文献详情 ──
@@ -517,6 +606,7 @@ max_results_slider = ft.Slider(min=10, max=200, value=30, divisions=19,
 
 
 def build_settings_page():
+    global container_settings
     from paperpilot.config import load_config, save_config as do_save
 
     current_config = load_config()
@@ -563,6 +653,59 @@ def build_settings_page():
         key_status.color = ft.Colors.GREEN
         key_status.update()
 
+    # ── 主题切换 ──
+    theme_buttons: dict[str, ft.Container] = {}
+
+    def on_select_theme(name):
+        state.theme_name = name
+        apply_theme(_page, name, state.dark_mode)
+        do_save(updates={"ui": {"theme": name, "dark_mode": state.dark_mode}})
+        # 就地更新主题按钮边框（避免重建页面导致滚回顶部）
+        for n, btn in theme_buttons.items():
+            btn.border = _border(
+                ft.Colors.ON_SURFACE if n == name else ft.Colors.OUTLINE_VARIANT
+            )
+            btn.update()
+        # 导航栏重建（无滚动，不影响体验）
+        nav_content_ref.content = build_left_nav(2)
+        nav_content_ref.update()
+
+    def on_toggle_dark(e):
+        state.dark_mode = e.control.value
+        apply_theme(_page, state.theme_name, state.dark_mode)
+        do_save(updates={"ui": {"theme": state.theme_name, "dark_mode": state.dark_mode}})
+        # 按钮边框不随夜间模式变化，只重建导航栏
+        nav_content_ref.content = build_left_nav(2)
+        nav_content_ref.update()
+
+    theme_selector = ft.Row([
+        ft.Column([
+            ft.Container(
+                width=44, height=44, border_radius=22,
+                bgcolor=t["seed"],
+                border=_border(
+                    ft.Colors.ON_SURFACE if state.theme_name == name else ft.Colors.OUTLINE_VARIANT
+                ),
+                ink=True,
+                on_click=lambda e, n=name: on_select_theme(n),
+            ),
+            ft.Text(t["label"], size=11, text_align=ft.TextAlign.CENTER),
+        ], spacing=4, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+        for name, t in THEMES.items()
+    ], spacing=20, alignment=ft.MainAxisAlignment.CENTER)
+
+    # 收集按钮引用用于就地更新（避免重建页面导致滚回顶部）
+    for i, name in enumerate(THEMES):
+        col = theme_selector.controls[i]
+        btn = col.controls[0]  # Container 是 Column 的第一个子控件
+        theme_buttons[name] = btn
+
+    dark_switch = ft.Switch(
+        label="夜间模式",
+        value=state.dark_mode,
+        on_change=on_toggle_dark,
+    )
+
     return ft.Column([
         ft.Text("设置", size=22, weight=ft.FontWeight.BOLD),
         ft.Divider(height=16),
@@ -586,6 +729,12 @@ def build_settings_page():
         ft.Text("每个来源的最大检索结果数", size=13, italic=True),
         max_results_slider,
         ft.Divider(height=16),
+        ft.Text("外观", size=16, weight=ft.FontWeight.W_500),
+        ft.Text("选择配色主题和夜间模式", size=13, italic=True),
+        theme_selector,
+        ft.Container(height=8),
+        dark_switch,
+        ft.Divider(height=16),
         ft.Text("离线模式", size=16, weight=ft.FontWeight.W_500),
         ft.Text("Embedding 模型：paraphrase-multilingual-MiniLM-L12-v2", size=13),
         ft.Text("已下载至本地缓存，无需联网", size=13, color=ft.Colors.GREEN),
@@ -603,8 +752,14 @@ def main(page: ft.Page):
     page.window.height = 750
     page.window.min_width = 900
     page.window.min_height = 500
-    page.theme_mode = ft.ThemeMode.LIGHT
     page.padding = 0
+
+    # 加载主题偏好
+    from paperpilot.config import load_config
+    ui_config = load_config().get("ui", {})
+    state.theme_name = ui_config.get("theme", DEFAULT_THEME)
+    state.dark_mode = ui_config.get("dark_mode", False)
+    apply_theme(page, state.theme_name, state.dark_mode)
 
     # 左侧导航容器（内容后续由 page_switcher 动态替换）
     nav_content_ref = ft.Container(
@@ -637,7 +792,6 @@ def main(page: ft.Page):
                     container_settings,
                 ], expand=True),
             ], expand=True),
-            bgcolor="#E5FFF7",
             expand=True,
         ),
     )
