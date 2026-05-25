@@ -167,14 +167,13 @@ def _run_pipeline():
         print("[PaperPilot] 未找到论文")
         return [], []
 
-    # 5. 排序打分（FAISS -> cross-encoder -> fusion + 关键词加分）
+    # 5. 排序打分（API 粗筛 -> cross-encoder 精排 -> 关键词加分）
     state.status_text = f"排序中（{len(papers)} 篇）..."
     query_for_scoring = desc_en_query if desc_en_query else state.topic_desc
     scores = rank_papers(
         query=query_for_scoring,
         papers=papers,
         top_k=20,
-        api_weight=0.7,
         primary_kw=primary_en,
         secondary_kw=secondary_en,
         regular_kw=regular_en,
