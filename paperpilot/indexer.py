@@ -314,19 +314,20 @@ def rank_papers(
     query: str,
     papers: list[dict],
     top_k: int = 20,
-    api_weight: float = 0.7,
     primary_kw: str | None = None,
     secondary_kw: list[str] | None = None,
     regular_kw: list[str] | None = None,
     kw_bonus_scale: float = 0.05,
 ) -> list[tuple[dict, float]]:
-    """完整的论文排序流水线：FAISS 粗筛 → cross-encoder 精排 → API 分数融合。
+    """完整的论文排序流水线：API 分粗筛 → cross-encoder 精排 → 关键词加分。
+
+    FAISS 已移除。API 排序分（arXiv/OpenAlex 原始相关性）承担粗筛，
+    cross-encoder 承担精排，最终得分 = CE 分 + 关键词匹配加分。
 
     Args:
         query: 课题描述文本
         papers: 去重后的论文列表
         top_k: 最终返回数量
-        api_weight: API 分数融合权重
         primary_kw: 主关键词（可选，用于关键词匹配加分）
         secondary_kw: 副关键词列表
         regular_kw: 普通关键词列表
@@ -338,23 +339,27 @@ def rank_papers(
     if not papers:
         return []
 
-    # Stage 1: FAISS bi-encoder 粗筛
-    idx, indexed_papers = build_index(papers)
-    # 取 top-K 候选，K = min(2 * top_k, total) 给 cross-encoder 留余量
+    # Stage 1: API 分粗筛 —— 按 api_score 降序取 top-K 候选
+    papers_with_api = [p for p in papers if p.get("api_score") is not None]
+    papers_without_api = [p for p in papers if p.get("api_score") is None]
+    papers_with_api.sort(key=lambda p: p.get("api_score", 0), reverse=True)
     candidates_k = min(top_k * 2, len(papers))
-    candidates = search_similar(query, idx, indexed_papers, top_k=candidates_k)
+    candidates = [
+        (p, p.get("api_score", 0.5))
+        for p in papers_with_api[:candidates_k] + papers_without_api[:candidates_k]
+    ]
 
     # Stage 2: Cross-encoder 精排
     reranked = rerank_with_cross_encoder(query, candidates, top_k=top_k)
 
-    # Stage 3: API 分数融合 + 关键词匹配加分
-    final = fuse_scores(
-        reranked,
-        api_weight=api_weight,
-        primary_kw=primary_kw,
-        secondary_kw=secondary_kw,
-        regular_kw=regular_kw,
-        kw_bonus_scale=kw_bonus_scale,
-    )
-
+    # Stage 3: 关键词匹配加分（不做 API/语义加权融合）
+    secondary_kw = secondary_kw or []
+    regular_kw = regular_kw or []
+    final = []
+    for paper, ce_score in reranked:
+        score = float(ce_score)
+        kw_bonus = keyword_match_bonus(paper, primary_kw, secondary_kw, regular_kw)
+        score += kw_bonus * kw_bonus_scale
+        final.append((paper, score))
+    final.sort(key=lambda x: -x[1])
     return final[:top_k]
