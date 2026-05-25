@@ -8,7 +8,7 @@ import flet as ft
 
 from paperpilot.keywords import extract_all_keywords, merge_keywords
 from paperpilot.mt_translator import translate_terms
-from paperpilot.fetcher import fetch_arxiv, fetch_openalex, fetch_with_cascade, deduplicate
+from paperpilot.fetcher import fetch_arxiv, fetch_openalex, fetch_multi_primary, deduplicate
 from paperpilot.indexer import rank_papers
 
 
@@ -97,10 +97,7 @@ def _run_pipeline():
     regular_en = [t for t in translate_terms(state.regular_keywords)
                   if t and not _has_cjk(t)]
 
-    # fetch_with_cascade 的 primary_kw 是单选，取第一个主关键词
-    primary_en = primary_en_list[0] if primary_en_list else None
-    # 其余主关键词并入副关键词（均参与 AND 组）
-    secondary_en = primary_en_list[1:] + secondary_en
+    primary_en = primary_en_list
 
     print(f"\n[PaperPilot] 开始检索")
     print(f"[PaperPilot] 主关键词: {primary_en}")
@@ -111,7 +108,7 @@ def _run_pipeline():
     if arxiv_switch.value:
         state.status_text = "arXiv 抓取中..."
         try:
-            arxiv_papers, level = fetch_with_cascade(
+            arxiv_papers = fetch_multi_primary(
                 primary_kw=primary_en,
                 secondary_kw=secondary_en,
                 regular_kw=regular_en,
@@ -119,7 +116,7 @@ def _run_pipeline():
                 max_results=max_per,
                 min_results=3,
             )
-            print(f"[PaperPilot] arXiv 返回: {len(arxiv_papers)} 篇 (策略{level})")
+            print(f"[PaperPilot] arXiv 返回: {len(arxiv_papers)} 篇 ({len(primary_en)}路主关键词)")
             papers += arxiv_papers
         except Exception as e:
             print(f"[PaperPilot] arXiv 失败: {e}")
@@ -136,7 +133,7 @@ def _run_pipeline():
     if openalex_switch.value:
         state.status_text = "OpenAlex 抓取中..."
         try:
-            oa_papers, oa_level = fetch_with_cascade(
+            oa_papers = fetch_multi_primary(
                 primary_kw=primary_en,
                 secondary_kw=secondary_en,
                 regular_kw=regular_en,
@@ -144,7 +141,7 @@ def _run_pipeline():
                 max_results=max_per,
                 min_results=3,
             )
-            print(f"[PaperPilot] OpenAlex 返回: {len(oa_papers)} 篇 (策略{oa_level})")
+            print(f"[PaperPilot] OpenAlex 返回: {len(oa_papers)} 篇 ({len(primary_en)}路主关键词)")
             papers += oa_papers
         except Exception as e:
             print(f"[PaperPilot] OpenAlex 失败: {e}")
@@ -184,7 +181,7 @@ def _run_pipeline():
 
 # ── 左侧导航栏 ──
 NAV_ITEMS = [
-    ("课题", ft.Icons.EDIT_NOTE, 0),
+    ("检索", ft.Icons.SEARCH, 0),
     ("文献", ft.Icons.FORMAT_LIST_NUMBERED, 1),
     ("设置", ft.Icons.SETTINGS, 2),
 ]
@@ -420,7 +417,7 @@ def build_project_page():
     # ── 检索结果区域 ──
     def _summary_text():
         return (
-            f"课题：{state.topic_name}  |  检索到 {len(state.scores)} 篇论文  |  "
+            f"{state.topic_name}  |  检索到 {len(state.scores)} 篇论文  |  "
             f"关键词：{', '.join(state.keywords[:5])}"
         )
 
@@ -442,7 +439,7 @@ def build_project_page():
     def on_extract(e):
         desc = topic_desc_field.value.strip()
         if not desc:
-            status_text.value = "请先输入课题描述"
+            status_text.value = "请先输入检索描述"
             status_text.update()
             return
         status_text.value = "正在提取关键词..."
@@ -474,7 +471,7 @@ def build_project_page():
 
     def on_start_search(e):
         if not topic_desc_field.value.strip():
-            status_text.value = "请先输入课题描述"
+            status_text.value = "请先输入检索描述"
             status_text.update()
             return
         if not state.keywords:
@@ -482,7 +479,7 @@ def build_project_page():
             status_text.update()
             return
 
-        state.topic_name = topic_name_field.value.strip() or "未命名课题"
+        state.topic_name = topic_name_field.value.strip() or "未命名检索"
         state.topic_desc = topic_desc_field.value.strip()
         state.is_searching = True
         state.papers = []
@@ -540,9 +537,9 @@ def build_project_page():
 
     return ft.Column([
         ft.Text("PaperPilot", size=28, weight=ft.FontWeight.BOLD),
-        ft.Text("课题驱动的智能文献筛选", size=14, italic=True),
+        ft.Text("智能文献检索与筛选", size=14, italic=True),
         ft.Divider(height=20),
-        ft.Text("课题信息", size=16, weight=ft.FontWeight.W_500),
+        ft.Text("检索信息", size=16, weight=ft.FontWeight.W_500),
         topic_name_field,
         topic_desc_field,
         ft.Row([
@@ -677,6 +674,39 @@ max_results_slider = ft.Slider(min=10, max=200, value=30, divisions=19,
                                 label="{value} 篇")
 
 
+def _make_model_selector():
+    """创建模型选择下拉框，读取/写入 config.yaml。"""
+    from paperpilot.config import load_config as _lc, save_config as _sc
+
+    current = _lc().get("deepseek", {}).get("model", "deepseek-v4-flash")
+
+    model_options = [
+        ft.dropdown.Option("deepseek-v4-flash", "DeepSeek V4 Flash"),
+        ft.dropdown.Option("deepseek-chat", "DeepSeek V3 (chat) - 7月下线"),
+    ]
+
+    model_dd = ft.Dropdown(
+        options=model_options,
+        value=current if current in ("deepseek-v4-flash", "deepseek-chat") else "deepseek-v4-flash",
+        expand=True,
+    )
+
+    model_status = ft.Text("", size=12, italic=True)
+
+    def on_change_model(e):
+        _sc(updates={"deepseek": {"model": e.control.value}})
+        model_status.value = f"已切换至 {e.control.value}，下次搜索生效"
+        model_status.color = ft.Colors.GREEN
+        model_status.update()
+
+    model_dd.on_change = on_change_model
+
+    return ft.Column([
+        ft.Row([model_dd], spacing=8),
+        model_status,
+    ], spacing=4)
+
+
 def build_settings_page():
     global container_settings
     from paperpilot.config import load_config, save_config as do_save
@@ -791,6 +821,10 @@ def build_settings_page():
             ),
         ], spacing=8),
         save_status,
+        ft.Divider(height=12),
+        ft.Text("模型", size=16, weight=ft.FontWeight.W_500),
+        ft.Text("选择 DeepSeek API 模型，7月后 V3 将下线", size=13, italic=True),
+        _make_model_selector(),
         ft.Divider(height=16),
         ft.Text("数据源", size=16, weight=ft.FontWeight.W_500),
         ft.Text("选择从哪些来源获取论文", size=13, italic=True),

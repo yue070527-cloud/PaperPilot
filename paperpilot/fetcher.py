@@ -227,7 +227,7 @@ def fetch_openalex(keywords: list[str], max_results: int = 30,
 
 
 def fetch_with_cascade(
-    primary_kw: str | None,
+    primary_kw: list[str],
     secondary_kw: list[str],
     regular_kw: list[str],
     source: str = "arxiv",
@@ -236,12 +236,12 @@ def fetch_with_cascade(
 ) -> tuple[list[dict], int]:
     """三级级联检索：核心AND → 主关键词AND → 全部OR。
 
-    Strategy 0: 全部核心词 AND + 普通词 OR（最严，需用户未选主关键词时核心词全命中）
-    Strategy 1: (主关键词) AND (所有其他词 OR)（仅主关键词必须命中）
+    Strategy 0: 全部核心词 AND + 普通词 OR（最严，核心词全命中）
+    Strategy 1: (所有主关键词 AND) + (其余词 OR)（主关键词必须全部命中）
     Strategy 2: 全部 OR（保底宽召回）
 
     Args:
-        primary_kw: 用户选择的主关键词，None 表示未选择
+        primary_kw: 用户标记的主关键词列表，空列表表示未选主关键词
         secondary_kw: 副关键词（核心词中未被选为主关键词的）
         regular_kw: 普通关键词
         source: "arxiv" 或 "openalex"
@@ -252,8 +252,8 @@ def fetch_with_cascade(
         (papers, strategy_level): papers 含 api_score，strategy_level 0/1/2
     """
     fetch_raw = _fetch_arxiv_raw if source == "arxiv" else _fetch_openalex_raw
-    all_kw = ([primary_kw] if primary_kw else []) + secondary_kw + regular_kw
-    all_core = ([primary_kw] if primary_kw else []) + secondary_kw
+    all_kw = primary_kw + secondary_kw + regular_kw
+    all_core = primary_kw + secondary_kw
 
     strategies = []
 
@@ -262,10 +262,10 @@ def fetch_with_cascade(
         q0 = _build_mixed_query(and_kw=all_core, or_kw=regular_kw)
         strategies.append((0, q0))
 
-    # Strategy 1: primary AND + all others OR (only if primary is set)
+    # Strategy 1: all primary AND + all others OR (only if primary is set)
     if primary_kw:
         others = secondary_kw + regular_kw
-        q1 = _build_mixed_query(and_kw=[primary_kw], or_kw=others)
+        q1 = _build_mixed_query(and_kw=primary_kw, or_kw=others)
         strategies.append((1, q1))
 
     # Strategy 2: all OR (safety net)
@@ -280,6 +280,77 @@ def fetch_with_cascade(
             return papers, level
 
     return [], -1
+
+
+def fetch_multi_primary(
+    primary_kw: list[str],
+    secondary_kw: list[str],
+    regular_kw: list[str],
+    source: str = "arxiv",
+    max_results: int = 30,
+    min_results: int = 3,
+) -> list[dict]:
+    """多主关键词独立检索 + 合并加权。
+
+    每个主关键词独立进行一次级联检索，结果合并去重。
+    命中多个主关键词的论文获得 api_score 加权，自然排前。
+
+    Args:
+        primary_kw: 用户标记的主关键词列表
+        secondary_kw: 副关键词
+        regular_kw: 普通关键词
+        source: "arxiv" 或 "openalex"
+        max_results: 最终返回的最大论文数
+        min_results: 每路检索触发降级的结果数阈值
+
+    Returns:
+        papers 列表，含 api_score（多路命中已加权）
+    """
+    if not primary_kw:
+        papers, _ = fetch_with_cascade(
+            primary_kw=[], secondary_kw=secondary_kw,
+            regular_kw=regular_kw, source=source,
+            max_results=max_results, min_results=min_results)
+        return papers
+
+    seen: dict[str, tuple[dict, int]] = {}
+    per_kw = max(max_results // len(primary_kw), min_results)
+
+    # 每路主关键词独立搜索时，副关键词放入 OR 组而非 AND 组
+    # 避免 Strategy 0 的主+副多路 AND 过于严格导致结果太少
+    merged_regular = secondary_kw + regular_kw
+
+    for pk in primary_kw:
+        papers, level = fetch_with_cascade(
+            primary_kw=[pk],
+            secondary_kw=[],
+            regular_kw=merged_regular,
+            source=source,
+            max_results=per_kw,
+            min_results=min_results,
+        )
+        for p in papers:
+            pid = (p.get("title", "") + "|" + p.get("source", "") + "|"
+                   + str(p.get("year", ""))).lower()
+            if pid in seen:
+                prev, hits = seen[pid]
+                if p.get("api_score", 0) > prev.get("api_score", 0):
+                    seen[pid] = (p, hits + 1)
+                else:
+                    seen[pid] = (prev, hits + 1)
+            else:
+                seen[pid] = (p, 1)
+
+    max_hits = max(h[1] for h in seen.values()) if seen else 1
+    result = []
+    for pid, (paper, hits) in seen.items():
+        if max_hits > 1:
+            boost = 1.0 + (hits / max_hits) * 0.3
+            paper["api_score"] = min(paper.get("api_score", 0.5) * boost, 1.0)
+        result.append(paper)
+
+    result.sort(key=lambda p: p.get("api_score", 0), reverse=True)
+    return result[:max_results]
 
 
 def _extract_text_from_page(page, max_chars: int = 3000) -> str:

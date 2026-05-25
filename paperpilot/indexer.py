@@ -232,7 +232,7 @@ def rerank_with_cross_encoder(
 
 def keyword_match_bonus(
     paper: dict,
-    primary_kw: str | None,
+    primary_kw: list[str],
     secondary_kw: list[str],
     regular_kw: list[str],
     w_primary: float = 1.0,
@@ -242,6 +242,7 @@ def keyword_match_bonus(
     """计算论文的关键词命中加分（逐层二分：命中一层即得分，不重复计数）。
 
     在 title + abstract 中搜索关键词，每层最多计一次。
+    主关键词层：任一主关键词命中即得分。
     返回原始加分值，范围 0 到 w_primary + w_secondary + w_regular (max 2.1)。
     """
     title = (paper.get("title") or "").lower()
@@ -249,8 +250,11 @@ def keyword_match_bonus(
     text = f"{title} {abstract}"
 
     bonus = 0.0
-    if primary_kw and primary_kw.lower() in text:
-        bonus += w_primary
+    if primary_kw:
+        for pk in primary_kw:
+            if pk.lower() in text:
+                bonus += w_primary
+                break
     for kw in secondary_kw:
         if kw.lower() in text:
             bonus += w_secondary
@@ -267,7 +271,7 @@ def keyword_match_bonus(
 def fuse_scores(
     results: list[tuple[dict, float]],
     api_weight: float = 0.7,
-    primary_kw: str | None = None,
+    primary_kw: list[str] | None = None,
     secondary_kw: list[str] | None = None,
     regular_kw: list[str] | None = None,
     kw_bonus_scale: float = 0.05,
@@ -280,7 +284,7 @@ def fuse_scores(
     Args:
         results: [(paper, semantic_score), ...] 列表
         api_weight: API 分数权重，默认 0.7
-        primary_kw: 主关键词（可选，用于匹配加分）
+        primary_kw: 主关键词列表（可选，用于匹配加分）
         secondary_kw: 副关键词列表
         regular_kw: 普通关键词列表
         kw_bonus_scale: 关键词加分缩放系数，默认 0.05
@@ -314,7 +318,7 @@ def rank_papers(
     query: str,
     papers: list[dict],
     top_k: int = 20,
-    primary_kw: str | None = None,
+    primary_kw: list[str] | None = None,
     secondary_kw: list[str] | None = None,
     regular_kw: list[str] | None = None,
     kw_bonus_scale: float = 0.05,
@@ -328,7 +332,7 @@ def rank_papers(
         query: 课题描述文本
         papers: 去重后的论文列表
         top_k: 最终返回数量
-        primary_kw: 主关键词（可选，用于关键词匹配加分）
+        primary_kw: 主关键词列表（可选，用于关键词匹配加分）
         secondary_kw: 副关键词列表
         regular_kw: 普通关键词列表
         kw_bonus_scale: 关键词加分缩放系数

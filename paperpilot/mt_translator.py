@@ -11,7 +11,20 @@ import urllib.error
 from paperpilot.config import load_config
 
 _API_URL = "https://api.deepseek.com/v1/chat/completions"
-_MODEL = "deepseek-chat"
+_DEFAULT_MODEL = "deepseek-v4-flash"
+
+# V4 Flash/V4 Pro 默认开启推理模式，翻译等简单任务需要显式禁用 thinking
+_THINKING_DISABLED = {"type": "disabled"}
+
+
+def _get_model():
+    """从 config.yaml 读取用户选择的模型，未配置时用 V4 Flash。"""
+    model = load_config().get("deepseek", {}).get("model", "").strip()
+    return model or _DEFAULT_MODEL
+
+
+def _is_v4_model(model: str) -> bool:
+    return "v4" in model.lower()
 
 _SYSTEM_PROMPT = (
     "You are a scientific translator. Translate Chinese academic keywords into "
@@ -65,7 +78,6 @@ def translate_terms(chinese_terms: list[str]) -> list[str]:
     )
 
     payload = {
-        "model": _MODEL,
         "messages": [
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": user_msg},
@@ -74,6 +86,10 @@ def translate_terms(chinese_terms: list[str]) -> list[str]:
         "max_tokens": len(to_translate) * 50,
         "stream": False,
     }
+    model = _get_model()
+    payload["model"] = model
+    if _is_v4_model(model):
+        payload["thinking"] = _THINKING_DISABLED
 
     try:
         req = urllib.request.Request(
