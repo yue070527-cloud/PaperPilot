@@ -208,7 +208,13 @@ def rerank_with_cross_encoder(
         normalized.sort(key=lambda x: -x[1])
         return normalized[:top_k]
 
-    pairs = [(query, p.get("abstract", "") or "") for p, _ in results]
+    # 标题 + 摘要拼接，CE 同时匹配标题和正文关键词
+    def _paper_text(p: dict) -> str:
+        title = (p.get("title") or "").strip()
+        abstract = (p.get("abstract") or "").strip()
+        return f"{title}. {abstract}" if title else abstract
+
+    pairs = [(query, _paper_text(p)) for p, _ in results]
     try:
         scores = ce.predict(pairs, show_progress_bar=False)
         # Normalize to [0, 1]
@@ -343,7 +349,7 @@ def rank_papers(
     papers_with_api = [p for p in papers if p.get("api_score") is not None]
     papers_without_api = [p for p in papers if p.get("api_score") is None]
     papers_with_api.sort(key=lambda p: p.get("api_score", 0), reverse=True)
-    candidates_k = min(top_k * 2, len(papers))
+    candidates_k = min(top_k * 5, len(papers))
     candidates = [
         (p, p.get("api_score", 0.5))
         for p in papers_with_api[:candidates_k] + papers_without_api[:candidates_k]
