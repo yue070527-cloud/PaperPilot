@@ -19,4 +19,4 @@ ui:
   window_height: 750
   title: PaperPilot
   theme: cyan
-  dark_mode: false
+  dark_mode: true

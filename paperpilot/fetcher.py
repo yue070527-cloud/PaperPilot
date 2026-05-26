@@ -420,6 +420,8 @@ def fetch_multi_primary(
     source: str = "arxiv",
     max_results: int = 30,
     min_results: int = 3,
+    year_min: str = "",
+    year_max: str = "",
 ) -> list[dict]:
     """多主关键词独立检索 + 合并加权。
 
@@ -433,6 +435,8 @@ def fetch_multi_primary(
         source: "arxiv" 或 "openalex"
         max_results: 最终返回的最大论文数
         min_results: 每路检索触发降级的结果数阈值
+        year_min: 起始年份筛选（仅 OpenAlex 生效）
+        year_max: 结束年份筛选（仅 OpenAlex 生效）
 
     Returns:
         papers 列表，含 api_score（多路命中已加权）
@@ -441,7 +445,8 @@ def fetch_multi_primary(
         papers, _ = fetch_with_cascade(
             primary_kw=[], secondary_kw=secondary_kw,
             regular_kw=regular_kw, source=source,
-            max_results=max_results, min_results=min_results)
+            max_results=max_results, min_results=min_results,
+            year_min=year_min, year_max=year_max)
         return papers
 
     seen: dict[str, tuple[dict, int]] = {}
@@ -459,6 +464,8 @@ def fetch_multi_primary(
             source=source,
             max_results=per_kw,
             min_results=min_results,
+            year_min=year_min,
+            year_max=year_max,
         )
         for p in papers:
             pid = (p.get("title", "") + "|" + p.get("source", "") + "|"

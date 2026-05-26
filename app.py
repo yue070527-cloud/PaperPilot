@@ -8,7 +8,7 @@ import flet as ft
 
 from paperpilot.keywords import extract_all_keywords, merge_keywords
 from paperpilot.mt_translator import translate_terms
-from paperpilot.fetcher import fetch_arxiv, fetch_openalex, fetch_with_cascade, deduplicate
+from paperpilot.fetcher import fetch_arxiv, fetch_openalex, fetch_with_cascade, fetch_multi_primary, deduplicate
 from paperpilot.indexer import rank_papers
 
 
@@ -128,11 +128,11 @@ def _run_pipeline(max_per: int, year_min: str, year_max: str,
     print(f"[PaperPilot] 副关键词: {secondary_en}")
     print(f"[PaperPilot] 普通关键词: {regular_en}")
 
-    # 3. 级联检索
+    # 3. 多主关键词独立检索
     if use_arxiv:
         state.status_text = "arXiv 抓取中..."
         try:
-            arxiv_papers, level = fetch_with_cascade(
+            arxiv_papers = fetch_multi_primary(
                 primary_kw=primary_kw_list,
                 secondary_kw=secondary_en,
                 regular_kw=regular_en,
@@ -142,7 +142,7 @@ def _run_pipeline(max_per: int, year_min: str, year_max: str,
                 year_min=year_min,
                 year_max=year_max,
             )
-            print(f"[PaperPilot] arXiv 返回: {len(arxiv_papers)} 篇 (策略{level})")
+            print(f"[PaperPilot] arXiv 返回: {len(arxiv_papers)} 篇 ({len(primary_kw_list)}路主关键词)")
             papers += arxiv_papers
         except Exception as e:
             print(f"[PaperPilot] arXiv 失败: {e}")
@@ -159,7 +159,7 @@ def _run_pipeline(max_per: int, year_min: str, year_max: str,
     if use_openalex:
         state.status_text = "OpenAlex 抓取中..."
         try:
-            oa_papers, oa_level = fetch_with_cascade(
+            oa_papers = fetch_multi_primary(
                 primary_kw=primary_kw_list,
                 secondary_kw=secondary_en,
                 regular_kw=regular_en,
@@ -169,7 +169,7 @@ def _run_pipeline(max_per: int, year_min: str, year_max: str,
                 year_min=year_min,
                 year_max=year_max,
             )
-            print(f"[PaperPilot] OpenAlex 返回: {len(oa_papers)} 篇 (策略{oa_level})")
+            print(f"[PaperPilot] OpenAlex 返回: {len(oa_papers)} 篇 ({len(primary_kw_list)}路主关键词)")
             papers += oa_papers
         except Exception as e:
             print(f"[PaperPilot] OpenAlex 失败: {e}")
