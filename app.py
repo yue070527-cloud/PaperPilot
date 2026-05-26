@@ -101,6 +101,7 @@ def _run_pipeline(max_per: int, year_min: str, year_max: str,
         print(f"[PaperPilot] 年份筛选: {year_min or '—'} ~ {year_max or '—'}", flush=True)
 
     # 1. 翻译课题描述
+    state.status_text = "翻译课题描述..."
     desc_en_query = None
     desc = state.topic_desc.strip()
     desc_en_terms = translate_terms([desc])
@@ -113,6 +114,7 @@ def _run_pipeline(max_per: int, year_min: str, year_max: str,
         print(f"[PaperPilot] 课题描述原文即英文: {desc_en_query[:80]}...")
 
     # 2. 翻译三层关键词
+    state.status_text = "翻译关键词..."
     primary_en_list = [t for t in translate_terms(state.primary_keywords)
                        if t and not _has_cjk(t)]
     secondary_en = [t for t in translate_terms(state.secondary_keywords)
@@ -192,8 +194,8 @@ def _run_pipeline(max_per: int, year_min: str, year_max: str,
         print("[PaperPilot] 未找到论文")
         return [], []
 
-    # 5. 排序打分
-    state.status_text = f"排序中（{len(papers)} 篇）..."
+    # 5. 排序打分（首次会加载 942MB 语义模型，约需 10-30 秒）
+    state.status_text = f"语义精排中（{len(papers)} 篇）..."
     query_for_scoring = desc_en_query if desc_en_query else state.topic_desc
     scores = rank_papers(
         query=query_for_scoring,

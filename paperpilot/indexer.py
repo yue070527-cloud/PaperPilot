@@ -11,6 +11,7 @@ Phase 1 核心流水线：
 import hashlib
 import logging
 import os
+import threading
 from pathlib import Path
 
 os.environ["HF_HUB_OFFLINE"] = "1"
@@ -31,10 +32,12 @@ _MODEL = _MODEL_PATH if Path(_MODEL_PATH).exists() else _MODEL_NAME
 _cache_dir = Path(config.get("cache", {}).get("dir", "./cache/api"))
 _model = None  # SentenceTransformer, lazy-loaded
 
-# Cross-encoder 模型：mxbai-rerank-base-v2（Qwen2-based，988MB）
+# Cross-encoder 模型：mxbai-rerank-base-v2（Qwen2-based，367M params，942MB）
 _CE_PATH = str(Path.home() / ".cache/modelscope/mixedbread-ai/mxbai-rerank-base-v2")
 _CE_NAME = "mixedbread-ai/mxbai-rerank-base-v2"
+_CE_MAX_LENGTH = 512  # 截断长文本，防止 O(n²) 注意力爆炸
 _cross_encoder = None
+_ce_lock = threading.Lock()  # 防止多线程同时加载模型
 
 
 def _get_model():
@@ -152,36 +155,70 @@ def load_index(path: str):
 # ── Cross-Encoder 重排序 ──
 
 def _get_cross_encoder():
-    """加载 cross-encoder 模型（懒加载，本地缓存优先）。"""
+    """加载 cross-encoder 模型（懒加载，线程安全，本地缓存优先）。
+
+    关键参数：
+    - max_length=512：截断长文本，Qwen2 默认 32K 会导致注意力 O(n²) 爆炸
+    - 使用 threading.Lock 防止多线程重复加载
+    - ThreadPoolExecutor 180s 超时保护，超时回退到纯 API 排序
+    """
     global _cross_encoder
     if _cross_encoder is not None:
         return _cross_encoder
 
-    import time as _t
-    print("[CE] Loading cross-encoder...", flush=True)
-    _t0 = _t.time()
+    with _ce_lock:
+        if _cross_encoder is not None:
+            return _cross_encoder
 
-    if Path(_CE_PATH).exists():
-        print(f"[CE] Loading from cache: {_CE_PATH}", flush=True)
-        _cross_encoder = CrossEncoder(_CE_PATH)
-        print(f"[CE] Loaded in {_t.time()-_t0:.1f}s", flush=True)
+        import time as _t
+        import concurrent.futures
+        print("[CE] Loading cross-encoder...", flush=True)
+        _t0 = _t.time()
+
+        if Path(_CE_PATH).exists():
+            print(f"[CE] Loading from cache: {_CE_PATH}", flush=True)
+
+            def _load():
+                return CrossEncoder(
+                    _CE_PATH,
+                    max_length=_CE_MAX_LENGTH,
+                    device="cpu",
+                )
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_load)
+                try:
+                    _cross_encoder = future.result(timeout=180)
+                    print(f"[CE] Loaded in {_t.time()-_t0:.1f}s", flush=True)
+                    return _cross_encoder
+                except concurrent.futures.TimeoutError:
+                    print(f"[CE] 加载超时(180s)，将使用纯 API 排序", flush=True)
+                    _cross_encoder = None
+                    return None
+                except Exception as e:
+                    logger.warning(f"Cross-encoder load failed: {e}")
+                    _cross_encoder = None
+                    return None
+
+        # 本地无缓存，尝试在线下载
+        logger.info("Cross-encoder not cached, attempting download...")
+        old_hf = os.environ.pop("HF_HUB_OFFLINE", None)
+        old_tr = os.environ.pop("TRANSFORMERS_OFFLINE", None)
+        try:
+            _cross_encoder = CrossEncoder(
+                _CE_NAME,
+                max_length=_CE_MAX_LENGTH,
+                device="cpu",
+            )
+        except Exception as e:
+            logger.warning(f"Cross-encoder download failed: {e}")
+            _cross_encoder = None
+        if old_hf is not None:
+            os.environ["HF_HUB_OFFLINE"] = old_hf
+        if old_tr is not None:
+            os.environ["TRANSFORMERS_OFFLINE"] = old_tr
+
         return _cross_encoder
-
-    # 本地无缓存，尝试在线下载
-    logger.info("Cross-encoder not cached, attempting download...")
-    old_hf = os.environ.pop("HF_HUB_OFFLINE", None)
-    old_tr = os.environ.pop("TRANSFORMERS_OFFLINE", None)
-    try:
-        _cross_encoder = CrossEncoder(_CE_NAME)
-    except Exception as e:
-        logger.warning(f"Cross-encoder download failed: {e}")
-        _cross_encoder = None
-    if old_hf is not None:
-        os.environ["HF_HUB_OFFLINE"] = old_hf
-    if old_tr is not None:
-        os.environ["TRANSFORMERS_OFFLINE"] = old_tr
-
-    return _cross_encoder
 
 
 def rerank_with_cross_encoder(
@@ -189,21 +226,15 @@ def rerank_with_cross_encoder(
     results: list[tuple[dict, float]],
     top_k: int = 20,
 ) -> list[tuple[dict, float]]:
-    """用 cross-encoder 对 FAISS 粗筛结果精排。
+    """用 cross-encoder 对粗筛结果精排。
 
-    bi-encoder 召回 → cross-encoder 精排，IR 经典两阶段范式。
-
-    Args:
-        query: 课题描述（英文，同语言匹配区分度更高）
-        results: FAISS 返回的 [(paper, faiss_score), ...] 列表
-        top_k: 最终返回数量
-
-    Returns:
-        [(paper, cross_encoder_score), ...]，按分数降序
+    安全措施：
+    - max_length=512 已在模型加载时设置，防止长序列 OOM
+    - 文本在拼接前截断到 3000 字符，双重保险
+    - predict() 有 120s 超时保护，超时回退到 API 分数排序
     """
     ce = _get_cross_encoder()
     if ce is None or not results:
-        # Cross-encoder unavailable — normalize FAISS scores to [0, 1]
         scores_arr = np.array([s for _, s in results])
         min_s, max_s = scores_arr.min(), scores_arr.max()
         if max_s > min_s:
@@ -213,24 +244,38 @@ def rerank_with_cross_encoder(
         normalized.sort(key=lambda x: -x[1])
         return normalized[:top_k]
 
-    # 标题 + 摘要拼接，CE 同时匹配标题和正文关键词
+    # 截断保护：标题最多 300 字符，摘要最多 2500 字符（约 500 tokens）
     def _paper_text(p: dict) -> str:
-        title = (p.get("title") or "").strip()
-        abstract = (p.get("abstract") or "").strip()
+        title = (p.get("title") or "").strip()[:300]
+        abstract = (p.get("abstract") or "").strip()[:2500]
         return f"{title}. {abstract}" if title else abstract
 
-    pairs = [(query, _paper_text(p)) for p, _ in results]
-    try:
-        scores = ce.predict(pairs, show_progress_bar=False)
-        # Normalize to [0, 1]
-        min_s, max_s = scores.min(), scores.max()
-        if max_s > min_s:
-            scores = (scores - min_s) / (max_s - min_s)
-        else:
-            scores = np.zeros_like(scores)
-    except Exception as e:
-        logger.warning(f"Cross-encoder prediction failed: {e}")
-        return results[:top_k]
+    pairs = [(query[:2000], _paper_text(p)) for p, _ in results]
+
+    import concurrent.futures
+
+    def _predict():
+        return ce.predict(pairs, show_progress_bar=False)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_predict)
+        try:
+            scores = future.result(timeout=120)
+        except concurrent.futures.TimeoutError:
+            print("[CE] predict 超时(120s)，回退到 API 分数排序", flush=True)
+            results.sort(key=lambda x: -(x[1] if x[1] is not None else 0))
+            return results[:top_k]
+        except Exception as e:
+            logger.warning(f"Cross-encoder prediction failed: {e}")
+            results.sort(key=lambda x: -(x[1] if x[1] is not None else 0))
+            return results[:top_k]
+
+    # Normalize to [0, 1]
+    min_s, max_s = scores.min(), scores.max()
+    if max_s > min_s:
+        scores = (scores - min_s) / (max_s - min_s)
+    else:
+        scores = np.zeros_like(scores)
 
     reranked = sorted(
         zip([p for p, _ in results], scores),
