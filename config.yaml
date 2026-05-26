@@ -1,5 +1,6 @@
 deepseek:
-  api_key: ${DEEPSEEK_API_KEY}
+  api_key: sk-324f64a6f4bc42d3a755abd0a9cb2cd4
+  model: deepseek-v4-flash
 embedding:
   local_model: paraphrase-multilingual-MiniLM-L12-v2
   cache_dir: ./cache/embedding
@@ -17,5 +18,5 @@ ui:
   window_width: 1100
   window_height: 750
   title: PaperPilot
-  theme: sand
-  dark_mode: true
+  theme: cyan
+  dark_mode: false
