@@ -142,3 +142,82 @@ def _parse_batch_response(content: str, expected_count: int) -> list[str]:
             t = ""
         result.append(t)
     return result
+
+
+def translate_all_terms(*term_lists: list[str]) -> list[list[str]]:
+    """一次性翻译多组术语列表，合并为单次 API 调用。
+
+    Args:
+        *term_lists: 多组中文关键词列表
+
+    Returns:
+        与输入一一对应的英文术语列表（每组对应一个输入 list）
+    """
+    all_terms: list[str] = []
+    mapping: list[tuple[int, int]] = []  # (src_idx, term_idx)
+    results: list[list[str]] = [[] for _ in term_lists]
+
+    for src_idx, terms in enumerate(term_lists):
+        results[src_idx] = [""] * len(terms)
+        for term_idx, term in enumerate(terms):
+            stripped = term.strip()
+            if not stripped:
+                continue
+            if all(ord(c) < 128 for c in stripped):
+                results[src_idx][term_idx] = stripped
+                continue
+            all_terms.append(stripped)
+            mapping.append((src_idx, term_idx))
+
+    if not all_terms:
+        return results
+
+    config = load_config()
+    api_key = config.get("deepseek", {}).get("api_key", "").strip()
+    if not api_key:
+        return results
+
+    numbered = "\n".join(f"{j+1}. {t}" for j, t in enumerate(all_terms))
+    user_msg = (
+        "Translate these Chinese academic keywords to English. "
+        "Output one translation per line in the format: number. English term\n\n"
+        f"{numbered}"
+    )
+
+    payload = {
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+        "temperature": 0.1,
+        "max_tokens": len(all_terms) * 50,
+        "stream": False,
+    }
+    model = _get_model()
+    payload["model"] = model
+    if _is_v4_model(model):
+        payload["thinking"] = _THINKING_DISABLED
+
+    try:
+        req = urllib.request.Request(
+            _API_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError):
+        return results
+
+    content = body.get("choices", [{}])[0].get("message", {}).get("content", "")
+    translations = _parse_batch_response(content, len(all_terms))
+
+    for j, translation in enumerate(translations):
+        if translation and j < len(mapping):
+            src_idx, term_idx = mapping[j]
+            results[src_idx][term_idx] = translation
+
+    return results

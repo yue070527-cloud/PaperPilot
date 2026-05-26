@@ -8,7 +8,7 @@ import flet as ft
 
 from paperpilot.keywords import extract_all_keywords, merge_keywords
 from paperpilot.mt_translator import translate_terms
-from paperpilot.fetcher import fetch_arxiv, fetch_openalex, fetch_multi_primary, deduplicate
+from paperpilot.fetcher import fetch_arxiv, fetch_openalex, fetch_with_cascade, deduplicate
 from paperpilot.indexer import rank_papers
 
 
@@ -18,6 +18,8 @@ THEMES = {
     "ocean": {"label": "海蓝",   "seed": "#1565C0", "light_bg": "#E8F0FE", "dark_bg": "#0D1B2A"},
     "sand":  {"label": "暖沙",   "seed": "#E65100", "light_bg": "#FFF5F0", "dark_bg": "#1E1610"},
     "dusk":  {"label": "暮紫",   "seed": "#7B1FA2", "light_bg": "#F5F0FF", "dark_bg": "#1A1020"},
+    "rose":  {"label": "玫瑰",   "seed": "#D81B60", "light_bg": "#FFF0F4", "dark_bg": "#1F0E15"},
+    "cyan":  {"label": "青碧",   "seed": "#0097A7", "light_bg": "#E5F7F9", "dark_bg": "#0D1A1C"},
 }
 DEFAULT_THEME = "mint"
 
@@ -56,12 +58,23 @@ class AppState:
         self.selected_paper: dict | None = None
         self.theme_name: str = DEFAULT_THEME
         self.dark_mode: bool = False
+        # 筛选状态
+        self.filter_year_min: str = ""
+        self.filter_year_max: str = ""
+        self.filter_type: str = "全部"
+        self.filter_source: str = "全部"
+        self.filter_citations_min: str = ""
 
 
 state = AppState()
 _page: ft.Page | None = None
 results_summary: ft.Text | None = None
 detail_sidebar: ft.Container | None = None  # 右侧文献详情侧边栏
+# 筛选控件全局引用
+filter_year_min_field: ft.TextField | None = None
+filter_year_max_field: ft.TextField | None = None
+filter_type_dropdown: ft.Dropdown | None = None
+filter_citations_field: ft.TextField | None = None
 
 
 def _has_cjk(text: str) -> bool:
@@ -69,15 +82,25 @@ def _has_cjk(text: str) -> bool:
     return any('一' <= c <= '鿿' for c in text)
 
 
-def _run_pipeline():
+def _run_pipeline(max_per: int, year_min: str, year_max: str,
+                  use_arxiv: bool, use_openalex: bool,
+                  top_k: int, ce_candidates: int):
     """在后台线程中运行完整的搜索流水线。
 
-    使用三级级联检索 + cross-encoder 精排 + API 分数融合 + 关键词匹配加分。
+    所有 Flet 控件值由主线程读取后传入，避免跨线程访问控件。
     """
-    papers = []
-    max_per = int(max_results_slider.value)
+    import time as _time
+    _t0 = _time.time()
+    print(f"[PaperPilot] === 流水线启动 === max_per={max_per}, arxiv={use_arxiv}, "
+          f"openalex={use_openalex}, top_k={top_k}, ce_candidates={ce_candidates}", flush=True)
 
-    # 1. 翻译课题描述（用于打分 + 并行描述检索）
+    papers = []
+
+    # 0. 年份筛选
+    if year_min or year_max:
+        print(f"[PaperPilot] 年份筛选: {year_min or '—'} ~ {year_max or '—'}", flush=True)
+
+    # 1. 翻译课题描述
     desc_en_query = None
     desc = state.topic_desc.strip()
     desc_en_terms = translate_terms([desc])
@@ -97,59 +120,64 @@ def _run_pipeline():
     regular_en = [t for t in translate_terms(state.regular_keywords)
                   if t and not _has_cjk(t)]
 
-    primary_en = primary_en_list
+    primary_kw_list = primary_en_list  # 所有主关键词作为 AND 核心
+    # secondary_en 保持独立，不混入主关键词
 
     print(f"\n[PaperPilot] 开始检索")
-    print(f"[PaperPilot] 主关键词: {primary_en}")
+    print(f"[PaperPilot] 主关键词: {primary_kw_list}")
     print(f"[PaperPilot] 副关键词: {secondary_en}")
     print(f"[PaperPilot] 普通关键词: {regular_en}")
 
     # 3. 级联检索
-    if arxiv_switch.value:
+    if use_arxiv:
         state.status_text = "arXiv 抓取中..."
         try:
-            arxiv_papers = fetch_multi_primary(
-                primary_kw=primary_en,
+            arxiv_papers, level = fetch_with_cascade(
+                primary_kw=primary_kw_list,
                 secondary_kw=secondary_en,
                 regular_kw=regular_en,
                 source="arxiv",
                 max_results=max_per,
                 min_results=3,
+                year_min=year_min,
+                year_max=year_max,
             )
-            print(f"[PaperPilot] arXiv 返回: {len(arxiv_papers)} 篇 ({len(primary_en)}路主关键词)")
+            print(f"[PaperPilot] arXiv 返回: {len(arxiv_papers)} 篇 (策略{level})")
             papers += arxiv_papers
         except Exception as e:
             print(f"[PaperPilot] arXiv 失败: {e}")
 
-        # 课题描述并行检索（补充召回）
         if desc_en_query:
             try:
-                desc_papers = fetch_arxiv([desc_en_query], max_results=max_per, logic="OR")
+                desc_papers = fetch_arxiv([desc_en_query], max_results=max_per, logic="OR",
+                                          year_min=year_min, year_max=year_max)
                 print(f"[PaperPilot] arXiv（描述）返回: {len(desc_papers)} 篇")
                 papers += desc_papers
             except Exception as e:
                 print(f"[PaperPilot] arXiv（描述）失败: {e}")
 
-    if openalex_switch.value:
+    if use_openalex:
         state.status_text = "OpenAlex 抓取中..."
         try:
-            oa_papers = fetch_multi_primary(
-                primary_kw=primary_en,
+            oa_papers, oa_level = fetch_with_cascade(
+                primary_kw=primary_kw_list,
                 secondary_kw=secondary_en,
                 regular_kw=regular_en,
                 source="openalex",
                 max_results=max_per,
                 min_results=3,
+                year_min=year_min,
+                year_max=year_max,
             )
-            print(f"[PaperPilot] OpenAlex 返回: {len(oa_papers)} 篇 ({len(primary_en)}路主关键词)")
+            print(f"[PaperPilot] OpenAlex 返回: {len(oa_papers)} 篇 (策略{oa_level})")
             papers += oa_papers
         except Exception as e:
             print(f"[PaperPilot] OpenAlex 失败: {e}")
 
-        # 课题描述并行检索
         if desc_en_query:
             try:
-                desc_papers = fetch_openalex([desc_en_query], max_results=max_per, logic="OR")
+                desc_papers = fetch_openalex([desc_en_query], max_results=max_per, logic="OR",
+                                             year_min=year_min, year_max=year_max)
                 print(f"[PaperPilot] OpenAlex（描述）返回: {len(desc_papers)} 篇")
                 papers += desc_papers
             except Exception as e:
@@ -164,18 +192,18 @@ def _run_pipeline():
         print("[PaperPilot] 未找到论文")
         return [], []
 
-    # 5. 排序打分（API 粗筛 -> cross-encoder 精排 -> 关键词加分）
+    # 5. 排序打分
     state.status_text = f"排序中（{len(papers)} 篇）..."
     query_for_scoring = desc_en_query if desc_en_query else state.topic_desc
     scores = rank_papers(
         query=query_for_scoring,
         papers=papers,
-        top_k=20,
-        primary_kw=primary_en,
+        top_k=top_k,
+        ce_candidates=ce_candidates,
+        primary_kw=primary_en_list,
         secondary_kw=secondary_en,
         regular_kw=regular_en,
     )
-
     return papers, scores
 
 
@@ -378,10 +406,10 @@ def build_project_page():
     status_text = ft.Text("", size=13, italic=True)
 
     # ── 文献详情侧边栏 ──
-    sb_title = ft.Text("", size=18, weight=ft.FontWeight.BOLD)
-    sb_meta = ft.Text("", size=13)
-    sb_abstract = ft.Text("", size=13)
-    sb_url = ft.Text("", size=12, color=ft.Colors.PRIMARY)
+    sb_title = ft.Text("", size=18, weight=ft.FontWeight.BOLD, selectable=True)
+    sb_meta = ft.Text("", size=13, selectable=True)
+    sb_abstract = ft.Text("", size=13, selectable=True)
+    sb_links = ft.Row([], spacing=8)
 
     def on_close_sidebar(e):
         detail_sidebar.visible = False
@@ -400,7 +428,7 @@ def build_project_page():
             ft.Text("摘要", size=14, weight=ft.FontWeight.W_500),
             ft.Container(content=sb_abstract, expand=True),
             ft.Divider(height=8),
-            sb_url,
+            sb_links,
         ], spacing=6),
         width=400,
         padding=ft.padding.Padding(left=16, top=12, right=16, bottom=12),
@@ -411,7 +439,7 @@ def build_project_page():
     sidebar._title = sb_title
     sidebar._meta = sb_meta
     sidebar._abstract = sb_abstract
-    sidebar._url = sb_url
+    sidebar._links = sb_links
     detail_sidebar = sidebar
 
     # ── 检索结果区域 ──
@@ -424,16 +452,62 @@ def build_project_page():
     summary = ft.Text(_summary_text(), size=14)
     results_summary = summary
 
+    # 筛选回调
+    def _on_year_min_change(e):
+        state.filter_year_min = e.control.value.strip()
+        _on_filter_change()
+
+    def _on_year_max_change(e):
+        state.filter_year_max = e.control.value.strip()
+        _on_filter_change()
+
+    def _on_type_change(e):
+        state.filter_type = e.control.value or "全部"
+        _on_filter_change()
+
+    def _on_citations_change(e):
+        state.filter_citations_min = e.control.value.strip()
+        _on_filter_change()
+
+    # 筛选控件
+    def _build_type_options():
+        return [
+            ft.dropdown.Option("全部", "全部"),
+            ft.dropdown.Option("综述", "综述"),
+            ft.dropdown.Option("研究论文", "研究论文"),
+            ft.dropdown.Option("书籍章节", "书籍章节"),
+            ft.dropdown.Option("书籍", "书籍"),
+            ft.dropdown.Option("学位论文", "学位论文"),
+            ft.dropdown.Option("其他", "其他"),
+        ]
+
+    global filter_year_min_field, filter_year_max_field
+    global filter_type_dropdown, filter_citations_field
+
+    filter_year_min_field = ft.TextField(
+        hint_text="起始年", width=80, height=38, text_size=13,
+    )
+    filter_year_min_field.on_change = _on_year_min_change
+    filter_year_max_field = ft.TextField(
+        hint_text="结束年", width=80, height=38, text_size=13,
+    )
+    filter_year_max_field.on_change = _on_year_max_change
+    filter_type_dropdown = ft.Dropdown(
+        options=_build_type_options(), value="全部",
+        width=115, text_size=13,
+    )
+    filter_type_dropdown.on_change = _on_type_change
+    filter_citations_field = ft.TextField(
+        hint_text="最低引用", width=85, height=38, text_size=13,
+    )
+    filter_citations_field.on_change = _on_citations_change
+
     results_area = ft.Column([
         ft.Divider(height=16),
         ft.Text("检索结果", size=22, weight=ft.FontWeight.BOLD),
         summary,
         ft.Divider(height=8),
-        ft.Text("点击某行查看详情", size=12, italic=True),
-        ft.Row([
-            ft.Column([results_table], expand=True, scroll=ft.ScrollMode.AUTO),
-            sidebar,
-        ], spacing=8, expand=True),
+        ft.Column([results_table], expand=True, scroll=ft.ScrollMode.AUTO),
     ], spacing=6, expand=True, visible=False)
 
     def on_extract(e):
@@ -461,7 +535,7 @@ def build_project_page():
     def on_add_keyword(e):
         kw = (e.control.value or "").strip()
         if kw:
-            state.regular_keywords.append(kw)
+            state.secondary_keywords.append(kw)
             state.keywords = merge_keywords(state.keywords, [kw])
             manual_kw_field.value = ""
             manual_kw_field.update()
@@ -479,11 +553,27 @@ def build_project_page():
             status_text.update()
             return
 
+        import threading
+
         state.topic_name = topic_name_field.value.strip() or "未命名检索"
         state.topic_desc = topic_desc_field.value.strip()
         state.is_searching = True
         state.papers = []
         state.scores = []
+        # 重置筛选
+        state.filter_year_min = ""
+        state.filter_year_max = ""
+        state.filter_type = "全部"
+        state.filter_citations_min = ""
+        if filter_year_min_field:
+            filter_year_min_field.value = ""
+            filter_year_max_field.value = ""
+            filter_type_dropdown.value = "全部"
+            filter_citations_field.value = ""
+            filter_year_min_field.update()
+            filter_year_max_field.update()
+            filter_type_dropdown.update()
+            filter_citations_field.update()
 
         progress_bar.visible = True
         search_btn.disabled = True
@@ -492,12 +582,55 @@ def build_project_page():
         search_btn.update()
         status_text.update()
 
-        async def _do_search():
-            loop = asyncio.get_running_loop()
-            try:
-                papers, scores = await loop.run_in_executor(None, _run_pipeline)
+        # 在主线程读取所有 Flet 控件值，避免后台线程跨线程访问控件
+        _max_per = int(max_results_slider.value)
+        _year_min = (filter_year_min_field.value or "").strip() if filter_year_min_field else ""
+        _year_max = (filter_year_max_field.value or "").strip() if filter_year_max_field else ""
+        _use_arxiv = arxiv_switch.value
+        _use_openalex = openalex_switch.value
+        _top_k = int(top_k_slider.value)
+        _ce_candidates = int(ce_candidates_slider.value)
 
-                if not papers:
+        # 线程间共享结果
+        _result: dict = {}       # {"papers": ..., "scores": ...} or {"error": ...}
+        _done = threading.Event()
+
+        def _run_in_thread():
+            """在独立线程中执行流水线，避免 run_in_executor 嵌套回调丢失。"""
+            try:
+                papers, scores = _run_pipeline(
+                    max_per=_max_per, year_min=_year_min, year_max=_year_max,
+                    use_arxiv=_use_arxiv, use_openalex=_use_openalex,
+                    top_k=_top_k, ce_candidates=_ce_candidates,
+                )
+                _result["papers"] = papers
+                _result["scores"] = scores
+            except Exception as ex:
+                _result["error"] = ex
+            finally:
+                _done.set()
+
+        threading.Thread(target=_run_in_thread, daemon=True).start()
+
+        async def _poll():
+            import traceback
+            last_status = status_text.value
+            while not _done.is_set():
+                await asyncio.sleep(0.5)
+                # 仅状态变化时才刷新 UI，避免事件循环拥塞
+                if state.status_text != last_status:
+                    last_status = state.status_text
+                    status_text.value = state.status_text
+                    status_text.update()
+
+            # 流水线完成，执行一次性 UI 更新
+            try:
+                if "error" in _result:
+                    state.status_text = f"检索失败: {_result['error']}"
+                    traceback.print_exception(
+                        type(_result["error"]), _result["error"],
+                        _result["error"].__traceback__)
+                elif not _result.get("papers"):
                     state.status_text = "未找到相关论文"
                     state.papers = []
                     state.scores = []
@@ -507,15 +640,13 @@ def build_project_page():
                     results_area.visible = True
                     results_area.update()
                 else:
-                    state.papers = papers
-                    state.scores = scores
-                    state.status_text = f"完成！共 {len(scores)} 篇"
+                    state.papers = _result["papers"]
+                    state.scores = _result["scores"]
+                    state.status_text = f"完成！共 {len(_result['scores'])} 篇"
                     refresh_results_table()
                     summary.value = _summary_text()
                     results_area.visible = True
                     results_area.update()
-            except Exception as ex:
-                state.status_text = f"检索失败: {ex}"
             finally:
                 state.is_searching = False
                 progress_bar.visible = False
@@ -525,7 +656,7 @@ def build_project_page():
                 search_btn.update()
                 status_text.update()
 
-        _page.run_task(_do_search)
+        _page.run_task(_poll)
 
     search_btn = ft.FilledButton(
         content=ft.Text("开始检索"), icon=ft.Icons.SEARCH, on_click=on_start_search,
@@ -535,7 +666,8 @@ def build_project_page():
     # 初始化分区（恢复已有状态）
     refresh_all_zones()
 
-    return ft.Column([
+    # ── 页面布局：左侧可滚动检索区 + 右侧固定详情侧边栏 ──
+    scrollable_left = ft.Column([
         ft.Text("PaperPilot", size=28, weight=ft.FontWeight.BOLD),
         ft.Text("智能文献检索与筛选", size=14, italic=True),
         ft.Divider(height=20),
@@ -561,8 +693,26 @@ def build_project_page():
         ft.Divider(height=12),
         ft.Row([search_btn, progress_bar], spacing=16),
         status_text,
+        ft.Divider(height=8),
+        ft.Text("筛选条件（搜索前设定）", size=14, weight=ft.FontWeight.W_500),
+        ft.Row([
+            ft.Text("年份:", size=13),
+            filter_year_min_field,
+            ft.Text("–", size=13),
+            filter_year_max_field,
+            ft.Text("  类型:", size=13),
+            filter_type_dropdown,
+            ft.Text("  引用次数≥:", size=13),
+            filter_citations_field,
+        ], spacing=6, wrap=True),
         results_area,
-    ], spacing=8, scroll=ft.ScrollMode.AUTO)
+    ], spacing=8, scroll=ft.ScrollMode.AUTO, expand=True)
+
+    return ft.Row([
+        scrollable_left,
+        ft.VerticalDivider(width=1),
+        sidebar,
+    ], spacing=0, expand=True)
 
 
 # ── 文献详情 ──
@@ -571,16 +721,39 @@ def show_paper_detail(paper: dict):
     sb = detail_sidebar
     if sb is None:
         return
+    from paperpilot.fetcher import get_article_type_label
     sb._title.value = paper.get("title", "")
     source = {"arxiv": "arXiv", "openalex": "OpenAlex", "local_pdf": "本地"}.get(
         paper.get("source", ""), paper.get("source", "")
     )
-    sb._meta.value = (
-        f"作者: {paper.get('authors', '未知')}  |  "
-        f"年份: {paper.get('year', '—')}  |  来源: {source}"
-    )
+    type_label = get_article_type_label(paper)
+    meta_parts = [
+        f"作者: {paper.get('authors', '未知')}",
+        f"年份: {paper.get('year', '—')}",
+        f"来源: {source}",
+        f"类型: {type_label}",
+    ]
+    journal = paper.get("journal")
+    if journal:
+        meta_parts.append(f"期刊: {journal}")
+    cit = paper.get("cited_by_count")
+    if cit is not None:
+        meta_parts.append(f"引用次数: {cit}")
+    sb._meta.value = "  |  ".join(meta_parts)
     sb._abstract.value = paper.get("abstract", "") or "（无摘要）"
-    sb._url.value = f"链接: {paper['url']}" if paper.get("url") else ""
+    # 可点击链接
+    import webbrowser
+    links = []
+    url = paper.get("url")
+    if url:
+        links.append(ft.TextButton("打开原文", icon=ft.Icons.OPEN_IN_BROWSER,
+                                    on_click=lambda e, u=url: webbrowser.open(u)))
+    doi = paper.get("doi")
+    if doi:
+        doi_url = f"https://doi.org/{doi}"
+        links.append(ft.TextButton("DOI", icon=ft.Icons.LINK,
+                                    on_click=lambda e, u=doi_url: webbrowser.open(u)))
+    sb._links.controls = links
     sb.visible = True
     sb.update()
 
@@ -593,7 +766,9 @@ results_table = ft.DataTable(
         ft.DataColumn(ft.Text("作者"), on_sort=lambda e: sort_table("authors")),
         ft.DataColumn(ft.Text("年份"), numeric=True, on_sort=lambda e: sort_table("year")),
         ft.DataColumn(ft.Text("来源")),
+        ft.DataColumn(ft.Text("引用"), numeric=True, on_sort=lambda e: sort_table("citations")),
         ft.DataColumn(ft.Text("得分"), numeric=True, on_sort=lambda e: sort_table("score")),
+        ft.DataColumn(ft.Text("类型")),
     ],
     rows=[],
     sort_column_index=5,
@@ -613,15 +788,81 @@ def sort_table(column: str):
         _sort_column = column
         _sort_ascending = False
 
-    key_map = {"title": "title", "authors": "authors", "year": "year", "score": "score"}
+    key_map = {"title": "title", "authors": "authors", "year": "year",
+               "citations": "cited_by_count", "score": "score"}
     key = key_map.get(column, "score")
     reverse = _sort_ascending
 
-    scored = sorted(state.scores, key=lambda x: (
-        x[0].get(key, "") or "" if key != "score" else x[1]
-    ), reverse=not reverse if key != "score" else reverse)
+    if key == "cited_by_count":
+        scored = sorted(state.scores, key=lambda x: x[0].get(key) or 0, reverse=not reverse)
+    elif key == "score":
+        scored = sorted(state.scores, key=lambda x: x[1], reverse=reverse)
+    else:
+        scored = sorted(state.scores, key=lambda x: (
+            x[0].get(key, "") or ""
+        ), reverse=not reverse)
 
     refresh_results_table(scored)
+
+
+def _on_filter_change(e=None):
+    """任一筛选控件变化时重新过滤并刷新表格。"""
+    filters = {
+        "year_min": state.filter_year_min,
+        "year_max": state.filter_year_max,
+        "paper_type": state.filter_type,
+        "citations_min": state.filter_citations_min,
+    }
+    filtered = apply_filters(state.scores, filters)
+    refresh_results_table(filtered)
+
+
+def _type_badge(paper: dict) -> ft.Container:
+    """构建文章类型标签（小色块 + 文字）。"""
+    from paperpilot.fetcher import get_article_type_label
+    label = get_article_type_label(paper)
+    type_colors = {
+        "综述": ft.Colors.AMBER,
+        "研究论文": ft.Colors.BLUE,
+        "书籍章节": ft.Colors.TEAL,
+        "书籍": ft.Colors.PURPLE,
+        "学位论文": ft.Colors.ORANGE,
+        "其他": ft.Colors.OUTLINE,
+    }
+    color = type_colors.get(label, ft.Colors.OUTLINE)
+    return ft.Container(
+        ft.Text(label, size=12, color=color, weight=ft.FontWeight.W_600),
+        border=_border(color),
+        border_radius=4,
+        padding=ft.padding.Padding(left=4, top=1, right=4, bottom=1),
+    )
+
+
+def apply_filters(
+    scores: list[tuple[dict, float]],
+    filters: dict,
+) -> list[tuple[dict, float]]:
+    """纯函数：按用户筛选条件过滤结果（AND 逻辑）。"""
+    from paperpilot.fetcher import get_article_type_label
+
+    year_min = int(filters["year_min"]) if filters.get("year_min") else None
+    year_max = int(filters["year_max"]) if filters.get("year_max") else None
+    paper_type = filters.get("paper_type", "全部")
+    cit_min = int(filters["citations_min"]) if filters.get("citations_min") else None
+
+    result = []
+    for paper, score in scores:
+        py = paper.get("year")
+        if year_min is not None and (py is None or py < year_min):
+            continue
+        if year_max is not None and (py is None or py > year_max):
+            continue
+        if paper_type != "全部" and get_article_type_label(paper) != paper_type:
+            continue
+        if cit_min is not None and (paper.get("cited_by_count") or 0) < cit_min:
+            continue
+        result.append((paper, score))
+    return result
 
 
 def refresh_results_table(scored=None):
@@ -630,6 +871,8 @@ def refresh_results_table(scored=None):
     results_table.rows.clear()
     for i, (paper, score) in enumerate(scored):
         year_str = str(paper.get("year") or "—")
+        cit = paper.get("cited_by_count")
+        cit_str = str(cit) if cit is not None else "—"
         source_label = {"arxiv": "arXiv", "openalex": "OpenAlex", "local_pdf": "本地"}
         src = source_label.get(paper.get("source", ""), paper.get("source", ""))
 
@@ -651,7 +894,9 @@ def refresh_results_table(scored=None):
                     ft.DataCell(ft.Text((paper.get("authors") or "")[:40])),
                     ft.DataCell(ft.Text(year_str)),
                     ft.DataCell(ft.Text(src)),
+                    ft.DataCell(ft.Text(cit_str)),
                     ft.DataCell(score_widget),
+                    ft.DataCell(_type_badge(paper)),
                 ],
             )
         )
@@ -672,6 +917,10 @@ arxiv_switch = ft.Switch(label="arXiv", value=True)
 openalex_switch = ft.Switch(label="OpenAlex", value=True)
 max_results_slider = ft.Slider(min=10, max=500, value=30, divisions=49,
                                 label="{value} 篇")
+top_k_slider = ft.Slider(min=10, max=200, value=50, divisions=19,
+                          label="显示 {value} 篇")
+ce_candidates_slider = ft.Slider(min=10, max=200, value=100, divisions=19,
+                                  label="精排候选 {value} 篇")
 
 
 def _make_model_selector():
@@ -834,6 +1083,11 @@ def build_settings_page():
         ft.Text("检索数量", size=16, weight=ft.FontWeight.W_500),
         ft.Text("每个来源的最大检索结果数", size=13, italic=True),
         max_results_slider,
+        ft.Container(height=8),
+        ft.Text("结果显示与精排", size=16, weight=ft.FontWeight.W_500),
+        ft.Text("控制最终显示的论文数量和送入精排的候选数", size=13, italic=True),
+        top_k_slider,
+        ce_candidates_slider,
         ft.Divider(height=16),
         ft.Text("外观", size=16, weight=ft.FontWeight.W_500),
         ft.Text("选择配色主题和夜间模式", size=13, italic=True),

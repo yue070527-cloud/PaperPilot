@@ -4,18 +4,22 @@
 
     {
         "title": str,
-        "authors": str,       # 逗号分隔
+        "authors": str,         # 逗号分隔
         "abstract": str,
         "year": int | None,
-        "source": str,        # "arxiv" | "openalex" | "local_pdf"
+        "source": str,          # "arxiv" | "openalex" | "local_pdf"
         "url": str | None,
         "doi": str | None,
-        "api_score": float,   # 0.0-1.0, API 原始排序位置归一化
+        "api_score": float,     # 0.0-1.0, API 原始排序位置归一化
+        "type": str | None,     # 文章类型 (OpenAlex: review/article/...; arXiv: None)
+        "cited_by_count": int | None,  # 引用次数 (仅 OpenAlex)
+        "journal": str | None,  # 期刊/会议名 (OpenAlex source; arXiv journal_ref)
     }
 """
 
 import os
 import re
+import socket
 import time
 from difflib import SequenceMatcher
 
@@ -73,20 +77,60 @@ def _parse_arxiv_result(r) -> dict:
         "source": "arxiv",
         "url": r.entry_id or None,
         "doi": doi,
+        "type": None,
+        "cited_by_count": None,
+        "journal": getattr(r, "journal_ref", None) or None,
+        "openalex_id": None,
     }
 
 
-def _fetch_arxiv_raw(query: str, max_results: int = 30) -> list[dict]:
-    """Fetch papers from arXiv with a raw query string (internal helper)."""
-    client = arxiv.Client()
+def _fetch_arxiv_raw(query: str, max_results: int = 30,
+                     year_min: str = "", year_max: str = "") -> list[dict]:
+    """Fetch papers from arXiv with a raw query string (internal helper).
+
+    Uses ThreadPoolExecutor + timeout to guard against the arxiv library's
+    underlying requests.Session which has no default timeout and can hang.
+    """
+    import concurrent.futures
+    import random
+    print(f"[arXiv] 开始抓取: query={query[:80]}... max={max_results}", flush=True)
+
+    client = arxiv.Client(num_retries=2, delay_seconds=3)
     search = arxiv.Search(
         query=query,
         max_results=max_results,
         sort_by=arxiv.SortCriterion.Relevance,
     )
-    papers = []
-    for r in client.results(search):
-        papers.append(_parse_arxiv_result(r))
+    papers: list[dict] = []
+
+    for attempt in range(2):
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            future = executor.submit(
+                lambda: list(client.results(search))
+            )
+            results = future.result(timeout=45)
+            for r in results:
+                papers.append(_parse_arxiv_result(r))
+            break
+        except concurrent.futures.TimeoutError:
+            print(f"[arXiv] 超时(45s) attempt {attempt+1}/2", flush=True)
+            if attempt < 1:
+                time.sleep(3)
+        except Exception as e:
+            msg = str(e)
+            if "429" in msg or "403" in msg:
+                wait = (2 ** attempt) * 5 + random.uniform(0, 3)
+                print(f"[arXiv] 限流(attempt {attempt+1}/2)，等待 {wait:.0f}s...", flush=True)
+                time.sleep(wait)
+            else:
+                print(f"[arXiv] 错误: {e}", flush=True)
+                break
+        finally:
+            executor.shutdown(wait=False)
+    else:
+        print(f"[arXiv] 请求超时/失败，返回空结果", flush=True)
+
     total = max(len(papers), 1)
     for i, p in enumerate(papers):
         p["api_score"] = 1.0 - (i / total)
@@ -94,7 +138,8 @@ def _fetch_arxiv_raw(query: str, max_results: int = 30) -> list[dict]:
 
 
 def fetch_arxiv(keywords: list[str], max_results: int = 30,
-                logic: str = "OR") -> list[dict]:
+                logic: str = "OR",
+                year_min: str = "", year_max: str = "") -> list[dict]:
     """通过 arXiv API 检索论文。
 
     Args:
@@ -108,7 +153,7 @@ def fetch_arxiv(keywords: list[str], max_results: int = 30,
     if not keywords:
         return []
     query = _build_search_query(keywords, logic=logic)
-    return _fetch_arxiv_raw(query, max_results)
+    return _fetch_arxiv_raw(query, max_results, year_min=year_min, year_max=year_max)
 
 
 def _parse_openalex_work(w: dict) -> dict | None:
@@ -128,15 +173,63 @@ def _parse_openalex_work(w: dict) -> dict | None:
     abstract_inverted = w.get("abstract_inverted_index")
     if abstract_inverted:
         abstract = _decode_inverted_index(abstract_inverted)
+    # 新增字段
+    paper_type = w.get("type")  # "review", "article", "book-chapter", ...
+    cited_by = w.get("cited_by_count")
+    primary_loc = w.get("primary_location") or {}
+    source_info = primary_loc.get("source") or {}
+    journal = source_info.get("display_name") or None
+    oa_id = w.get("id") or None  # "https://openalex.org/W2023271753"
+
     return {
         "title": title,
         "authors": authors,
         "abstract": abstract,
         "year": year,
         "source": "openalex",
-        "url": w.get("primary_location", {}).get("landing_page_url") or None,
+        "url": primary_loc.get("landing_page_url") or None,
         "doi": doi,
+        "type": paper_type,
+        "cited_by_count": cited_by,
+        "journal": journal,
+        "openalex_id": oa_id,
     }
+
+
+# ── 文章类型标签映射 ──
+
+_TYPE_LABELS: dict[str, str] = {
+    "review": "综述",
+    "article": "研究论文",
+    "book-chapter": "书籍章节",
+    "book": "书籍",
+    "dissertation": "学位论文",
+    "other": "其他",
+}
+
+_REVIEW_KEYWORDS = [
+    "survey", "review", "meta-analysis", "meta analysis",
+    "systematic review", "literature review", "state of the art",
+    "state-of-the-art", "综述", "述评", "回顾", "进展",
+]
+
+
+def get_article_type_label(paper: dict) -> str:
+    """返回论文类型的中文标签。
+
+    OpenAlex: 使用 API 返回的 type 字段（权威来源）。
+    arXiv/本地PDF: 标题关键词推断，默认 "研究论文"。
+    """
+    paper_type = paper.get("type")
+    if paper_type and paper_type in _TYPE_LABELS:
+        return _TYPE_LABELS[paper_type]
+
+    title = (paper.get("title") or "").lower()
+    for kw in _REVIEW_KEYWORDS:
+        if kw in title:
+            return "综述"
+
+    return "研究论文"
 
 
 def _decode_inverted_index(inv: dict) -> str:
@@ -148,45 +241,61 @@ def _decode_inverted_index(inv: dict) -> str:
     return " ".join(words)
 
 
-def _fetch_openalex_raw(query: str, max_results: int = 30) -> list[dict]:
+def _fetch_openalex_raw(query: str, max_results: int = 30,
+                        year_min: str = "", year_max: str = "") -> list[dict]:
     """Fetch papers from OpenAlex with a raw query string (internal helper)."""
     url = "https://api.openalex.org/works"
     papers = []
     per_page = min(50, max_results)
     pages = (max_results + per_page - 1) // per_page
     headers = {"User-Agent": "PaperPilot/1.0 (mailto:paperpilot@example.com)"}
-    for page in range(1, pages + 1):
-        params = {
-            "search": query,
-            "per_page": per_page,
-            "page": page,
-            "mailto": "paperpilot@example.com",
-        }
-        try:
-            resp = requests.get(url, params=params, headers=headers, timeout=15)
-            for retry in range(3):
-                if resp.status_code != 429:
-                    break
-                time.sleep(1 * (retry + 1))
+    # 构建年份筛选
+    year_filter = None
+    if year_min and year_max:
+        year_filter = f"publication_year:{year_min}-{year_max}"
+    elif year_min:
+        year_filter = f"publication_year:>{int(year_min)-1}"
+    elif year_max:
+        year_filter = f"publication_year:<{int(year_max)+1}"
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(15)
+    try:
+        for page in range(1, pages + 1):
+            params = {
+                "search": query,
+                "per_page": per_page,
+                "page": page,
+                "mailto": "paperpilot@example.com",
+            }
+            if year_filter:
+                params["filter"] = year_filter
+            try:
                 resp = requests.get(url, params=params, headers=headers, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-            results = data.get("results", [])
-            page_total = len(results)
-            for i, w in enumerate(results):
-                paper = _parse_openalex_work(w)
-                if paper:
-                    api_rel = w.get("relevance_score")
-                    if api_rel is not None:
-                        paper["api_score"] = float(api_rel)
-                    else:
-                        paper["api_score"] = 1.0 - (i / max(page_total, 1))
-                    papers.append(paper)
-            if len(papers) >= max_results:
-                break
-            time.sleep(0.1)
-        except requests.RequestException:
-            continue
+                for retry in range(3):
+                    if resp.status_code != 429:
+                        break
+                    time.sleep(1 * (retry + 1))
+                    resp = requests.get(url, params=params, headers=headers, timeout=15)
+                resp.raise_for_status()
+                data = resp.json()
+                results = data.get("results", [])
+                page_total = len(results)
+                for i, w in enumerate(results):
+                    paper = _parse_openalex_work(w)
+                    if paper:
+                        api_rel = w.get("relevance_score")
+                        if api_rel is not None:
+                            paper["api_score"] = float(api_rel)
+                        else:
+                            paper["api_score"] = 1.0 - (i / max(page_total, 1))
+                        papers.append(paper)
+                if len(papers) >= max_results:
+                    break
+                time.sleep(0.1)
+            except requests.RequestException:
+                continue
+    finally:
+        socket.setdefaulttimeout(old_timeout)
     # Normalize api_score to [0, 1] — OpenAlex relevance_score may exceed [0, 1]
     api_scores = [p.get("api_score") for p in papers if p.get("api_score") is not None]
     if api_scores:
@@ -205,25 +314,61 @@ def _fetch_openalex_raw(query: str, max_results: int = 30) -> list[dict]:
     for i, p in enumerate(papers):
         if p.get("api_score") is None:
             p["api_score"] = 1.0 - (i / total)
-    return papers[:max_results]
+    papers = papers[:max_results]
+    papers = _fetch_missing_abstracts(papers)
+    return papers
+
+
+def _fetch_missing_abstracts(papers: list[dict]) -> list[dict]:
+    """对缺少摘要的 OpenAlex 论文，单独请求完整摘要。
+
+    OpenAlex 搜索结果常截断摘要，需用 works/{id} 端点获取完整数据。
+    最多处理 30 篇，速率 ~10 req/s，不影响总体时效。
+    """
+    to_fetch = [
+        p for p in papers
+        if p.get("openalex_id") and not (p.get("abstract") or "").strip()
+    ][:30]
+
+    if not to_fetch:
+        return papers
+
+    headers = {"User-Agent": "PaperPilot/1.0 (mailto:paperpilot@example.com)"}
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(10)
+    count = 0
+    try:
+        for paper in to_fetch:
+            oa_id = paper["openalex_id"]
+            try:
+                resp = requests.get(oa_id, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    w = resp.json()
+                    inv = w.get("abstract_inverted_index")
+                    if inv:
+                        paper["abstract"] = _decode_inverted_index(inv)
+                        count += 1
+                elif resp.status_code == 429:
+                    time.sleep(1)
+                # 非 200/429 静默跳过
+            except requests.RequestException:
+                continue
+            time.sleep(0.1)  # 礼貌速率：~10 req/s
+    finally:
+        socket.setdefaulttimeout(old_timeout)
+    if count:
+        print(f"[OpenAlex] 补齐 {count} 篇摘要", flush=True)
+    return papers
 
 
 def fetch_openalex(keywords: list[str], max_results: int = 30,
-                   logic: str = "OR") -> list[dict]:
-    """通过 OpenAlex API 检索论文（免 Key）。
-
-    Args:
-        keywords: 关键词列表
-        max_results: 最大返回数
-        logic: "OR"（宽召回，默认）或 "AND"（核心词全部命中）
-
-    Returns:
-        paper dict 列表，含 api_score 字段（0.0-1.0，API 排序位置归一化）
-    """
+                   logic: str = "OR",
+                   year_min: str = "", year_max: str = "") -> list[dict]:
+    """通过 OpenAlex API 检索论文（免 Key）。"""
     if not keywords:
         return []
     query = _build_search_query(keywords, logic=logic)
-    return _fetch_openalex_raw(query, max_results)
+    return _fetch_openalex_raw(query, max_results, year_min=year_min, year_max=year_max)
 
 
 def fetch_with_cascade(
@@ -233,24 +378,10 @@ def fetch_with_cascade(
     source: str = "arxiv",
     max_results: int = 30,
     min_results: int = 3,
+    year_min: str = "",
+    year_max: str = "",
 ) -> tuple[list[dict], int]:
-    """三级级联检索：核心AND → 主关键词AND → 全部OR。
-
-    Strategy 0: 全部核心词 AND + 普通词 OR（最严，核心词全命中）
-    Strategy 1: (所有主关键词 AND) + (其余词 OR)（主关键词必须全部命中）
-    Strategy 2: 全部 OR（保底宽召回）
-
-    Args:
-        primary_kw: 用户标记的主关键词列表，空列表表示未选主关键词
-        secondary_kw: 副关键词（核心词中未被选为主关键词的）
-        regular_kw: 普通关键词
-        source: "arxiv" 或 "openalex"
-        max_results: 每次尝试的最大返回数
-        min_results: 触发降级的结果数阈值
-
-    Returns:
-        (papers, strategy_level): papers 含 api_score，strategy_level 0/1/2
-    """
+    """三级级联检索：核心AND → 主关键词AND → 全部OR。"""
     fetch_raw = _fetch_arxiv_raw if source == "arxiv" else _fetch_openalex_raw
     all_kw = primary_kw + secondary_kw + regular_kw
     all_core = primary_kw + secondary_kw
@@ -275,7 +406,7 @@ def fetch_with_cascade(
     for level, query in strategies:
         if not query:
             continue
-        papers = fetch_raw(query, max_results)
+        papers = fetch_raw(query, max_results, year_min=year_min, year_max=year_max)
         if len(papers) >= min_results or level == strategies[-1][0]:
             return papers, level
 
@@ -409,6 +540,10 @@ def import_local_pdfs(folder_path: str) -> list[dict]:
                 "source": "local_pdf",
                 "url": None,
                 "doi": None,
+                "type": None,
+                "cited_by_count": None,
+                "journal": None,
+                "openalex_id": None,
             })
         except Exception:
             continue
