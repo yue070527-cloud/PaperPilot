@@ -31,6 +31,7 @@ CHANGES_A.md
 ans.txt
 test*.txt
 test*.json
+test*.py
 docs/
 
 # Local config
