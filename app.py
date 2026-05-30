@@ -58,23 +58,12 @@ class AppState:
         self.selected_paper: dict | None = None
         self.theme_name: str = DEFAULT_THEME
         self.dark_mode: bool = False
-        # 筛选状态
-        self.filter_year_min: str = ""
-        self.filter_year_max: str = ""
-        self.filter_type: str = "全部"
-        self.filter_source: str = "全部"
-        self.filter_citations_min: str = ""
 
 
 state = AppState()
 _page: ft.Page | None = None
 results_summary: ft.Text | None = None
 detail_sidebar: ft.Container | None = None  # 右侧文献详情侧边栏
-# 筛选控件全局引用
-filter_year_min_field: ft.TextField | None = None
-filter_year_max_field: ft.TextField | None = None
-filter_type_dropdown: ft.Dropdown | None = None
-filter_citations_field: ft.TextField | None = None
 
 
 def _has_cjk(text: str) -> bool:
@@ -454,56 +443,6 @@ def build_project_page():
     summary = ft.Text(_summary_text(), size=14)
     results_summary = summary
 
-    # 筛选回调
-    def _on_year_min_change(e):
-        state.filter_year_min = e.control.value.strip()
-        _on_filter_change()
-
-    def _on_year_max_change(e):
-        state.filter_year_max = e.control.value.strip()
-        _on_filter_change()
-
-    def _on_type_change(e):
-        state.filter_type = e.control.value or "全部"
-        _on_filter_change()
-
-    def _on_citations_change(e):
-        state.filter_citations_min = e.control.value.strip()
-        _on_filter_change()
-
-    # 筛选控件
-    def _build_type_options():
-        return [
-            ft.dropdown.Option("全部", "全部"),
-            ft.dropdown.Option("综述", "综述"),
-            ft.dropdown.Option("研究论文", "研究论文"),
-            ft.dropdown.Option("书籍章节", "书籍章节"),
-            ft.dropdown.Option("书籍", "书籍"),
-            ft.dropdown.Option("学位论文", "学位论文"),
-            ft.dropdown.Option("其他", "其他"),
-        ]
-
-    global filter_year_min_field, filter_year_max_field
-    global filter_type_dropdown, filter_citations_field
-
-    filter_year_min_field = ft.TextField(
-        hint_text="起始年", width=80, height=38, text_size=13,
-    )
-    filter_year_min_field.on_change = _on_year_min_change
-    filter_year_max_field = ft.TextField(
-        hint_text="结束年", width=80, height=38, text_size=13,
-    )
-    filter_year_max_field.on_change = _on_year_max_change
-    filter_type_dropdown = ft.Dropdown(
-        options=_build_type_options(), value="全部",
-        width=115, text_size=13,
-    )
-    filter_type_dropdown.on_change = _on_type_change
-    filter_citations_field = ft.TextField(
-        hint_text="最低引用", width=85, height=38, text_size=13,
-    )
-    filter_citations_field.on_change = _on_citations_change
-
     results_area = ft.Column([
         ft.Divider(height=16),
         ft.Text("检索结果", size=22, weight=ft.FontWeight.BOLD),
@@ -562,20 +501,6 @@ def build_project_page():
         state.is_searching = True
         state.papers = []
         state.scores = []
-        # 重置筛选
-        state.filter_year_min = ""
-        state.filter_year_max = ""
-        state.filter_type = "全部"
-        state.filter_citations_min = ""
-        if filter_year_min_field:
-            filter_year_min_field.value = ""
-            filter_year_max_field.value = ""
-            filter_type_dropdown.value = "全部"
-            filter_citations_field.value = ""
-            filter_year_min_field.update()
-            filter_year_max_field.update()
-            filter_type_dropdown.update()
-            filter_citations_field.update()
 
         progress_bar.visible = True
         search_btn.disabled = True
@@ -586,8 +511,8 @@ def build_project_page():
 
         # 在主线程读取所有 Flet 控件值，避免后台线程跨线程访问控件
         _max_per = int(max_results_slider.value)
-        _year_min = (filter_year_min_field.value or "").strip() if filter_year_min_field else ""
-        _year_max = (filter_year_max_field.value or "").strip() if filter_year_max_field else ""
+        _year_min = ""
+        _year_max = ""
         _use_arxiv = arxiv_switch.value
         _use_openalex = openalex_switch.value
         _top_k = int(top_k_slider.value)
@@ -696,17 +621,6 @@ def build_project_page():
         ft.Row([search_btn, progress_bar], spacing=16),
         status_text,
         ft.Divider(height=8),
-        ft.Text("筛选条件（搜索前设定）", size=14, weight=ft.FontWeight.W_500),
-        ft.Row([
-            ft.Text("年份:", size=13),
-            filter_year_min_field,
-            ft.Text("–", size=13),
-            filter_year_max_field,
-            ft.Text("  类型:", size=13),
-            filter_type_dropdown,
-            ft.Text("  引用次数≥:", size=13),
-            filter_citations_field,
-        ], spacing=6, wrap=True),
         results_area,
     ], spacing=8, scroll=ft.ScrollMode.AUTO, expand=True)
 
@@ -796,27 +710,15 @@ def sort_table(column: str):
     reverse = _sort_ascending
 
     if key == "cited_by_count":
-        scored = sorted(state.scores, key=lambda x: x[0].get(key) or 0, reverse=not reverse)
+        state.scores = sorted(state.scores, key=lambda x: x[0].get(key) or 0, reverse=not reverse)
     elif key == "score":
-        scored = sorted(state.scores, key=lambda x: x[1], reverse=reverse)
+        state.scores = sorted(state.scores, key=lambda x: x[1], reverse=reverse)
     else:
-        scored = sorted(state.scores, key=lambda x: (
+        state.scores = sorted(state.scores, key=lambda x: (
             x[0].get(key, "") or ""
         ), reverse=not reverse)
 
-    refresh_results_table(scored)
-
-
-def _on_filter_change(e=None):
-    """任一筛选控件变化时重新过滤并刷新表格。"""
-    filters = {
-        "year_min": state.filter_year_min,
-        "year_max": state.filter_year_max,
-        "paper_type": state.filter_type,
-        "citations_min": state.filter_citations_min,
-    }
-    filtered = apply_filters(state.scores, filters)
-    refresh_results_table(filtered)
+    refresh_results_table()
 
 
 def _type_badge(paper: dict) -> ft.Container:
@@ -840,36 +742,8 @@ def _type_badge(paper: dict) -> ft.Container:
     )
 
 
-def apply_filters(
-    scores: list[tuple[dict, float]],
-    filters: dict,
-) -> list[tuple[dict, float]]:
-    """纯函数：按用户筛选条件过滤结果（AND 逻辑）。"""
-    from paperpilot.fetcher import get_article_type_label
-
-    year_min = int(filters["year_min"]) if filters.get("year_min") else None
-    year_max = int(filters["year_max"]) if filters.get("year_max") else None
-    paper_type = filters.get("paper_type", "全部")
-    cit_min = int(filters["citations_min"]) if filters.get("citations_min") else None
-
-    result = []
-    for paper, score in scores:
-        py = paper.get("year")
-        if year_min is not None and (py is None or py < year_min):
-            continue
-        if year_max is not None and (py is None or py > year_max):
-            continue
-        if paper_type != "全部" and get_article_type_label(paper) != paper_type:
-            continue
-        if cit_min is not None and (paper.get("cited_by_count") or 0) < cit_min:
-            continue
-        result.append((paper, score))
-    return result
-
-
-def refresh_results_table(scored=None):
-    if scored is None:
-        scored = state.scores
+def refresh_results_table():
+    scored = state.scores
     results_table.rows.clear()
     for i, (paper, score) in enumerate(scored):
         year_str = str(paper.get("year") or "—")
