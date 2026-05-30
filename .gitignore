@@ -18,9 +18,21 @@ venv/
 *.sqlite3
 
 # Cache
+cache/
 *.cache/
 diskcache_cache/
 *.pkl
+
+# Claude
+.claude/
+
+# Temp files
+CHANGES_A.md
+ans.txt
+test*.txt
+test*.json
+test*.py
+docs/
 
 # Local config
 .env
