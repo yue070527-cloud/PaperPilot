@@ -788,15 +788,32 @@ def build_results_page():
     ], spacing=8)
 
 
+# ── 设置持久化 ──
+def _save_setting(key: str, value):
+    """保存单个搜索/数据源设置到 config.yaml。"""
+    from paperpilot.config import save_config
+    section, field = key.split(".", 1)
+    save_config({section: {field: value}})
+
+
+def _on_slider_saved(e, key: str):
+    _save_setting(key, int(e.control.value))
+
+
 # ── 设置页 ──
 arxiv_switch = ft.Switch(label="arXiv", value=True)
+arxiv_switch.on_change = lambda e: _save_setting("data_sources.arxiv", e.control.value)
 openalex_switch = ft.Switch(label="OpenAlex", value=True)
-max_results_slider = ft.Slider(min=10, max=500, value=30, divisions=49,
+openalex_switch.on_change = lambda e: _save_setting("data_sources.openalex", e.control.value)
+max_results_slider = ft.Slider(min=100, max=500, value=100, divisions=40,
                                 label="{value} 篇")
+max_results_slider.on_change = lambda e: _on_slider_saved(e, "search.max_results")
 top_k_slider = ft.Slider(min=10, max=200, value=50, divisions=19,
                           label="显示 {value} 篇")
+top_k_slider.on_change = lambda e: _on_slider_saved(e, "search.top_k")
 ce_candidates_slider = ft.Slider(min=10, max=200, value=100, divisions=19,
                                   label="精排候选 {value} 篇")
+ce_candidates_slider.on_change = lambda e: _on_slider_saved(e, "search.ce_candidates")
 
 
 def _make_model_selector():
@@ -990,12 +1007,28 @@ def main(page: ft.Page):
     page.window.min_height = 500
     page.padding = 0
 
-    # 加载主题偏好
+    # 加载已保存的所有设置
     from paperpilot.config import load_config
-    ui_config = load_config().get("ui", {})
+    cfg = load_config()
+    ui_config = cfg.get("ui", {})
     state.theme_name = ui_config.get("theme", DEFAULT_THEME)
     state.dark_mode = ui_config.get("dark_mode", False)
     apply_theme(page, state.theme_name, state.dark_mode)
+
+    # 恢复搜索/数据源设置
+    search_cfg = cfg.get("search", {})
+    if search_cfg.get("max_results"):
+        max_results_slider.value = int(search_cfg["max_results"])
+    if search_cfg.get("top_k"):
+        top_k_slider.value = int(search_cfg["top_k"])
+    if search_cfg.get("ce_candidates"):
+        ce_candidates_slider.value = int(search_cfg["ce_candidates"])
+
+    ds_cfg = cfg.get("data_sources", {})
+    if "arxiv" in ds_cfg:
+        arxiv_switch.value = bool(ds_cfg["arxiv"])
+    if "openalex" in ds_cfg:
+        openalex_switch.value = bool(ds_cfg["openalex"])
 
     # 左侧导航容器（内容后续由 page_switcher 动态替换）
     nav_content_ref = ft.Container(
