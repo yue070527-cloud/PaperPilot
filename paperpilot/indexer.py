@@ -19,7 +19,6 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 import numpy as np
-import torch
 from sentence_transformers import CrossEncoder
 
 from paperpilot.config import config
@@ -184,7 +183,6 @@ def _get_cross_encoder():
                     _CE_PATH,
                     max_length=_CE_MAX_LENGTH,
                     device="cpu",
-                    model_kwargs={"torch_dtype": torch.float32},
                 )
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
@@ -211,7 +209,6 @@ def _get_cross_encoder():
                 _CE_NAME,
                 max_length=_CE_MAX_LENGTH,
                 device="cpu",
-                model_kwargs={"torch_dtype": torch.float32},
             )
         except Exception as e:
             logger.warning(f"Cross-encoder download failed: {e}")
@@ -263,9 +260,9 @@ def rerank_with_cross_encoder(
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(_predict)
         try:
-            scores = future.result(timeout=120)
+            scores = future.result(timeout=300)
         except concurrent.futures.TimeoutError:
-            print("[CE] predict 超时(120s)，回退到 API 分数排序", flush=True)
+            print("[CE] predict 超时(300s)，回退到 API 分数排序", flush=True)
             results.sort(key=lambda x: -(x[1] if x[1] is not None else 0))
             return results[:top_k]
         except Exception as e:
