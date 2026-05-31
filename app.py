@@ -1027,6 +1027,8 @@ def build_results_page():
         expand=True,
     )
 
+    empty_hint = ft.Text("", size=13, italic=True, color=ft.Colors.OUTLINE)
+
     def refresh_paper_list():
         """从数据库刷新当前课题的论文列表。"""
         paper_table.rows.clear()
@@ -1036,10 +1038,16 @@ def build_results_page():
         _project_papers[:] = papers
 
         if not papers:
-            paper_table.rows.append(ft.DataRow(
-                cells=[ft.DataCell(ft.Text("暂无论文，在检索页保存结果到此课题", colspan=7,
-                                           italic=True, color=ft.Colors.OUTLINE))]
-            ))
+            paper_table.rows.clear()
+            empty_hint.value = "此课题暂无保存的论文，请在检索页保存结果到此课题"
+            empty_hint.update()
+            try:
+                paper_table.update()
+            except RuntimeError:
+                pass
+            return
+
+        empty_hint.value = ""
 
         status_colors = {"unread": ft.Colors.OUTLINE, "skimmed": ft.Colors.AMBER, "deep_read": ft.Colors.GREEN}
         status_labels = {"unread": "未读", "skimmed": "略读", "deep_read": "精读"}
@@ -1203,6 +1211,7 @@ def build_results_page():
                 status_filter_dd,
             ], spacing=4),
             ft.Divider(height=8),
+            empty_hint,
             ft.Column([paper_table], expand=True, scroll=ft.ScrollMode.AUTO),
         ], spacing=6, expand=True),
         expand=True,
