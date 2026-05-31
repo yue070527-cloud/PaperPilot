@@ -9,3 +9,4 @@ pymupdf>=1.23.0
 diskcache>=5.6.0
 pyyaml>=6.0
 jieba>=0.42
+pywebview>=4.0
