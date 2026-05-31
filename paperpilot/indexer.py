@@ -19,6 +19,7 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 import numpy as np
+import torch
 from sentence_transformers import CrossEncoder
 
 from paperpilot.config import config
