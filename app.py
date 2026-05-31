@@ -497,11 +497,17 @@ def build_project_page():
             if save_mode_val == "existing" and project_dd.value:
                 pid = int(project_dd.value)
             elif save_mode_val == "new" and new_name_field.value.strip():
-                proj = library.create_project(
-                    new_name_field.value.strip(),
-                    new_desc_field.value.strip() or state.topic_desc,
-                )
-                pid = proj.id
+                try:
+                    proj = library.create_project(
+                        new_name_field.value.strip(),
+                        new_desc_field.value.strip() or state.topic_desc,
+                    )
+                    pid = proj.id
+                except ValueError as ve:
+                    result_text.value = str(ve)
+                    result_text.color = ft.Colors.ERROR
+                    result_text.update()
+                    return
             else:
                 result_text.value = "请选择课题或输入新课题名称"
                 result_text.color = ft.Colors.ERROR
@@ -758,14 +764,16 @@ def show_paper_detail(paper: dict):
     sb._meta.value = "  |  ".join(meta_parts)
     sb._abstract.value = paper.get("abstract", "") or "（无摘要）"
     # 可点击链接
-    import webbrowser
     links = []
     url = paper.get("url")
     if url:
         links.append(ft.TextButton("打开原文", icon=ft.Icons.OPEN_IN_BROWSER,
-                                    on_click=lambda e, u=url: webbrowser.open(u)))
+                                    on_click=lambda e, p=paper: open_full_reader(
+                                        p, theme_seed=THEMES[state.theme_name]["seed"],
+                                        dark_mode=state.dark_mode)))
     doi = paper.get("doi")
     if doi:
+        import webbrowser
         doi_url = f"https://doi.org/{doi}"
         links.append(ft.TextButton("DOI", icon=ft.Icons.LINK,
                                     on_click=lambda e, u=doi_url: webbrowser.open(u)))
@@ -936,13 +944,18 @@ def build_results_page():
                 msg.color = ft.Colors.ERROR
                 msg.update()
                 return
-            proj = library.create_project(name_field.value.strip(), desc_field.value.strip())
-            msg.value = f"已创建「{proj.name}」"
-            msg.color = ft.Colors.GREEN
-            msg.update()
-            refresh_project_list()
-            dlg.open = False
-            dlg.update()
+            try:
+                proj = library.create_project(name_field.value.strip(), desc_field.value.strip())
+                msg.value = f"已创建「{proj.name}」"
+                msg.color = ft.Colors.GREEN
+                msg.update()
+                refresh_project_list()
+                dlg.open = False
+                dlg.update()
+            except ValueError as ve:
+                msg.value = str(ve)
+                msg.color = ft.Colors.ERROR
+                msg.update()
 
         def close_dlg(e):
             dlg.open = False

@@ -26,9 +26,17 @@ def _get_session() -> Session:
 # ── 课题管理 ──
 
 def create_project(name: str, description: str, push_interval_days: int = 7) -> Project:
-    """创建新课题。"""
+    """创建新课题。
+
+    Raises:
+        ValueError: 课题名称已存在
+    """
     session = _get_session()
     try:
+        existing = session.query(Project).filter(Project.name == name).first()
+        if existing:
+            raise ValueError(f"课题「{name}」已存在")
+
         project = Project(
             name=name,
             description=description,
