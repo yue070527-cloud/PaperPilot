@@ -183,6 +183,7 @@ def _get_cross_encoder():
                     _CE_PATH,
                     max_length=_CE_MAX_LENGTH,
                     device="cpu",
+                    model_kwargs={"torch_dtype": torch.float32},
                 )
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
@@ -209,6 +210,7 @@ def _get_cross_encoder():
                 _CE_NAME,
                 max_length=_CE_MAX_LENGTH,
                 device="cpu",
+                model_kwargs={"torch_dtype": torch.float32},
             )
         except Exception as e:
             logger.warning(f"Cross-encoder download failed: {e}")
