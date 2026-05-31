@@ -1,5 +1,5 @@
 flet>=0.22.0
-sqlalchemy>=2.0.0
+sqlalchemy>=2.0.50
 faiss-cpu>=1.7.4
 sentence-transformers>=2.2.0
 keybert>=0.8.0
