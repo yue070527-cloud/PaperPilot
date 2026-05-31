@@ -327,36 +327,35 @@ def _build_error_html(message: str, detail: str, dark_mode: bool, seed_color: st
 
 # ── 方案 B：pywebview 独立阅读窗口 ──
 
-_webview_loop_running = False
-_webview_lock = threading.Lock()
-
-
 def _create_window(create_kwargs: dict) -> bool:
-    """在非守护线程中创建 pywebview 窗口。
+    """在独立子进程中启动 pywebview 窗口，避免与 Flet 的主线程冲突。"""
+    import json
+    import subprocess
+    import sys
+    import tempfile
 
-    首次调用时：创建窗口 + 启动 GUI 循环（阻塞直到所有窗口关闭）。
-    后续调用时：仅创建窗口，被已运行的 GUI 循环接管。
-    """
-    global _webview_loop_running
+    # 将参数写入临时 JSON 文件（HTML 等大文本走文件而非命令行）
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False, encoding="utf-8"
+    ) as f:
+        json.dump(create_kwargs, f, ensure_ascii=False)
+        args_path = f.name
 
-    def _run():
-        global _webview_loop_running
-        import traceback
-        try:
-            _webview.create_window(**create_kwargs)
-            with _webview_lock:
-                need_start = not _webview_loop_running
-                if need_start:
-                    _webview_loop_running = True
-            if need_start:
-                _webview.start()
-                with _webview_lock:
-                    _webview_loop_running = False
-        except Exception:
-            traceback.print_exc()
+    script = (
+        "import json,webview,os\n"
+        f"with open({args_path!r},'r',encoding='utf-8') as f:\n"
+        "  k=json.load(f)\n"
+        f"os.unlink({args_path!r})\n"
+        "webview.create_window(**k)\n"
+        "webview.start()\n"
+    )
 
-    t = threading.Thread(target=_run, daemon=False)
-    t.start()
+    subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+    )
     return True
 
 

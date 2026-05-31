@@ -64,6 +64,7 @@ class AppState:
 
 state = AppState()
 _page: ft.Page | None = None
+_refresh_library = None  # 文献页刷新函数引用，page_switcher 触发
 results_summary: ft.Text | None = None
 detail_sidebar: ft.Container | None = None  # 右侧文献详情侧边栏
 
@@ -249,6 +250,9 @@ def page_switcher(idx: int):
     container_project.visible = idx == 0
     container_results.visible = idx == 1
     container_settings.visible = idx == 2
+
+    if idx == 1 and _refresh_library is not None:
+        _refresh_library()
 
     nav_content_ref.content = build_left_nav(idx)
     nav_content_ref.update()
@@ -932,6 +936,10 @@ def build_results_page():
         except RuntimeError:
             pass
 
+    # 暴露给 page_switcher，切到文献页时自动刷新
+    global _refresh_library
+    _refresh_library = refresh_project_list
+
     def on_new_project(e):
         """新建课题对话框。"""
         name_field = ft.TextField(label="课题名称", hint_text="例如：钙钛矿太阳能电池")
@@ -1185,6 +1193,7 @@ def build_results_page():
             ft.Row([
                 ft.IconButton(icon=ft.Icons.ADD, tooltip="新建课题", on_click=on_new_project),
                 ft.IconButton(icon=ft.Icons.DELETE, tooltip="删除课题", on_click=on_delete_project),
+                ft.IconButton(icon=ft.Icons.REFRESH, tooltip="刷新列表", on_click=lambda e: refresh_project_list()),
             ], spacing=2),
             project_list_col,
         ], spacing=6),
