@@ -327,31 +327,37 @@ def _build_error_html(message: str, detail: str, dark_mode: bool, seed_color: st
 
 # ── 方案 B：pywebview 独立阅读窗口 ──
 
-_webview_started = False
+_webview_loop_running = False
 _webview_lock = threading.Lock()
 
 
-def _ensure_webview_started():
-    """确保 webview GUI 循环在非守护线程中运行（仅首次调用）。"""
-    global _webview_started
-    if _webview_started:
-        return
-    with _webview_lock:
-        if _webview_started:
-            return
+def _create_window(create_kwargs: dict) -> bool:
+    """在非守护线程中创建 pywebview 窗口。
 
-        def _run_gui():
-            import traceback
-            try:
-                _webview.start(gui="edgechromium")
-            except Exception:
-                traceback.print_exc()
+    首次调用时：创建窗口 + 启动 GUI 循环（阻塞直到所有窗口关闭）。
+    后续调用时：仅创建窗口，被已运行的 GUI 循环接管。
+    """
+    global _webview_loop_running
 
-        t = threading.Thread(target=_run_gui, daemon=False)
-        t.start()
-        _webview_started = True
-        import time
-        time.sleep(0.3)  # 等待 GUI 循环初始化
+    def _run():
+        global _webview_loop_running
+        import traceback
+        try:
+            _webview.create_window(**create_kwargs)
+            with _webview_lock:
+                need_start = not _webview_loop_running
+                if need_start:
+                    _webview_loop_running = True
+            if need_start:
+                _webview.start()
+                with _webview_lock:
+                    _webview_loop_running = False
+        except Exception:
+            traceback.print_exc()
+
+    t = threading.Thread(target=_run, daemon=False)
+    t.start()
+    return True
 
 
 def open_full_reader(
@@ -423,51 +429,29 @@ def _open_pdfjs_window(
 ) -> bool:
     """生成 PDF.js HTML 并在 pywebview 窗口中打开。"""
     html = _build_reader_html(pdf_path, title, theme_seed, dark_mode)
-    _ensure_webview_started()
-
-    def _run():
-        try:
-            _webview.create_window(
-                title=title,
-                html=html,
-                frameless=True,
-                width=900,
-                height=700,
-                x=x,
-                y=y,
-                min_size=(400, 300),
-            )
-        except Exception:
-            import traceback
-            traceback.print_exc()
-
-    t = threading.Thread(target=_run, daemon=False)
-    t.start()
-    return True
+    return _create_window({
+        "title": title,
+        "html": html,
+        "frameless": True,
+        "width": 900,
+        "height": 700,
+        "x": x,
+        "y": y,
+        "min_size": (400, 300),
+    })
 
 
 def _open_url_window(url: str, title: str, x: int | None, y: int | None) -> bool:
     """用 pywebview 直接加载远程 URL。"""
-    _ensure_webview_started()
-
-    def _run():
-        try:
-            _webview.create_window(
-                title=title,
-                url=url,
-                width=1000,
-                height=750,
-                x=x,
-                y=y,
-                min_size=(400, 300),
-            )
-        except Exception:
-            import traceback
-            traceback.print_exc()
-
-    t = threading.Thread(target=_run, daemon=False)
-    t.start()
-    return True
+    return _create_window({
+        "title": title,
+        "url": url,
+        "width": 1000,
+        "height": 750,
+        "x": x,
+        "y": y,
+        "min_size": (400, 300),
+    })
 
 
 def _open_error_window(
@@ -484,26 +468,15 @@ def _open_error_window(
         dark_mode=dark_mode,
         seed_color=theme_seed,
     )
-    _ensure_webview_started()
-
-    def _run():
-        try:
-            _webview.create_window(
-                title=title,
-                html=html,
-                frameless=True,
-                width=500,
-                height=300,
-                x=x,
-                y=y,
-            )
-        except Exception:
-            import traceback
-            traceback.print_exc()
-
-    t = threading.Thread(target=_run, daemon=False)
-    t.start()
-    return True
+    return _create_window({
+        "title": title,
+        "html": html,
+        "frameless": True,
+        "width": 500,
+        "height": 300,
+        "x": x,
+        "y": y,
+    })
 
 
 # ── 方案 A：Flet 内嵌 PyMuPDF 轻量预览 ──
