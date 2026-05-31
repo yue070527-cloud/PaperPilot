@@ -10,6 +10,8 @@ from paperpilot.keywords import extract_all_keywords, merge_keywords
 from paperpilot.mt_translator import translate_terms
 from paperpilot.fetcher import fetch_arxiv, fetch_openalex, fetch_with_cascade, fetch_multi_primary, deduplicate
 from paperpilot.indexer import rank_papers
+from paperpilot import library
+from paperpilot.pdf_viewer import open_full_reader, render_preview, is_full_reader_available
 
 
 # ── 主题定义 ──
@@ -443,10 +445,107 @@ def build_project_page():
     summary = ft.Text(_summary_text(), size=14)
     results_summary = summary
 
+    save_to_library_btn = ft.OutlinedButton(
+        content=ft.Text("保存到文献库"),
+        icon=ft.Icons.SAVE,
+        visible=False,
+    )
+
+    def on_save_to_library(e):
+        """弹出对话框，选择课题保存当前检索结果。"""
+        projects = library.get_all_projects()
+        project_options = [ft.dropdown.Option(str(p.id), p.name) for p in projects]
+        project_dd = ft.Dropdown(
+            options=project_options,
+            hint_text="选择已有课题",
+            expand=True,
+        )
+        new_name_field = ft.TextField(
+            label="或新建课题",
+            hint_text="输入新课题名称",
+            visible=False,
+        )
+        new_desc_field = ft.TextField(
+            label="课题描述",
+            hint_text=state.topic_desc[:200],
+            visible=False,
+        )
+
+        def on_mode_change(e):
+            is_new = e.control.value == "new"
+            project_dd.visible = not is_new
+            new_name_field.visible = is_new
+            new_desc_field.visible = is_new
+            project_dd.update()
+            new_name_field.update()
+            new_desc_field.update()
+
+        save_mode = ft.RadioGroup(
+            content=ft.Row([
+                ft.Radio(value="existing", label="已有课题"),
+                ft.Radio(value="new", label="新建课题"),
+            ]),
+            value="existing",
+            on_change=on_mode_change,
+        )
+
+        result_text = ft.Text("", size=13, italic=True)
+
+        def do_save(e):
+            nonlocal projects
+            save_mode_val = save_mode.value
+            if save_mode_val == "existing" and project_dd.value:
+                pid = int(project_dd.value)
+            elif save_mode_val == "new" and new_name_field.value.strip():
+                proj = library.create_project(
+                    new_name_field.value.strip(),
+                    new_desc_field.value.strip() or state.topic_desc,
+                )
+                pid = proj.id
+            else:
+                result_text.value = "请选择课题或输入新课题名称"
+                result_text.color = ft.Colors.ERROR
+                result_text.update()
+                return
+
+            n = library.save_papers_to_project(pid, state.papers, state.scores)
+            result_text.value = f"已保存 {n} 篇论文到文献库"
+            result_text.color = ft.Colors.GREEN
+            result_text.update()
+            dlg.open = False
+            dlg.update()
+
+        def close_dlg(e):
+            dlg.open = False
+            dlg.update()
+
+        dlg = ft.AlertDialog(
+            title=ft.Text("保存到文献库"),
+            content=ft.Column([
+                ft.Text(f"将 {len(state.scores)} 篇检索结果保存到："),
+                save_mode,
+                project_dd,
+                new_name_field,
+                new_desc_field,
+                result_text,
+            ], spacing=12, tight=True, height=280),
+            actions=[
+                ft.TextButton("取消", on_click=close_dlg),
+                ft.FilledButton("保存", on_click=do_save),
+            ],
+        )
+
+        _page.overlay.append(dlg)
+        dlg.open = True
+        _page.update()
+
+    save_to_library_btn.on_click = on_save_to_library
+
     results_area = ft.Column([
         ft.Divider(height=16),
         ft.Text("检索结果", size=22, weight=ft.FontWeight.BOLD),
         summary,
+        ft.Row([save_to_library_btn], alignment=ft.MainAxisAlignment.END),
         ft.Divider(height=8),
         ft.Column([results_table], expand=True, scroll=ft.ScrollMode.AUTO),
     ], spacing=6, expand=True, visible=False)
@@ -573,6 +672,7 @@ def build_project_page():
                     refresh_results_table()
                     summary.value = _summary_text()
                     results_area.visible = True
+                    save_to_library_btn.visible = True
                     results_area.update()
             finally:
                 state.is_searching = False
@@ -780,12 +880,327 @@ def refresh_results_table():
 
 
 def build_results_page():
-    """文献管理页面（预留，后续开发）。"""
-    return ft.Column([
-        ft.Text("文献管理", size=22, weight=ft.FontWeight.BOLD),
-        ft.Divider(height=16),
-        ft.Text("此功能正在开发中，敬请期待。", size=14, italic=True),
-    ], spacing=8)
+    """文献管理页面：课题列表 + 论文列表 + 状态筛选 + 阅读 + 导出。"""
+    # 页面局部状态
+    _selected_project_id = None
+    _project_papers: list[dict] = []
+    _status_filter = "all"
+
+    # ── 左侧：课题列表 ──
+    project_list_col = ft.Column(spacing=4, expand=True, scroll=ft.ScrollMode.AUTO)
+    selected_project_title = ft.Text("请选择一个课题", size=16, weight=ft.FontWeight.W_500)
+    paper_count_text = ft.Text("", size=13, italic=True)
+
+    def refresh_project_list():
+        """从数据库刷新课题列表。"""
+        projects = library.get_all_projects()
+        project_list_col.controls.clear()
+        if not projects:
+            project_list_col.controls.append(
+                ft.Text("暂无课题，检索后保存即可创建", size=13, italic=True,
+                       color=ft.Colors.OUTLINE)
+            )
+        else:
+            for proj in projects:
+                is_active = _selected_project_id == proj.id
+                btn = ft.TextButton(
+                    content=ft.Row([
+                        ft.Icon(ft.Icons.FOLDER, size=16,
+                                color=ft.Colors.ON_PRIMARY_CONTAINER if is_active else None),
+                        ft.Text(proj.name[:20], size=13,
+                               weight=ft.FontWeight.W_600 if is_active else ft.FontWeight.NORMAL,
+                               color=ft.Colors.ON_PRIMARY_CONTAINER if is_active else None),
+                    ], spacing=6),
+                    data=proj.id,
+                    on_click=lambda e, pid=proj.id: on_select_project(pid),
+                    style=ft.ButtonStyle(
+                        bgcolor=ft.Colors.PRIMARY_CONTAINER if is_active else None,
+                        padding=ft.padding.Padding(left=12, top=8, right=12, bottom=8),
+                    ),
+                )
+                project_list_col.controls.append(btn)
+        try:
+            project_list_col.update()
+        except RuntimeError:
+            pass
+
+    def on_new_project(e):
+        """新建课题对话框。"""
+        name_field = ft.TextField(label="课题名称", hint_text="例如：钙钛矿太阳能电池")
+        desc_field = ft.TextField(label="课题描述", hint_text="输入1-3句描述", multiline=True, min_lines=2, max_lines=4)
+        msg = ft.Text("", size=13)
+
+        def do_create(e):
+            if not name_field.value.strip():
+                msg.value = "请输入课题名称"
+                msg.color = ft.Colors.ERROR
+                msg.update()
+                return
+            proj = library.create_project(name_field.value.strip(), desc_field.value.strip())
+            msg.value = f"已创建「{proj.name}」"
+            msg.color = ft.Colors.GREEN
+            msg.update()
+            refresh_project_list()
+            dlg.open = False
+            dlg.update()
+
+        def close_dlg(e):
+            dlg.open = False
+            dlg.update()
+
+        dlg = ft.AlertDialog(
+            title=ft.Text("新建课题"),
+            content=ft.Column([name_field, desc_field, msg], spacing=12, tight=True, height=200),
+            actions=[ft.TextButton("取消", on_click=close_dlg), ft.FilledButton("创建", on_click=do_create)],
+        )
+        _page.overlay.append(dlg)
+        dlg.open = True
+        _page.update()
+
+    def on_delete_project(e):
+        """删除当前选中课题。"""
+        nonlocal _selected_project_id
+        pid = _selected_project_id
+        if pid is None:
+            return
+
+        def do_delete(e):
+            nonlocal _selected_project_id
+            library.delete_project(pid)
+            _selected_project_id = None
+            selected_project_title.value = "请选择一个课题"
+            paper_count_text.value = ""
+            refresh_project_list()
+            refresh_paper_list()
+            selected_project_title.update()
+            paper_count_text.update()
+            dlg.open = False
+            dlg.update()
+
+        dlg = ft.AlertDialog(
+            title=ft.Text("确认删除"),
+            content=ft.Text("删除课题将同时删除其关联的论文记录（论文本身不会被删除）。"),
+            actions=[ft.TextButton("取消", on_click=lambda e: (setattr(dlg, 'open', False), dlg.update())),
+                     ft.FilledButton("确认删除", on_click=do_delete)],
+        )
+        _page.overlay.append(dlg)
+        dlg.open = True
+        _page.update()
+
+    # ── 右侧：论文列表 ──
+    status_filter_dd = ft.Dropdown(
+        options=[
+            ft.dropdown.Option("all", "全部"),
+            ft.dropdown.Option("unread", "未读"),
+            ft.dropdown.Option("skimmed", "略读"),
+            ft.dropdown.Option("deep_read", "精读"),
+        ],
+        value="all",
+        width=120,
+    )
+
+    paper_table = ft.DataTable(
+        columns=[
+            ft.DataColumn(ft.Text("#"), numeric=True),
+            ft.DataColumn(ft.Text("标题")),
+            ft.DataColumn(ft.Text("作者")),
+            ft.DataColumn(ft.Text("年份"), numeric=True),
+            ft.DataColumn(ft.Text("得分"), numeric=True),
+            ft.DataColumn(ft.Text("状态")),
+            ft.DataColumn(ft.Text("操作")),
+        ],
+        rows=[],
+        border=_border(ft.Colors.OUTLINE_VARIANT),
+        expand=True,
+    )
+
+    def refresh_paper_list():
+        """从数据库刷新当前课题的论文列表。"""
+        paper_table.rows.clear()
+        status_val = status_filter_dd.value
+        sf = None if status_val == "all" else status_val
+        papers = library.get_project_papers(_selected_project_id, status_filter=sf) if _selected_project_id else []
+        _project_papers[:] = papers
+
+        if not papers:
+            paper_table.rows.append(ft.DataRow(
+                cells=[ft.DataCell(ft.Text("暂无论文，在检索页保存结果到此课题", colspan=7,
+                                           italic=True, color=ft.Colors.OUTLINE))]
+            ))
+
+        status_colors = {"unread": ft.Colors.OUTLINE, "skimmed": ft.Colors.AMBER, "deep_read": ft.Colors.GREEN}
+        status_labels = {"unread": "未读", "skimmed": "略读", "deep_read": "精读"}
+
+        for i, p in enumerate(papers):
+            title = (p.get("title") or "")[:60]
+            authors = (p.get("authors") or "")[:30]
+            year = str(p.get("year") or "—")
+            score = p.get("total_score", 0)
+            status = p.get("status", "unread")
+
+            score_color = ft.Colors.GREEN if score >= 0.4 else ft.Colors.ORANGE if score >= 0.2 else ft.Colors.OUTLINE
+            status_color = status_colors.get(status, ft.Colors.OUTLINE)
+
+            # 阅读按钮
+            pp_id = p["project_paper_id"]
+            read_btn = ft.IconButton(
+                icon=ft.Icons.OPEN_IN_BROWSER,
+                tooltip="打开全文",
+                data=p,
+                on_click=lambda e, paper=p: _on_read_paper(paper),
+                icon_size=18,
+            )
+            if not is_full_reader_available():
+                read_btn.disabled = True
+
+            # 状态切换下拉
+            status_dd = ft.Dropdown(
+                options=[
+                    ft.dropdown.Option("unread", "未读"),
+                    ft.dropdown.Option("skimmed", "略读"),
+                    ft.dropdown.Option("deep_read", "精读"),
+                ],
+                value=status,
+                width=90,
+                text_size=12,
+            )
+            status_dd.data = pp_id
+            status_dd.on_change = lambda e, ppid=pp_id: _on_status_change(ppid, e.control.value)
+
+            paper_table.rows.append(ft.DataRow(cells=[
+                ft.DataCell(ft.Text(str(i + 1))),
+                ft.DataCell(ft.Text(title)),
+                ft.DataCell(ft.Text(authors)),
+                ft.DataCell(ft.Text(year)),
+                ft.DataCell(ft.Text(f"{score:.3f}", color=score_color, weight=ft.FontWeight.BOLD)),
+                ft.DataCell(ft.Row([
+                    ft.Container(width=8, height=8, border_radius=4, bgcolor=status_color),
+                    status_dd,
+                ], spacing=4)),
+                ft.DataCell(read_btn),
+            ]))
+        try:
+            paper_table.update()
+        except RuntimeError:
+            pass
+
+    def on_select_project(project_id: int | None):
+        """选中课题时刷新论文列表。"""
+        nonlocal _selected_project_id
+        _selected_project_id = project_id
+        if project_id is None:
+            selected_project_title.value = "请选择一个课题"
+            paper_count_text.value = ""
+        else:
+            proj = library.get_project(project_id)
+            if proj:
+                selected_project_title.value = proj.name
+        refresh_project_list()
+        refresh_paper_list()
+        selected_project_title.update()
+        paper_count_text.update()
+
+    def _on_read_paper(paper: dict):
+        """打开 PDF 阅读器。"""
+        # 构建完整的 paper dict（library 返回的已包含基本字段）
+        open_full_reader(paper, theme_seed=THEMES[state.theme_name]["seed"], dark_mode=state.dark_mode)
+
+    def _on_status_change(pp_id: int, new_status: str):
+        """更新论文状态并刷新列表。"""
+        library.update_paper_status(pp_id, new_status)
+        refresh_paper_list()
+
+    # 状态筛选回调
+    def on_status_filter_change(e):
+        nonlocal _status_filter
+        _status_filter = status_filter_dd.value
+        refresh_paper_list()
+
+    status_filter_dd.on_change = on_status_filter_change
+
+    # ── 导出（B 负责 UI，A 负责数据转换） ──
+    def on_export_bibtex(e):
+        try:
+            from paperpilot.export import to_bibtex
+            content = to_bibtex(_project_papers)
+            _save_export_file("bib", content)
+        except ImportError:
+            _show_export_unavailable()
+
+    def on_export_csv(e):
+        try:
+            from paperpilot.export import to_csv
+            content = to_csv(_project_papers)
+            _save_export_file("csv", content)
+        except ImportError:
+            _show_export_unavailable()
+
+    def _save_export_file(ext: str, content: str):
+        import subprocess, tempfile
+        path = tempfile.mktemp(suffix=f".{ext}", prefix="paperpilot_export_")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        try:
+            subprocess.Popen(["start", "", path], shell=True)
+        except Exception:
+            pass
+
+    def _show_export_unavailable():
+        dlg = ft.AlertDialog(
+            title=ft.Text("导出功能暂不可用"),
+            content=ft.Text("导出模块尚未完成，请等待后续更新。"),
+            actions=[ft.TextButton("确定", on_click=lambda e: (setattr(dlg, 'open', False), dlg.update()))],
+        )
+        _page.overlay.append(dlg)
+        dlg.open = True
+        _page.update()
+
+    # 首次加载课题列表
+    refresh_project_list()
+
+    # ── 布局 ──
+    left_panel = ft.Container(
+        content=ft.Column([
+            ft.Row([
+                ft.IconButton(icon=ft.Icons.ADD, tooltip="新建课题", on_click=on_new_project),
+                ft.IconButton(icon=ft.Icons.DELETE, tooltip="删除课题", on_click=on_delete_project),
+            ], spacing=2),
+            project_list_col,
+        ], spacing=6),
+        width=220,
+        padding=ft.padding.Padding(top=8, right=8, bottom=8, left=0),
+    )
+
+    right_panel = ft.Container(
+        content=ft.Column([
+            ft.Row([
+                selected_project_title,
+                ft.PopupMenuButton(
+                    icon=ft.Icons.DOWNLOAD,
+                    tooltip="导出",
+                    items=[
+                        ft.PopupMenuItem(text="BibTeX", on_click=on_export_bibtex),
+                        ft.PopupMenuItem(text="CSV", on_click=on_export_csv),
+                    ],
+                ),
+            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+            paper_count_text,
+            ft.Row([
+                ft.Text("筛选:", size=13),
+                status_filter_dd,
+            ], spacing=4),
+            ft.Divider(height=8),
+            ft.Column([paper_table], expand=True, scroll=ft.ScrollMode.AUTO),
+        ], spacing=6, expand=True),
+        expand=True,
+        padding=ft.padding.Padding(top=8, left=8, bottom=8, right=0),
+    )
+
+    return ft.Row([
+        left_panel,
+        ft.VerticalDivider(width=1),
+        right_panel,
+    ], spacing=0, expand=True)
 
 
 # ── 设置持久化 ──
