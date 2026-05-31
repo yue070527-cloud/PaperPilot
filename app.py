@@ -1179,8 +1179,8 @@ def build_results_page():
                     icon=ft.Icons.DOWNLOAD,
                     tooltip="导出",
                     items=[
-                        ft.PopupMenuItem(text="BibTeX", on_click=on_export_bibtex),
-                        ft.PopupMenuItem(text="CSV", on_click=on_export_csv),
+                        ft.PopupMenuItem(content=ft.Text("BibTeX"), on_click=on_export_bibtex),
+                        ft.PopupMenuItem(content=ft.Text("CSV"), on_click=on_export_csv),
                     ],
                 ),
             ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
