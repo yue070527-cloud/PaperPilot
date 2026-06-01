@@ -1041,8 +1041,6 @@ def build_results_page():
     # ── 上传 & 排序 ──
     upload_picker = ft.FilePicker()
     folder_picker = ft.FilePicker()
-    _page.overlay.append(upload_picker)
-    _page.overlay.append(folder_picker)
 
     upload_progress = ft.Text("", size=12, italic=True)
     sort_btn = ft.IconButton(
