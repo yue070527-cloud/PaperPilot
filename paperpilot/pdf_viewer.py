@@ -392,6 +392,9 @@ def open_full_reader(
     doi = paper.get("doi")
     title = (paper.get("title") or "PaperPilot Reader").strip()
 
+    # 标记：pdf_path 设了但文件不存在（用于最终错误提示）
+    missing_local = pdf_path and not os.path.isfile(pdf_path)
+
     # 1. 本地 PDF 文件
     if pdf_path and os.path.isfile(pdf_path):
         return _open_pdfjs_window(pdf_path, title, theme_seed, dark_mode, x, y)
@@ -415,6 +418,13 @@ def open_full_reader(
         return _open_url_window(doi_url, title, x, y)
 
     # 5. 无法获取全文
+    if missing_local:
+        return _open_error_window(
+            title, theme_seed, dark_mode, x, y,
+            message="PDF 文件已移动或删除",
+            detail=f"原路径: {paper['pdf_path']}",
+        )
+
     return _open_error_window(title, theme_seed, dark_mode, x, y)
 
 
@@ -459,11 +469,13 @@ def _open_error_window(
     dark_mode: bool,
     x: int | None,
     y: int | None,
+    message: str = "无法获取全文",
+    detail: str = "该论文没有可用的本地 PDF 文件或远程链接。",
 ) -> bool:
-    """显示'无法获取全文'的错误提示窗口。"""
+    """显示错误提示窗口。"""
     html = _build_error_html(
-        message="无法获取全文",
-        detail="该论文没有可用的本地 PDF 文件或远程链接。",
+        message=message,
+        detail=detail,
         dark_mode=dark_mode,
         seed_color=theme_seed,
     )
