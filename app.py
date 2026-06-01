@@ -1169,37 +1169,58 @@ def build_results_page():
 
         _page.run_task(_poll_upload)
 
-    # 文件选择 → tkinter 原生对话框（Flet 0.85 FilePicker 兼容性不足）
-    def _pick_single_file():
-        import tkinter.filedialog as fd
-        import tkinter as tk
-        root = tk.Tk(); root.withdraw()
-        path = fd.askopenfilename(
-            title="选择 PDF 文件", filetypes=[("PDF files", "*.pdf")]
+    # 文件选择 → PowerShell 调用 Windows 原生对话框
+    def _run_ps_dialog(script: str) -> str:
+        import subprocess, tempfile, os
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".ps1", delete=False, encoding="utf-8"
         )
-        root.destroy()
-        if path:
-            _start_upload([path])
+        tmp.write(script)
+        tmp.close()
+        try:
+            r = subprocess.run(
+                ["powershell", "-ExecutionPolicy", "Bypass", "-File", tmp.name],
+                capture_output=True, text=True, timeout=120,
+            )
+            return r.stdout.strip()
+        finally:
+            os.unlink(tmp.name)
+
+    def _pick_single_file():
+        script = (
+            'Add-Type -AssemblyName System.Windows.Forms\n'
+            '$f=New-Object System.Windows.Forms.OpenFileDialog\n'
+            "$f.Filter='PDF Files (*.pdf)|*.pdf'\n"
+            "$f.Title='选择 PDF 文件'\n"
+            "if($f.ShowDialog() -eq 'OK'){Write-Output $f.FileName}\n"
+        )
+        out = _run_ps_dialog(script)
+        if out:
+            _start_upload([out])
 
     def _pick_multiple_files():
-        import tkinter.filedialog as fd
-        import tkinter as tk
-        root = tk.Tk(); root.withdraw()
-        paths = fd.askopenfilenames(
-            title="选择 PDF 文件", filetypes=[("PDF files", "*.pdf")]
+        script = (
+            'Add-Type -AssemblyName System.Windows.Forms\n'
+            '$f=New-Object System.Windows.Forms.OpenFileDialog\n'
+            "$f.Filter='PDF Files (*.pdf)|*.pdf'\n"
+            "$f.Title='选择 PDF 文件'\n"
+            '$f.Multiselect=$true\n'
+            "if($f.ShowDialog() -eq 'OK'){$f.FileNames|%{Write-Output $_}}\n"
         )
-        root.destroy()
-        if paths:
-            _start_upload(list(paths))
+        out = _run_ps_dialog(script)
+        if out:
+            _start_upload([p for p in out.split("\n") if p.strip()])
 
     def _pick_folder():
-        import tkinter.filedialog as fd
-        import tkinter as tk
-        root = tk.Tk(); root.withdraw()
-        path = fd.askdirectory(title="选择包含 PDF 的文件夹")
-        root.destroy()
-        if path:
-            pdfs = scan_folder(path, recursive=True)
+        script = (
+            'Add-Type -AssemblyName System.Windows.Forms\n'
+            '$f=New-Object System.Windows.Forms.FolderBrowserDialog\n'
+            "$f.Description='选择包含 PDF 的文件夹'\n"
+            "if($f.ShowDialog() -eq 'OK'){Write-Output $f.SelectedPath}\n"
+        )
+        out = _run_ps_dialog(script)
+        if out:
+            pdfs = scan_folder(out, recursive=True)
             if pdfs:
                 _start_upload(pdfs)
             else:
