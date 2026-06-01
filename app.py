@@ -11,6 +11,7 @@ from paperpilot.mt_translator import translate_terms
 from paperpilot.fetcher import fetch_arxiv, fetch_openalex, fetch_with_cascade, fetch_multi_primary, deduplicate
 from paperpilot.indexer import rank_papers
 from paperpilot import library
+from paperpilot.local_import import scan_folder, extract_pdfs
 from paperpilot.pdf_viewer import open_full_reader, render_preview, is_full_reader_available
 
 
@@ -1037,6 +1038,190 @@ def build_results_page():
 
     empty_hint = ft.Text("", size=13, italic=True, color=ft.Colors.OUTLINE)
 
+    # ── 上传 & 排序 ──
+    upload_picker = ft.FilePicker()
+    folder_picker = ft.FilePicker()
+
+    upload_progress = ft.Text("", size=12, italic=True)
+    sort_btn = ft.IconButton(
+        icon=ft.Icons.SORT,
+        tooltip="CE 语义排序",
+        disabled=True,
+    )
+
+    def on_sort_click(e):
+        """对当前课题所有论文跑 CE 精排并持久化分数。"""
+        if _selected_project_id is None:
+            return
+        proj = library.get_project(_selected_project_id)
+        if not proj or not proj.description:
+            upload_progress.value = "请先在课题描述中填写研究方向后再排序"
+            upload_progress.color = ft.Colors.ERROR
+            upload_progress.update()
+            return
+
+        papers = library.get_project_papers(_selected_project_id)
+        if not papers:
+            upload_progress.value = "暂无论文可排序"
+            upload_progress.color = ft.Colors.ERROR
+            upload_progress.update()
+            return
+
+        upload_progress.value = "正在语义排序..."
+        upload_progress.color = ft.Colors.OUTLINE
+        upload_progress.update()
+
+        # 构建 paper dict 列表（含 pdf_path）
+        paper_dicts = []
+        for p in papers:
+            d = {
+                "title": p.get("title", ""),
+                "authors": p.get("authors", ""),
+                "abstract": p.get("abstract", ""),
+                "year": p.get("year"),
+                "source": p.get("source", "local_pdf"),
+                "url": p.get("url"),
+                "doi": p.get("doi"),
+                "api_score": None,
+                "type": None,
+                "cited_by_count": None,
+                "journal": None,
+                "pdf_path": p.get("pdf_path"),
+            }
+            paper_dicts.append(d)
+
+        import threading
+        _sort_done = threading.Event()
+        _sort_result: list = []
+
+        def _run_sort():
+            try:
+                scored = rank_papers(
+                    query=proj.description,
+                    papers=paper_dicts,
+                    top_k=len(paper_dicts),
+                    ce_candidates=len(paper_dicts),
+                )
+                _sort_result.extend(scored)
+            except Exception as ex:
+                _sort_result.append(ex)
+            finally:
+                _sort_done.set()
+
+        threading.Thread(target=_run_sort, daemon=True).start()
+
+        async def _poll_sort():
+            import asyncio
+            while not _sort_done.is_set():
+                await asyncio.sleep(0.3)
+            if _sort_result and isinstance(_sort_result[0], Exception):
+                upload_progress.value = f"排序失败: {_sort_result[0]}"
+                upload_progress.color = ft.Colors.ERROR
+            else:
+                n = library.update_paper_scores(_selected_project_id, _sort_result)
+                upload_progress.value = f"排序完成，已更新 {n} 篇"
+                upload_progress.color = ft.Colors.GREEN
+            upload_progress.update()
+            refresh_paper_list()
+
+        _page.run_task(_poll_sort)
+
+    sort_btn.on_click = on_sort_click
+
+    def _start_upload(file_paths: list[str]):
+        """后台提取 PDF 并保存到课题。"""
+        if not file_paths:
+            return
+        total = len(file_paths)
+        upload_progress.value = f"正在提取 0/{total}..."
+        upload_progress.color = ft.Colors.OUTLINE
+        upload_progress.update()
+
+        import threading
+        _upload_done = threading.Event()
+        _upload_result: dict = {}
+
+        def _run_extract():
+            def progress_cb(cur, tot, fname):
+                upload_progress.value = f"正在提取 {cur}/{tot}: {fname[:30]}"
+                upload_progress.update()
+
+            papers, skipped = extract_pdfs(file_paths, on_progress=progress_cb)
+            _upload_result["papers"] = papers
+            _upload_result["skipped"] = skipped
+            _upload_done.set()
+
+        threading.Thread(target=_run_extract, daemon=True).start()
+
+        async def _poll_upload():
+            import asyncio
+            while not _upload_done.is_set():
+                await asyncio.sleep(0.3)
+
+            papers = _upload_result.get("papers", [])
+            skipped = _upload_result.get("skipped", [])
+
+            n = library.save_papers_to_project(_selected_project_id, papers)
+            msg_parts = [f"已添加 {n} 篇"]
+            if skipped:
+                msg_parts.append(f"跳过 {len(skipped)} 篇扫描件/加密文件")
+            upload_progress.value = "，".join(msg_parts)
+            upload_progress.color = ft.Colors.GREEN
+            upload_progress.update()
+            refresh_paper_list()
+
+        _page.run_task(_poll_upload)
+
+    def _on_files_picked(e: ft.FilePickerResultEvent):
+        if not e.files:
+            return
+        paths = [f.path for f in e.files if f.path and f.path.lower().endswith(".pdf")]
+        if not paths:
+            upload_progress.value = "未选择 PDF 文件"
+            upload_progress.color = ft.Colors.ERROR
+            upload_progress.update()
+            return
+        _start_upload(paths)
+
+    def _on_folder_picked(e: ft.FilePickerResultEvent):
+        path = e.path if e.path else (e.directory if hasattr(e, 'directory') else None)
+        if not path:
+            return
+        pdfs = scan_folder(path, recursive=True)
+        if not pdfs:
+            upload_progress.value = "所选文件夹中无 PDF 文件"
+            upload_progress.color = ft.Colors.ERROR
+            upload_progress.update()
+            return
+        _start_upload(pdfs)
+
+    upload_picker.on_result = _on_files_picked
+    folder_picker.on_result = _on_folder_picked
+
+    # upload 按钮 → PopupMenu 选择模式
+    upload_menu_btn = ft.PopupMenuButton(
+        icon=ft.Icons.UPLOAD_FILE,
+        tooltip="上传本地论文",
+        items=[
+            ft.PopupMenuItem(
+                content=ft.Text("选择单个文件"),
+                on_click=lambda e: upload_picker.pick_files(
+                    allowed_extensions=["pdf"], allow_multiple=False
+                ),
+            ),
+            ft.PopupMenuItem(
+                content=ft.Text("选择多个文件"),
+                on_click=lambda e: upload_picker.pick_files(
+                    allowed_extensions=["pdf"], allow_multiple=True
+                ),
+            ),
+            ft.PopupMenuItem(
+                content=ft.Text("选择文件夹"),
+                on_click=lambda e: folder_picker.get_directory_path(),
+            ),
+        ],
+    )
+
     def refresh_paper_list():
         """从数据库刷新当前课题的论文列表。"""
         paper_table.rows.clear()
@@ -1120,10 +1305,15 @@ def build_results_page():
         if project_id is None:
             selected_project_title.value = "请选择一个课题"
             paper_count_text.value = ""
+            sort_btn.disabled = True
         else:
             proj = library.get_project(project_id)
             if proj:
                 selected_project_title.value = proj.name
+                sort_btn.disabled = not bool(proj.description)
+                sort_btn.tooltip = "CE 语义排序" if proj.description else "请先在课题描述中填写研究方向"
+            else:
+                sort_btn.disabled = True
         refresh_project_list()
         refresh_paper_list()
         selected_project_title.update()
@@ -1205,21 +1395,28 @@ def build_results_page():
         content=ft.Column([
             ft.Row([
                 selected_project_title,
-                ft.PopupMenuButton(
-                    icon=ft.Icons.DOWNLOAD,
-                    tooltip="导出",
-                    items=[
-                        ft.PopupMenuItem(content=ft.Text("BibTeX"), on_click=on_export_bibtex),
-                        ft.PopupMenuItem(content=ft.Text("CSV"), on_click=on_export_csv),
-                    ],
-                ),
+                ft.Row([
+                    upload_menu_btn,
+                    sort_btn,
+                    ft.PopupMenuButton(
+                        icon=ft.Icons.DOWNLOAD,
+                        tooltip="导出",
+                        items=[
+                            ft.PopupMenuItem(content=ft.Text("BibTeX"), on_click=on_export_bibtex),
+                            ft.PopupMenuItem(content=ft.Text("CSV"), on_click=on_export_csv),
+                        ],
+                    ),
+                ], spacing=2),
             ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
             paper_count_text,
+            upload_progress,
             ft.Row([
                 ft.Text("筛选:", size=13),
                 status_filter_dd,
             ], spacing=4),
             ft.Divider(height=8),
+            upload_picker,
+            folder_picker,
             empty_hint,
             ft.Column([paper_table], expand=True, scroll=ft.ScrollMode.AUTO),
         ], spacing=6, expand=True),

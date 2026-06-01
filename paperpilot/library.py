@@ -116,6 +116,7 @@ def _find_or_create_paper(session: Session, paper_dict: dict) -> Paper:
         source=paper_dict.get("source", "unknown"),
         url=paper_dict.get("url"),
         doi=doi,
+        pdf_path=paper_dict.get("pdf_path"),
     )
     session.add(paper)
     session.flush()
@@ -227,6 +228,7 @@ def get_project_papers(
                 "source": paper.source,
                 "url": paper.url,
                 "doi": paper.doi,
+                "pdf_path": paper.pdf_path,
                 "total_score": pp.total_score,
                 "status": pp.status,
                 "ai_notes": pp.ai_notes,
@@ -262,6 +264,52 @@ def update_paper_status(project_paper_id: int, status: str) -> bool:
         return True
     finally:
         session.close()
+
+
+def update_paper_scores(project_id: int, scored: list[tuple[dict, float]]) -> int:
+    """用 rank_papers 结果批量更新 ProjectPaper 分数。
+
+    通过 DOI 或标题匹配论文，更新 total_score 和 score_similarity。
+
+    Args:
+        project_id: 课题 ID
+        scored: [(paper_dict, score), ...] — rank_papers 输出
+
+    Returns:
+        更新的 ProjectPaper 记录数
+    """
+    session = _get_session()
+    updated = 0
+    try:
+        for paper_dict, score in scored:
+            doi = paper_dict.get("doi")
+            title = (paper_dict.get("title") or "").strip()
+
+            if not doi and not title:
+                continue
+
+            # 匹配 ProjectPaper
+            q = (
+                session.query(ProjectPaper)
+                .join(Paper, ProjectPaper.paper_id == Paper.id)
+                .filter(ProjectPaper.project_id == project_id)
+            )
+            if doi:
+                q = q.filter(Paper.doi == doi)
+            elif title:
+                q = q.filter(Paper.title == title)
+
+            pp = q.first()
+            if pp:
+                pp.total_score = float(score)
+                pp.score_similarity = float(score)
+                updated += 1
+
+        session.commit()
+    finally:
+        session.close()
+
+    return updated
 
 
 # ── 用户笔记 ──

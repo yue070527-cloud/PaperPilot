@@ -40,6 +40,7 @@ class Paper(Base):
     url = Column(String(500), nullable=True, comment="论文链接")
     doi = Column(String(200), nullable=True, comment="DOI")
     embedding_id = Column(Integer, nullable=True, comment="FAISS索引中的位置，-1表示未向量化")
+    pdf_path = Column(String(500), nullable=True, comment="本地 PDF 文件路径")
     created_at = Column(DateTime, default=datetime.now)
 
     projects = relationship("ProjectPaper", back_populates="paper", cascade="all, delete-orphan")
