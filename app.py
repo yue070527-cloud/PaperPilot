@@ -1172,7 +1172,7 @@ def build_results_page():
 
         _page.run_task(_poll_upload)
 
-    def _on_files_picked(e: ft.FilePickerResultEvent):
+    def _on_files_picked(e):
         if not e.files:
             return
         paths = [f.path for f in e.files if f.path and f.path.lower().endswith(".pdf")]
@@ -1183,7 +1183,7 @@ def build_results_page():
             return
         _start_upload(paths)
 
-    def _on_folder_picked(e: ft.FilePickerResultEvent):
+    def _on_folder_picked(e):
         path = e.path if e.path else (e.directory if hasattr(e, 'directory') else None)
         if not path:
             return
