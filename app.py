@@ -66,8 +66,6 @@ class AppState:
 state = AppState()
 _page: ft.Page | None = None
 _refresh_library = None  # 文献页刷新函数引用，page_switcher 触发
-_upload_picker: ft.FilePicker | None = None
-_folder_picker: ft.FilePicker | None = None
 results_summary: ft.Text | None = None
 detail_sidebar: ft.Container | None = None  # 右侧文献详情侧边栏
 
@@ -1041,10 +1039,6 @@ def build_results_page():
     empty_hint = ft.Text("", size=13, italic=True, color=ft.Colors.OUTLINE)
 
     # ── 上传 & 排序 ──
-    global _upload_picker, _folder_picker
-    _upload_picker = ft.FilePicker()
-    _folder_picker = ft.FilePicker()
-
     upload_progress = ft.Text("", size=12, italic=True)
     sort_btn = ft.IconButton(
         icon=ft.Icons.SORT,
@@ -1175,31 +1169,43 @@ def build_results_page():
 
         _page.run_task(_poll_upload)
 
-    def _on_files_picked(e):
-        if not e.files:
-            return
-        paths = [f.path for f in e.files if f.path and f.path.lower().endswith(".pdf")]
-        if not paths:
-            upload_progress.value = "未选择 PDF 文件"
-            upload_progress.color = ft.Colors.ERROR
-            upload_progress.update()
-            return
-        _start_upload(paths)
+    # 文件选择 → tkinter 原生对话框（Flet 0.85 FilePicker 兼容性不足）
+    def _pick_single_file():
+        import tkinter.filedialog as fd
+        import tkinter as tk
+        root = tk.Tk(); root.withdraw()
+        path = fd.askopenfilename(
+            title="选择 PDF 文件", filetypes=[("PDF files", "*.pdf")]
+        )
+        root.destroy()
+        if path:
+            _start_upload([path])
 
-    def _on_folder_picked(e):
-        path = e.path if e.path else (e.directory if hasattr(e, 'directory') else None)
-        if not path:
-            return
-        pdfs = scan_folder(path, recursive=True)
-        if not pdfs:
-            upload_progress.value = "所选文件夹中无 PDF 文件"
-            upload_progress.color = ft.Colors.ERROR
-            upload_progress.update()
-            return
-        _start_upload(pdfs)
+    def _pick_multiple_files():
+        import tkinter.filedialog as fd
+        import tkinter as tk
+        root = tk.Tk(); root.withdraw()
+        paths = fd.askopenfilenames(
+            title="选择 PDF 文件", filetypes=[("PDF files", "*.pdf")]
+        )
+        root.destroy()
+        if paths:
+            _start_upload(list(paths))
 
-    _upload_picker.on_result = _on_files_picked
-    _folder_picker.on_result = _on_folder_picked
+    def _pick_folder():
+        import tkinter.filedialog as fd
+        import tkinter as tk
+        root = tk.Tk(); root.withdraw()
+        path = fd.askdirectory(title="选择包含 PDF 的文件夹")
+        root.destroy()
+        if path:
+            pdfs = scan_folder(path, recursive=True)
+            if pdfs:
+                _start_upload(pdfs)
+            else:
+                upload_progress.value = "所选文件夹中无 PDF 文件"
+                upload_progress.color = ft.Colors.ERROR
+                upload_progress.update()
 
     # upload 按钮 → PopupMenu 选择模式
     upload_menu_btn = ft.PopupMenuButton(
@@ -1208,19 +1214,15 @@ def build_results_page():
         items=[
             ft.PopupMenuItem(
                 content=ft.Text("选择单个文件"),
-                on_click=lambda e: _upload_picker.pick_files(
-                    allowed_extensions=["pdf"], allow_multiple=False
-                ),
+                on_click=lambda e: _pick_single_file(),
             ),
             ft.PopupMenuItem(
                 content=ft.Text("选择多个文件"),
-                on_click=lambda e: _upload_picker.pick_files(
-                    allowed_extensions=["pdf"], allow_multiple=True
-                ),
+                on_click=lambda e: _pick_multiple_files(),
             ),
             ft.PopupMenuItem(
                 content=ft.Text("选择文件夹"),
-                on_click=lambda e: _folder_picker.get_directory_path(),
+                on_click=lambda e: _pick_folder(),
             ),
         ],
     )
@@ -1708,13 +1710,6 @@ def main(page: ft.Page):
             expand=True,
         ),
     )
-
-    # FilePicker 必须在 page 构建完成后注册到 overlay
-    if _upload_picker:
-        page.overlay.append(_upload_picker)
-    if _folder_picker:
-        page.overlay.append(_folder_picker)
-
 
 if __name__ == "__main__":
     ft.run(main)
