@@ -1051,11 +1051,9 @@ def build_results_page():
         if _selected_project_id is None:
             return
         proj = library.get_project(_selected_project_id)
-        if not proj or not proj.description:
-            upload_progress.value = "请先在课题描述中填写研究方向后再排序"
-            upload_progress.color = ft.Colors.ERROR
-            upload_progress.update()
+        if not proj:
             return
+        query = (proj.description or "").strip() or proj.name
 
         papers = library.get_project_papers(_selected_project_id)
         if not papers:
@@ -1094,7 +1092,7 @@ def build_results_page():
         def _run_sort():
             try:
                 scored = rank_papers(
-                    query=proj.description,
+                    query=query,
                     papers=paper_dicts,
                     top_k=len(paper_dicts),
                     ce_candidates=len(paper_dicts),
@@ -1336,8 +1334,8 @@ def build_results_page():
             proj = library.get_project(project_id)
             if proj:
                 selected_project_title.value = proj.name
-                sort_btn.disabled = not bool(proj.description)
-                sort_btn.tooltip = "CE 语义排序" if proj.description else "请先在课题描述中填写研究方向"
+                sort_btn.disabled = False
+                sort_btn.tooltip = "CE 语义排序"
             else:
                 sort_btn.disabled = True
         refresh_project_list()
