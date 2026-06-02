@@ -3,12 +3,19 @@
 提供课题管理、论文收藏、阅读状态追踪功能，复用 models.py 现有五张表。
 """
 
+import sys
+from pathlib import Path
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 
 from paperpilot.models import Base, Project, Paper, ProjectPaper, Feedback
 
-_DB_PATH = "paperpilot.db"
+if getattr(sys, 'frozen', False):
+    _BASE_DIR = Path(sys.executable).parent
+else:
+    _BASE_DIR = Path(__file__).parent.parent
+_DB_PATH = str(_BASE_DIR / "paperpilot.db")
 _engine = None
 _SessionLocal = None
 
