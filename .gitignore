@@ -37,6 +37,7 @@ docs/
 # Local config
 .env
 .env.local
+config.yaml
 
 # OS
 .DS_Store
