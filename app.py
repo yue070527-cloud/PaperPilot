@@ -1038,6 +1038,124 @@ def build_results_page():
 
     empty_hint = ft.Text("", size=13, italic=True, color=ft.Colors.OUTLINE)
 
+    # ── 多选模式 ──
+    _multi_select = False
+    _selected_ids: set[int] = set()
+
+    multi_select_bar = ft.Row(visible=False, spacing=8)
+    multi_select_toggle = ft.TextButton(
+        content=ft.Text("多选", size=13),
+        icon=ft.Icons.CHECKLIST,
+    )
+    multi_select_count = ft.Text("", size=13)
+
+    def _ensure_multi_columns():
+        """根据多选模式切换 DataTable 列定义。"""
+        if _multi_select:
+            paper_table.columns = [
+                ft.DataColumn(ft.Text("☐")),
+                ft.DataColumn(ft.Text("#"), numeric=True),
+                ft.DataColumn(ft.Text("标题")),
+                ft.DataColumn(ft.Text("作者")),
+                ft.DataColumn(ft.Text("年份"), numeric=True),
+                ft.DataColumn(ft.Text("得分"), numeric=True),
+                ft.DataColumn(ft.Text("状态")),
+                ft.DataColumn(ft.Text("操作")),
+            ]
+        else:
+            paper_table.columns = [
+                ft.DataColumn(ft.Text("#"), numeric=True),
+                ft.DataColumn(ft.Text("标题")),
+                ft.DataColumn(ft.Text("作者")),
+                ft.DataColumn(ft.Text("年份"), numeric=True),
+                ft.DataColumn(ft.Text("得分"), numeric=True),
+                ft.DataColumn(ft.Text("状态")),
+                ft.DataColumn(ft.Text("操作")),
+            ]
+
+    def on_toggle_multi_select(e):
+        nonlocal _multi_select
+        _multi_select = not _multi_select
+        _selected_ids.clear()
+        if _multi_select:
+            multi_select_toggle.text = "退出多选"
+            multi_select_toggle.icon = ft.Icons.CLOSE
+        else:
+            multi_select_toggle.text = "多选"
+            multi_select_toggle.icon = ft.Icons.CHECKLIST
+        multi_select_bar.visible = _multi_select
+        _ensure_multi_columns()
+        refresh_paper_list()
+        multi_select_toggle.update()
+        multi_select_bar.update()
+        try:
+            paper_table.update()
+        except RuntimeError:
+            pass
+
+    def on_select_all(e):
+        if e.control.value:
+            _selected_ids.update(p["project_paper_id"] for p in _project_papers)
+        else:
+            _selected_ids.clear()
+        refresh_paper_list()
+
+    def on_check_one(e, pp_id: int):
+        if e.control.value:
+            _selected_ids.add(pp_id)
+        else:
+            _selected_ids.discard(pp_id)
+        update_count()
+
+    def update_count():
+        multi_select_count.value = f"已选 {len(_selected_ids)} 篇"
+        multi_select_count.update()
+
+    def on_batch_delete(e):
+        if not _selected_ids:
+            return
+
+        def do_delete(e):
+            n = library.remove_papers_from_project(list(_selected_ids))
+            _selected_ids.clear()
+            upload_progress.value = f"已删除 {n} 篇"
+            upload_progress.color = ft.Colors.GREEN
+            upload_progress.update()
+            refresh_paper_list()
+
+        def close_dlg(e):
+            dlg.open = False; dlg.update()
+
+        dlg = ft.AlertDialog(
+            title=ft.Text("确认删除"),
+            content=ft.Text(f"将删除选中的 {len(_selected_ids)} 篇论文，此操作不可撤销。"),
+            actions=[
+                ft.TextButton("取消", on_click=close_dlg),
+                ft.FilledButton("确认删除", on_click=do_delete),
+            ],
+        )
+        _page.overlay.append(dlg)
+        dlg.open = True
+        _page.update()
+
+    multi_select_toggle.on_click = on_toggle_multi_select
+
+    select_all_cb = ft.Checkbox(
+        label="全选",
+        on_change=on_select_all,
+        visible=False,
+    )
+    _select_all_ref = select_all_cb
+
+    multi_select_bar.controls = [
+        _select_all_ref,
+        multi_select_count,
+        ft.FilledTonalButton(
+            content=ft.Text("删除选中"), icon=ft.Icons.DELETE,
+            on_click=on_batch_delete,
+        ),
+    ]
+
     # ── 上传 & 排序 ──
     upload_progress = ft.Text("", size=12, italic=True)
     sort_btn = ft.IconButton(
@@ -1246,6 +1364,27 @@ def build_results_page():
         ],
     )
 
+    def _on_single_delete(e, pp_id):
+        """删除单篇论文的确认对话框。"""
+        def do_delete(e):
+            library.remove_paper_from_project(pp_id)
+            refresh_paper_list()
+
+        def close_dlg(e):
+            dlg.open = False; dlg.update()
+
+        dlg = ft.AlertDialog(
+            title=ft.Text("确认删除"),
+            content=ft.Text("将删除这篇论文，此操作不可撤销。"),
+            actions=[
+                ft.TextButton("取消", on_click=close_dlg),
+                ft.FilledButton("确认删除", on_click=do_delete),
+            ],
+        )
+        _page.overlay.append(dlg)
+        dlg.open = True
+        _page.update()
+
     def refresh_paper_list():
         """从数据库刷新当前课题的论文列表。"""
         paper_table.rows.clear()
@@ -1267,7 +1406,6 @@ def build_results_page():
         empty_hint.value = ""
 
         status_colors = {"unread": ft.Colors.OUTLINE, "skimmed": ft.Colors.AMBER, "deep_read": ft.Colors.GREEN}
-        status_labels = {"unread": "未读", "skimmed": "略读", "deep_read": "精读"}
 
         for i, p in enumerate(papers):
             title = (p.get("title") or "")[:60]
@@ -1275,16 +1413,15 @@ def build_results_page():
             year = str(p.get("year") or "—")
             score = p.get("total_score", 0)
             status = p.get("status", "unread")
+            pp_id = p["project_paper_id"]
 
             score_color = ft.Colors.GREEN if score >= 0.4 else ft.Colors.ORANGE if score >= 0.2 else ft.Colors.OUTLINE
             status_color = status_colors.get(status, ft.Colors.OUTLINE)
 
             # 阅读按钮
-            pp_id = p["project_paper_id"]
             read_btn = ft.IconButton(
                 icon=ft.Icons.OPEN_IN_BROWSER,
                 tooltip="打开全文",
-                data=p,
                 on_click=lambda e, paper=p: _on_read_paper(paper),
                 icon_size=18,
             )
@@ -1302,21 +1439,60 @@ def build_results_page():
                 width=90,
                 text_size=12,
             )
-            status_dd.data = pp_id
             status_dd.on_change = lambda e, ppid=pp_id: _on_status_change(ppid, e.control.value)
 
-            paper_table.rows.append(ft.DataRow(cells=[
-                ft.DataCell(ft.Text(str(i + 1))),
-                ft.DataCell(ft.Text(title)),
-                ft.DataCell(ft.Text(authors)),
-                ft.DataCell(ft.Text(year)),
-                ft.DataCell(ft.Text(f"{score:.3f}", color=score_color, weight=ft.FontWeight.BOLD)),
-                ft.DataCell(ft.Row([
-                    ft.Container(width=8, height=8, border_radius=4, bgcolor=status_color),
-                    status_dd,
-                ], spacing=4)),
-                ft.DataCell(read_btn),
-            ]))
+            # 操作列
+            delete_btn = ft.IconButton(
+                icon=ft.Icons.DELETE,
+                tooltip="删除",
+                icon_size=18,
+                on_click=lambda e, pid=pp_id: _on_single_delete(e, pid),
+            )
+            action_cell = ft.DataCell(ft.Row([read_btn, delete_btn], spacing=2))
+
+            if _multi_select:
+                # 多选模式：复选框列 + 操作列仅阅读
+                is_checked = pp_id in _selected_ids
+                cb = ft.Checkbox(
+                    value=is_checked,
+                    on_change=lambda e, pid=pp_id: on_check_one(e, pid),
+                )
+                paper_table.rows.append(ft.DataRow(cells=[
+                    ft.DataCell(cb),
+                    ft.DataCell(ft.Text(str(i + 1))),
+                    ft.DataCell(ft.Text(title)),
+                    ft.DataCell(ft.Text(authors)),
+                    ft.DataCell(ft.Text(year)),
+                    ft.DataCell(ft.Text(f"{score:.3f}", color=score_color, weight=ft.FontWeight.BOLD)),
+                    ft.DataCell(ft.Row([
+                        ft.Container(width=8, height=8, border_radius=4, bgcolor=status_color),
+                        status_dd,
+                    ], spacing=4)),
+                    ft.DataCell(read_btn),
+                ]))
+            else:
+                # 正常模式
+                paper_table.rows.append(ft.DataRow(cells=[
+                    ft.DataCell(ft.Text(str(i + 1))),
+                    ft.DataCell(ft.Text(title)),
+                    ft.DataCell(ft.Text(authors)),
+                    ft.DataCell(ft.Text(year)),
+                    ft.DataCell(ft.Text(f"{score:.3f}", color=score_color, weight=ft.FontWeight.BOLD)),
+                    ft.DataCell(ft.Row([
+                        ft.Container(width=8, height=8, border_radius=4, bgcolor=status_color),
+                        status_dd,
+                    ], spacing=4)),
+                    ft.DataCell(ft.Row([read_btn, delete_btn], spacing=2)),
+                ]))
+
+        # 更新全选复选框状态
+        if _multi_select:
+            select_all_cb.value = (len(_selected_ids) == len(papers) and len(papers) > 0)
+            select_all_cb.visible = True
+            update_count()
+        else:
+            select_all_cb.visible = False
+
         try:
             paper_table.update()
         except RuntimeError:
@@ -1420,6 +1596,7 @@ def build_results_page():
             ft.Row([
                 selected_project_title,
                 ft.Row([
+                    multi_select_toggle,
                     upload_menu_btn,
                     sort_btn,
                     ft.PopupMenuButton(
@@ -1434,6 +1611,7 @@ def build_results_page():
             ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
             paper_count_text,
             upload_progress,
+            multi_select_bar,
             ft.Row([
                 ft.Text("筛选:", size=13),
                 status_filter_dd,

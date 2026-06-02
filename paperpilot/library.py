@@ -319,6 +319,47 @@ def update_paper_scores(project_id: int, scored: list[tuple[dict, float]]) -> in
     return updated
 
 
+def remove_paper_from_project(project_paper_id: int) -> bool:
+    """从课题中删除单篇论文（仅删 ProjectPaper 关联，不删 Paper）。
+
+    Args:
+        project_paper_id: ProjectPaper 的 ID
+
+    Returns:
+        True 表示删除成功，False 表示记录不存在
+    """
+    session = _get_session()
+    try:
+        pp = session.query(ProjectPaper).filter(ProjectPaper.id == project_paper_id).first()
+        if not pp:
+            return False
+        # 清理关联的反馈记录
+        session.query(Feedback).filter(
+            Feedback.project_paper_id == project_paper_id
+        ).delete()
+        session.delete(pp)
+        session.commit()
+        return True
+    finally:
+        session.close()
+
+
+def remove_papers_from_project(project_paper_ids: list[int]) -> int:
+    """批量从课题中删除论文。
+
+    Args:
+        project_paper_ids: ProjectPaper ID 列表
+
+    Returns:
+        成功删除的条数
+    """
+    count = 0
+    for pp_id in project_paper_ids:
+        if remove_paper_from_project(pp_id):
+            count += 1
+    return count
+
+
 # ── 用户笔记 ──
 
 def update_user_notes(project_paper_id: int, notes: str) -> bool:
