@@ -5,13 +5,13 @@ embedding:
   local_model: paraphrase-multilingual-MiniLM-L12-v2
   cache_dir: ./cache/embedding
 data_sources:
-  arxiv: true
+  arxiv: false
   openalex: true
   local_pdf: true
 search:
   max_results: 100
-  top_k: 50
-  ce_candidates: 100
+  top_k: 20
+  ce_candidates: 20
 cache:
   dir: ./cache/api
   ttl_hours: 24

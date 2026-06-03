@@ -3,6 +3,7 @@ Phase 1: 课题输入 → 关键词提取 → 论文抓取 → 排序展示
 """
 
 import asyncio
+import threading
 
 import flet as ft
 
@@ -772,9 +773,13 @@ def show_paper_detail(paper: dict):
     url = paper.get("url")
     if url:
         links.append(ft.TextButton("打开原文", icon=ft.Icons.OPEN_IN_BROWSER,
-                                    on_click=lambda e, p=paper: open_full_reader(
-                                        p, theme_seed=THEMES[state.theme_name]["seed"],
-                                        dark_mode=state.dark_mode)))
+                                    on_click=lambda e, p=paper: threading.Thread(
+                                        target=open_full_reader,
+                                        args=(p,),
+                                        kwargs={"theme_seed": THEMES[state.theme_name]["seed"],
+                                                "dark_mode": state.dark_mode},
+                                        daemon=True,
+                                    ).start()))
     doi = paper.get("doi")
     if doi:
         import webbrowser
@@ -1130,9 +1135,14 @@ def build_results_page():
         paper_count_text.update()
 
     def _on_read_paper(paper: dict):
-        """打开 PDF 阅读器。"""
-        # 构建完整的 paper dict（library 返回的已包含基本字段）
-        open_full_reader(paper, theme_seed=THEMES[state.theme_name]["seed"], dark_mode=state.dark_mode)
+        """打开 PDF 阅读器（后台线程，避免 CDP 抓取阻塞 UI）。"""
+        t = threading.Thread(
+            target=open_full_reader,
+            args=(paper,),
+            kwargs={"theme_seed": THEMES[state.theme_name]["seed"], "dark_mode": state.dark_mode},
+            daemon=True,
+        )
+        t.start()
 
     def _on_status_change(pp_id: int, new_status: str):
         """更新论文状态并刷新列表。"""
