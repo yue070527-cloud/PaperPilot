@@ -32,8 +32,8 @@ def apply_theme(page: ft.Page, theme_name: str, dark_mode: bool):
     theme = THEMES.get(theme_name, THEMES[DEFAULT_THEME])
     seed = theme["seed"]
     bg = theme["dark_bg"] if dark_mode else theme["light_bg"]
-    page.theme = ft.Theme(color_scheme_seed=seed, scaffold_bgcolor=bg)
-    page.dark_theme = ft.Theme(color_scheme_seed=seed, scaffold_bgcolor=theme["dark_bg"])
+    page.theme = ft.Theme(color_scheme_seed=seed, scaffold_bgcolor=bg, font_family="Microsoft YaHei")
+    page.dark_theme = ft.Theme(color_scheme_seed=seed, scaffold_bgcolor=theme["dark_bg"], font_family="Microsoft YaHei")
     page.theme_mode = ft.ThemeMode.DARK if dark_mode else ft.ThemeMode.LIGHT
     page.update()
 
@@ -243,7 +243,7 @@ def build_left_nav(active_idx: int) -> ft.Column:
         )
 
     return ft.Column([
-        ft.Text("PaperPilot", size=18, weight=ft.FontWeight.BOLD),
+        ft.Text("PaperPilot", size=18),
         ft.Divider(height=20),
         *nav_buttons,
     ], spacing=4)
@@ -288,7 +288,7 @@ def build_project_page():
     def _make_draggable_chip(kw: str, zone: str, icon, color):
         """创建可拖拽的关键词 Chip。"""
         chip = ft.Chip(
-            label=ft.Text(kw, weight=ft.FontWeight.BOLD if zone == "primary" else None),
+            label=ft.Text(kw),
             leading=ft.Icon(icon, size=14, color=color) if icon else None,
             bgcolor=ft.Colors.PRIMARY_CONTAINER if zone == "primary" else None,
             on_delete=lambda e, k=kw: _on_delete_keyword(k),
@@ -374,7 +374,7 @@ def build_project_page():
                 ft.Text(label, size=13, weight=ft.FontWeight.W_500),
             ], spacing=4),
             drag_target,
-            ft.Text(hint, size=11, italic=True, color=ft.Colors.OUTLINE),
+            ft.Text(hint, size=11, color=ft.Colors.OUTLINE),
         ], spacing=4)
 
     def refresh_all_zones():
@@ -393,7 +393,7 @@ def build_project_page():
                 row.controls.append(_make_draggable_chip(kw, zone_name, icon, color))
             if not keywords:
                 row.controls.append(
-                    ft.Text(hint, size=12, italic=True, color=ft.Colors.OUTLINE)
+                    ft.Text(hint, size=12, color=ft.Colors.OUTLINE)
                 )
             try:
                 row.update()
@@ -405,10 +405,10 @@ def build_project_page():
         prefix_icon=ft.Icons.ADD, expand=True,
     )
     progress_bar = ft.ProgressBar(visible=False, expand=True)
-    status_text = ft.Text("", size=13, italic=True)
+    status_text = ft.Text("", size=13)
 
     # ── 文献详情侧边栏 ──
-    sb_title = ft.Text("", size=18, weight=ft.FontWeight.BOLD, selectable=True)
+    sb_title = ft.Text("", size=18, selectable=True)
     sb_meta = ft.Text("", size=13, selectable=True)
     sb_abstract = ft.Text("", size=13, selectable=True)
     sb_links = ft.Row([], spacing=8)
@@ -562,7 +562,7 @@ def build_project_page():
             on_change=on_mode_change,
         )
 
-        result_text = ft.Text("", size=13, italic=True)
+        result_text = ft.Text("", size=13)
 
         def do_save(e):
             nonlocal projects
@@ -629,7 +629,7 @@ def build_project_page():
 
     results_area = ft.Column([
         ft.Divider(height=16),
-        ft.Text("检索结果", size=22, weight=ft.FontWeight.BOLD),
+        ft.Text("检索结果", size=22, weight=ft.FontWeight.W_600),
         summary,
         ft.Row([
             search_multi_toggle,
@@ -787,8 +787,8 @@ def build_project_page():
 
     # ── 页面布局：左侧可滚动检索区 + 右侧固定详情侧边栏 ──
     scrollable_left = ft.Column([
-        ft.Text("PaperPilot", size=28, weight=ft.FontWeight.BOLD),
-        ft.Text("智能文献检索与筛选", size=14, italic=True),
+        ft.Text("PaperPilot", size=28, weight=ft.FontWeight.W_600),
+        ft.Text("智能文献检索与筛选", size=14),
         ft.Divider(height=20),
         ft.Text("检索信息", size=16, weight=ft.FontWeight.W_500),
         topic_name_field,
@@ -977,7 +977,7 @@ def refresh_results_table():
             else ft.Colors.ORANGE if score >= 0.2
             else ft.Colors.OUTLINE
         )
-        score_widget = ft.Text(f"{score:.3f}", color=color, weight=ft.FontWeight.BOLD)
+        score_widget = ft.Text(f"{score:.3f}", color=color)
 
         base_cells = [
             ft.DataCell(ft.Text(str(i + 1))),
@@ -1021,7 +1021,7 @@ def build_results_page():
     # ── 左侧：课题列表 ──
     project_list_col = ft.Column(spacing=4, expand=True, scroll=ft.ScrollMode.AUTO)
     selected_project_title = ft.Text("请选择一个课题", size=16, weight=ft.FontWeight.W_500)
-    paper_count_text = ft.Text("", size=13, italic=True)
+    paper_count_text = ft.Text("", size=13)
 
     def refresh_project_list():
         """从数据库刷新课题列表。"""
@@ -1029,7 +1029,7 @@ def build_results_page():
         project_list_col.controls.clear()
         if not projects:
             project_list_col.controls.append(
-                ft.Text("暂无课题，检索后保存即可创建", size=13, italic=True,
+                ft.Text("暂无课题，检索后保存即可创建", size=13,
                        color=ft.Colors.OUTLINE)
             )
         else:
@@ -1155,7 +1155,7 @@ def build_results_page():
         expand=True,
     )
 
-    empty_hint = ft.Text("", size=13, italic=True, color=ft.Colors.OUTLINE)
+    empty_hint = ft.Text("", size=13, color=ft.Colors.OUTLINE)
 
     # ── 多选模式 ──
     _multi_select = False
@@ -1276,7 +1276,7 @@ def build_results_page():
     ]
 
     # ── 上传 & 排序 ──
-    upload_progress = ft.Text("", size=12, italic=True)
+    upload_progress = ft.Text("", size=12)
     sort_btn = ft.IconButton(
         icon=ft.Icons.SORT,
         tooltip="CE 语义排序",
@@ -1582,7 +1582,7 @@ def build_results_page():
                     ft.DataCell(ft.Text(title)),
                     ft.DataCell(ft.Text(authors)),
                     ft.DataCell(ft.Text(year)),
-                    ft.DataCell(ft.Text(f"{score:.3f}", color=score_color, weight=ft.FontWeight.BOLD)),
+                    ft.DataCell(ft.Text(f"{score:.3f}", color=score_color)),
                     ft.DataCell(ft.Row([
                         ft.Container(width=8, height=8, border_radius=4, bgcolor=status_color),
                         status_dd,
@@ -1596,7 +1596,7 @@ def build_results_page():
                     ft.DataCell(ft.Text(title)),
                     ft.DataCell(ft.Text(authors)),
                     ft.DataCell(ft.Text(year)),
-                    ft.DataCell(ft.Text(f"{score:.3f}", color=score_color, weight=ft.FontWeight.BOLD)),
+                    ft.DataCell(ft.Text(f"{score:.3f}", color=score_color)),
                     ft.DataCell(ft.Row([
                         ft.Container(width=8, height=8, border_radius=4, bgcolor=status_color),
                         status_dd,
@@ -1795,7 +1795,7 @@ def _make_model_selector():
         expand=True,
     )
 
-    model_status = ft.Text("", size=12, italic=True)
+    model_status = ft.Text("", size=12)
 
     def on_change_model(e):
         _sc(updates={"deepseek": {"model": e.control.value}})
@@ -1825,7 +1825,7 @@ def build_settings_page():
             return key[:3] + "****" + key[-1:]
         return key[:3] + "****" + key[-4:]
 
-    key_status = ft.Text("", size=12, italic=True)
+    key_status = ft.Text("", size=12)
     if current_key:
         key_status.value = f"已配置: {mask_key(current_key)}"
         key_status.color = ft.Colors.GREEN
@@ -1842,7 +1842,7 @@ def build_settings_page():
         expand=True,
     )
 
-    save_status = ft.Text("", size=13, italic=True)
+    save_status = ft.Text("", size=13)
 
     def on_save_key(e):
         new_key = api_key_field.value.strip()
@@ -1913,10 +1913,10 @@ def build_settings_page():
     )
 
     return ft.Column([
-        ft.Text("设置", size=22, weight=ft.FontWeight.BOLD),
+        ft.Text("设置", size=22),
         ft.Divider(height=16),
         ft.Text("DeepSeek API", size=16, weight=ft.FontWeight.W_500),
-        ft.Text("用于关键词提取和中英翻译，密钥仅存储在本地 config.yaml", size=13, italic=True),
+        ft.Text("用于关键词提取和中英翻译，密钥仅存储在本地 config.yaml", size=13),
         key_status,
         ft.Row([
             api_key_field,
@@ -1927,25 +1927,25 @@ def build_settings_page():
         save_status,
         ft.Divider(height=12),
         ft.Text("模型", size=16, weight=ft.FontWeight.W_500),
-        ft.Text("选择 DeepSeek API 模型，7月后 V3 将下线", size=13, italic=True),
+        ft.Text("选择 DeepSeek API 模型，7月后 V3 将下线", size=13),
         _make_model_selector(),
         ft.Divider(height=16),
         ft.Text("数据源", size=16, weight=ft.FontWeight.W_500),
-        ft.Text("选择从哪些来源获取论文", size=13, italic=True),
+        ft.Text("选择从哪些来源获取论文", size=13),
         arxiv_switch,
         openalex_switch,
         ft.Divider(height=16),
         ft.Text("检索数量", size=16, weight=ft.FontWeight.W_500),
-        ft.Text("每个来源的最大检索结果数", size=13, italic=True),
+        ft.Text("每个来源的最大检索结果数", size=13),
         max_results_slider,
         ft.Container(height=8),
         ft.Text("结果显示与精排", size=16, weight=ft.FontWeight.W_500),
-        ft.Text("控制最终显示的论文数量和送入精排的候选数", size=13, italic=True),
+        ft.Text("控制最终显示的论文数量和送入精排的候选数", size=13),
         top_k_slider,
         ce_candidates_slider,
         ft.Divider(height=16),
         ft.Text("外观", size=16, weight=ft.FontWeight.W_500),
-        ft.Text("选择配色主题和夜间模式", size=13, italic=True),
+        ft.Text("选择配色主题和夜间模式", size=13),
         theme_selector,
         ft.Container(height=8),
         dark_switch,
