@@ -66,6 +66,10 @@ class AppState:
 state = AppState()
 _page: ft.Page | None = None
 _refresh_library = None  # 文献页刷新函数引用，page_switcher 触发
+_search_multi = False  # 检索结果多选模式
+_search_selected_ids = set()  # 检索结果多选已选索引
+_search_select_count_ref = None  # 多选计数 UI
+_search_check_handler = None  # _on_search_check_one 引用
 results_summary: ft.Text | None = None
 detail_sidebar: ft.Container | None = None  # 右侧文献详情侧边栏
 
@@ -450,6 +454,67 @@ def build_project_page():
     summary = ft.Text(_summary_text(), size=14)
     results_summary = summary
 
+    # ── 检索结果多选 ──
+    global _search_multi, _search_selected_ids
+    _search_multi = False
+    _search_selected_ids = set()
+
+    search_multi_toggle = ft.TextButton(
+        content=ft.Text("多选", size=13),
+        icon=ft.Icons.CHECKLIST,
+        visible=False,
+    )
+    search_select_count = ft.Text("", size=13)
+    search_select_all_cb = ft.Checkbox(label="全选", visible=False)
+
+    def _update_search_count():
+        global _search_select_count_ref
+        if _search_select_count_ref:
+            _search_select_count_ref.value = f"已选 {len(_search_selected_ids)} 篇"
+            _search_select_count_ref.update()
+
+    def _on_search_select_all(e):
+        if e.control.value:
+            _search_selected_ids.update(range(len(state.scores)))
+        else:
+            _search_selected_ids.clear()
+        refresh_results_table()
+
+    def _on_search_check_one(e, idx: int):
+        if e.control.value:
+            _search_selected_ids.add(idx)
+        else:
+            _search_selected_ids.discard(idx)
+        if _search_select_count_ref:
+            _search_select_count_ref.value = f"已选 {len(_search_selected_ids)} 篇"
+            _search_select_count_ref.update()
+
+    global _search_select_count_ref, _search_check_handler
+    _search_select_count_ref = search_select_count
+    _search_check_handler = _on_search_check_one
+
+    search_select_all_cb.on_change = _on_search_select_all
+
+    def _on_toggle_search_multi(e):
+        global _search_multi
+        _search_multi = not _search_multi
+        _search_selected_ids.clear()
+        if _search_multi:
+            search_multi_toggle.text = "退出多选"
+            search_multi_toggle.icon = ft.Icons.CLOSE
+            save_to_library_btn.text = "保存选中"
+        else:
+            search_multi_toggle.text = "多选"
+            search_multi_toggle.icon = ft.Icons.CHECKLIST
+            save_to_library_btn.text = "保存到文献库"
+        search_select_all_cb.visible = _search_multi
+        search_select_count.visible = _search_multi
+        refresh_results_table()
+        search_multi_toggle.update()
+        save_to_library_btn.update()
+
+    search_multi_toggle.on_click = _on_toggle_search_multi
+
     save_to_library_btn = ft.OutlinedButton(
         content=ft.Text("保存到文献库"),
         icon=ft.Icons.SAVE,
@@ -457,7 +522,10 @@ def build_project_page():
     )
 
     def on_save_to_library(e):
-        """弹出对话框，选择课题保存当前检索结果。"""
+        """弹出对话框，选择课题保存检索结果（多选模式下仅保存选中论文）。"""
+        if _search_multi and not _search_selected_ids:
+            return  # 不弹窗，静默忽略
+
         projects = library.get_all_projects()
         project_options = [ft.dropdown.Option(str(p.id), p.name) for p in projects]
         project_dd = ft.Dropdown(
@@ -519,7 +587,14 @@ def build_project_page():
                 result_text.update()
                 return
 
-            n = library.save_papers_to_project(pid, state.papers, state.scores)
+            # 多选模式下仅保存选中论文
+            if _search_multi:
+                sel_papers = [state.scores[i][0] for i in _search_selected_ids if i < len(state.scores)]
+                sel_scores = [(state.scores[i][0], state.scores[i][1]) for i in _search_selected_ids if i < len(state.scores)]
+                n = library.save_papers_to_project(pid, sel_papers, sel_scores)
+                _search_selected_ids.clear()
+            else:
+                n = library.save_papers_to_project(pid, state.papers, state.scores)
             result_text.value = f"已保存 {n} 篇论文到文献库"
             result_text.color = ft.Colors.GREEN
             result_text.update()
@@ -533,7 +608,7 @@ def build_project_page():
         dlg = ft.AlertDialog(
             title=ft.Text("保存到文献库"),
             content=ft.Column([
-                ft.Text(f"将 {len(state.scores)} 篇检索结果保存到："),
+                ft.Text(f"将 {len(_search_selected_ids) if _search_multi else len(state.scores)} 篇检索结果保存到："),
                 save_mode,
                 project_dd,
                 new_name_field,
@@ -556,7 +631,12 @@ def build_project_page():
         ft.Divider(height=16),
         ft.Text("检索结果", size=22, weight=ft.FontWeight.BOLD),
         summary,
-        ft.Row([save_to_library_btn], alignment=ft.MainAxisAlignment.END),
+        ft.Row([
+            search_multi_toggle,
+            search_select_all_cb,
+            search_select_count,
+            save_to_library_btn,
+        ], alignment=ft.MainAxisAlignment.END, spacing=8),
         ft.Divider(height=8),
         ft.Column([results_table], expand=True, scroll=ft.ScrollMode.AUTO),
     ], spacing=6, expand=True, visible=False)
@@ -684,6 +764,7 @@ def build_project_page():
                     summary.value = _summary_text()
                     results_area.visible = True
                     save_to_library_btn.visible = True
+                    search_multi_toggle.visible = True
                     results_area.update()
             finally:
                 state.is_searching = False
@@ -858,6 +939,32 @@ def _type_badge(paper: dict) -> ft.Container:
 def refresh_results_table():
     scored = state.scores
     results_table.rows.clear()
+
+    # 根据多选模式切换列
+    if _search_multi:
+        results_table.columns = [
+            ft.DataColumn(ft.Text("☐")),
+            ft.DataColumn(ft.Text("#"), numeric=True),
+            ft.DataColumn(ft.Text("标题"), on_sort=lambda e: sort_table("title")),
+            ft.DataColumn(ft.Text("作者"), on_sort=lambda e: sort_table("authors")),
+            ft.DataColumn(ft.Text("年份"), numeric=True, on_sort=lambda e: sort_table("year")),
+            ft.DataColumn(ft.Text("来源")),
+            ft.DataColumn(ft.Text("引用"), numeric=True, on_sort=lambda e: sort_table("citations")),
+            ft.DataColumn(ft.Text("得分"), numeric=True, on_sort=lambda e: sort_table("score")),
+            ft.DataColumn(ft.Text("类型")),
+        ]
+    else:
+        results_table.columns = [
+            ft.DataColumn(ft.Text("#"), numeric=True),
+            ft.DataColumn(ft.Text("标题"), on_sort=lambda e: sort_table("title")),
+            ft.DataColumn(ft.Text("作者"), on_sort=lambda e: sort_table("authors")),
+            ft.DataColumn(ft.Text("年份"), numeric=True, on_sort=lambda e: sort_table("year")),
+            ft.DataColumn(ft.Text("来源")),
+            ft.DataColumn(ft.Text("引用"), numeric=True, on_sort=lambda e: sort_table("citations")),
+            ft.DataColumn(ft.Text("得分"), numeric=True, on_sort=lambda e: sort_table("score")),
+            ft.DataColumn(ft.Text("类型")),
+        ]
+
     for i, (paper, score) in enumerate(scored):
         year_str = str(paper.get("year") or "—")
         cit = paper.get("cited_by_count")
@@ -872,23 +979,35 @@ def refresh_results_table():
         )
         score_widget = ft.Text(f"{score:.3f}", color=color, weight=ft.FontWeight.BOLD)
 
-        results_table.rows.append(
-            ft.DataRow(
-                cells=[
-                    ft.DataCell(ft.Text(str(i + 1))),
-                    ft.DataCell(ft.Container(
-                        ft.Text(paper.get("title", "")[:80]),
-                        on_click=lambda e, p=paper: show_paper_detail(p),
-                    )),
-                    ft.DataCell(ft.Text((paper.get("authors") or "")[:40])),
-                    ft.DataCell(ft.Text(year_str)),
-                    ft.DataCell(ft.Text(src)),
-                    ft.DataCell(ft.Text(cit_str)),
-                    ft.DataCell(score_widget),
-                    ft.DataCell(_type_badge(paper)),
-                ],
+        base_cells = [
+            ft.DataCell(ft.Text(str(i + 1))),
+            ft.DataCell(ft.Container(
+                ft.Text(paper.get("title", "")[:80]),
+                on_click=lambda e, p=paper: show_paper_detail(p),
+            )),
+            ft.DataCell(ft.Text((paper.get("authors") or "")[:40])),
+            ft.DataCell(ft.Text(year_str)),
+            ft.DataCell(ft.Text(src)),
+            ft.DataCell(ft.Text(cit_str)),
+            ft.DataCell(score_widget),
+            ft.DataCell(_type_badge(paper)),
+        ]
+
+        if _search_multi:
+            is_checked = i in _search_selected_ids
+            cb = ft.Checkbox(
+                value=is_checked,
+                on_change=lambda e, idx=i: _search_check_handler(e, idx),
             )
-        )
+            results_table.rows.append(ft.DataRow(cells=[ft.DataCell(cb)] + base_cells))
+        else:
+            results_table.rows.append(ft.DataRow(cells=base_cells))
+
+    # 更新全选复选框
+    if _search_multi and len(scored) > 0:
+        from paperpilot.fetcher import get_article_type_label  # keep existing import path
+        pass  # search_select_all_cb handled inside build_project_page
+
     results_table.update()
 
 
