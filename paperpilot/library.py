@@ -20,12 +20,38 @@ _engine = None
 _SessionLocal = None
 
 
+def _migrate_schema(engine):
+    """检测并添加缺失的列，向前兼容旧数据库。"""
+    import sqlite3
+    conn = sqlite3.connect(str(_DB_PATH))
+    try:
+        cursor = conn.cursor()
+
+        # 获取 papers 表已有列
+        existing = {r[1] for r in cursor.execute("PRAGMA table_info(papers)")}
+
+        # 需要在 base 模型中声明但可能缺失的列
+        needed = {
+            "pdf_path": "TEXT",
+        }
+
+        for col_name, col_type in needed.items():
+            if col_name not in existing:
+                cursor.execute(f"ALTER TABLE papers ADD COLUMN {col_name} {col_type}")
+                print(f"[Library] 数据库迁移: papers 表新增列 {col_name}")
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _get_session() -> Session:
     """获取数据库会话（单引擎，复用 session factory）。"""
     global _engine, _SessionLocal
     if _engine is None:
         _engine = create_engine(f"sqlite:///{_DB_PATH}", echo=False)
         Base.metadata.create_all(_engine)
+        _migrate_schema(_engine)
         _SessionLocal = sessionmaker(bind=_engine)
     return _SessionLocal()
 
