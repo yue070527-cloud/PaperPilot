@@ -585,8 +585,12 @@ class BrowserSession:
             except Exception:
                 pass
 
+            # 页面尚未完成初始加载（title 为空），继续等待
+            if title == "":
+                continue
+
             # CF 挑战进行中
-            cf_active = title in ("just a moment...", "请稍候…", "") or "challenge" in title
+            cf_active = title in ("just a moment...", "请稍候…") or "challenge" in title
 
             if cf_active:
                 # CF 持续超过 12 秒 → 临时拉窗口到屏幕内加速
