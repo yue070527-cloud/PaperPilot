@@ -158,12 +158,19 @@ def _run_pipeline(max_per: int, year_min: str, year_max: str,
 
     if use_openalex:
         state.status_text = "OpenAlex 抓取中..."
-        en_search_terms = [t for t in primary_kw_list + secondary_en + regular_en if t]
-        print(f"[PaperPilot] OpenAlex 查询: {' AND '.join(en_search_terms)}")
         try:
-            results = fetch_openalex(en_search_terms, max_results=max_per)
-            print(f"[PaperPilot] OpenAlex 返回: {len(results)} 篇")
-            papers += results
+            oa_papers = fetch_multi_primary(
+                primary_kw=primary_kw_list,
+                secondary_kw=secondary_en,
+                regular_kw=regular_en,
+                source="openalex",
+                max_results=max_per,
+                min_results=3,
+                year_min=year_min,
+                year_max=year_max,
+            )
+            print(f"[PaperPilot] OpenAlex 返回: {len(oa_papers)} 篇 ({len(primary_kw_list)}路主关键词)")
+            papers += oa_papers
         except Exception as e:
             print(f"[PaperPilot] OpenAlex 失败: {e}")
 
