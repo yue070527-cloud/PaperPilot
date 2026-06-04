@@ -458,12 +458,19 @@ class BrowserSession:
 
         self._profile.mkdir(parents=True, exist_ok=True)
 
-        # 清理标签页恢复文件
-        for f in ("Current Tabs", "Last Tabs"):
+        # 清理标签页恢复文件，防止 Edge 恢复上次访问的页面而非打开 about:blank
+        for f in ("Current Tabs", "Last Tabs", "Current Session", "Last Session"):
             fp = self._profile / "Default" / f
             try:
                 if fp.is_file():
                     fp.unlink()
+            except Exception:
+                pass
+        sessions_dir = self._profile / "Default" / "Sessions"
+        if sessions_dir.exists():
+            try:
+                import shutil
+                shutil.rmtree(sessions_dir, ignore_errors=True)
             except Exception:
                 pass
 
@@ -473,6 +480,9 @@ class BrowserSession:
             f"--user-data-dir={self._profile}",
             "--no-first-run",
             "--no-default-browser-check",
+            "--restore-last-session=false",
+            "--disable-session-crashed-bubble",
+            "--disable-features=RestoreSession",
             "--disable-blink-features=AutomationControlled",
             "--window-size=1024,768",
             "--window-position=-32000,-32000",
@@ -589,8 +599,10 @@ class BrowserSession:
             if title == "":
                 continue
 
-            # CF 挑战进行中
-            cf_active = title in ("just a moment...", "请稍候…") or "challenge" in title
+            # CF 挑战进行中（精确匹配，避免学术标题中 "challenges" 误触发）
+            cf_titles = ("just a moment...", "请稍候…", "checking your browser",
+                         "attention required", "ddos-guard", "one more step")
+            cf_active = title in cf_titles or "cloudflare" in title
 
             if cf_active:
                 # CF 持续超过 12 秒 → 临时拉窗口到屏幕内加速
