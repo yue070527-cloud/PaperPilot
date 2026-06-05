@@ -10,7 +10,7 @@ import flet as ft
 from paperpilot.keywords import extract_all_keywords, merge_keywords
 from paperpilot.mt_translator import translate_terms
 from paperpilot.fetcher import fetch_arxiv, fetch_openalex, fetch_with_cascade, fetch_multi_primary, deduplicate
-from paperpilot.indexer import rank_papers
+from paperpilot.indexer import rank_papers, unload_cross_encoder
 from paperpilot import library
 from paperpilot.local_import import scan_folder, extract_pdfs
 from paperpilot.pdf_viewer import open_full_reader, render_preview, is_full_reader_available
@@ -71,8 +71,10 @@ _search_multi = False  # 检索结果多选模式
 _search_selected_ids = set()  # 检索结果多选已选索引
 _search_select_count_ref = None  # 多选计数 UI
 _search_check_handler = None  # _on_search_check_one 引用
+_search_checkboxes: list = []  # 复选框控件引用，用于全选免重建
 results_summary: ft.Text | None = None
 detail_sidebar: ft.Container | None = None  # 右侧文献详情侧边栏
+_sidebar_busy = False  # 防竞态：侧边栏正在更新时拦截重复操作
 
 
 def _has_cjk(text: str) -> bool:
@@ -251,20 +253,26 @@ def build_left_nav(active_idx: int) -> ft.Column:
 
 
 # ── 页面切换 ──
+_last_page_idx = 0
+
 def page_switcher(idx: int):
-    """切换页面容器。"""
-    container_project.visible = idx == 0
-    container_results.visible = idx == 1
-    container_settings.visible = idx == 2
+    """切换页面容器（仅更新变化过的容器，避免多余渲染）。"""
+    global _last_page_idx
+    if idx == _last_page_idx:
+        return
+    prev, _last_page_idx = _last_page_idx, idx
+
+    containers = [container_project, container_results, container_settings]
+    containers[prev].visible = False
+    containers[idx].visible = True
 
     if idx == 1 and _refresh_library is not None:
         _refresh_library()
 
     nav_content_ref.content = build_left_nav(idx)
+    containers[prev].update()
+    containers[idx].update()
     nav_content_ref.update()
-    container_project.update()
-    container_results.update()
-    container_settings.update()
 
 
 # ── 课题页 ──
@@ -315,6 +323,8 @@ def build_project_page():
     def _make_on_accept(target_zone: str):
         """创建 DragTarget on_accept 回调。"""
         def on_accept(e: ft.DragTargetEvent):
+            if e.src is None:
+                return
             kw = e.src.data["kw"]
             from_zone = e.src.data["from"]
             if from_zone == target_zone:
@@ -341,6 +351,8 @@ def build_project_page():
                    zone_name: str, icon, color):
         """构建拖拽区：标题 + DragTarget。"""
         def on_will_accept(e: ft.DragTargetEvent):
+            if e.src is None:
+                return False
             if e.src.data and e.src.data.get("from") != zone_name:
                 zone_container.border = ft.Border(
                     _drop_border, _drop_border, _drop_border, _drop_border
@@ -415,8 +427,13 @@ def build_project_page():
     sb_links = ft.Row([], spacing=8)
 
     def on_close_sidebar(e):
+        global _sidebar_busy
+        if _sidebar_busy:
+            return
+        _sidebar_busy = True
         detail_sidebar.visible = False
         detail_sidebar.update()
+        _sidebar_busy = False
 
     sidebar = ft.Container(
         content=ft.Column([
@@ -475,11 +492,16 @@ def build_project_page():
             _search_select_count_ref.update()
 
     def _on_search_select_all(e):
-        if e.control.value:
+        checked = e.control.value
+        if checked:
             _search_selected_ids.update(range(len(state.scores)))
         else:
             _search_selected_ids.clear()
-        refresh_results_table()
+        # 直接翻转已有复选框，不重建整表
+        for cb in _search_checkboxes:
+            cb.value = checked
+            cb.update()
+        _update_search_count()
 
     def _on_search_check_one(e, idx: int):
         if e.control.value:
@@ -628,6 +650,10 @@ def build_project_page():
 
     save_to_library_btn.on_click = on_save_to_library
 
+    # ── 分割比例：表单区 vs 结果区 ──
+    _form_weight = 2
+    _results_weight = 3
+
     results_area = ft.Column([
         ft.Divider(height=16),
         ft.Text("检索结果", size=22, weight=ft.FontWeight.W_600),
@@ -639,8 +665,8 @@ def build_project_page():
             save_to_library_btn,
         ], alignment=ft.MainAxisAlignment.END, spacing=8),
         ft.Divider(height=8),
-        ft.Column([results_table], expand=True, scroll=ft.ScrollMode.AUTO),
-    ], spacing=6, expand=True, visible=False)
+        _search_list,
+    ], spacing=6, expand=_results_weight, visible=False)
 
     def on_extract(e):
         desc = topic_desc_field.value.strip()
@@ -752,26 +778,28 @@ def build_project_page():
                     state.status_text = "未找到相关论文"
                     state.papers = []
                     state.scores = []
-                    results_table.rows.clear()
-                    results_table.update()
-                    summary.value = _summary_text()
                     results_area.visible = True
-                    results_area.update()
+                    _search_list.controls.clear()
+                    _search_list.update()
+                    summary.value = _summary_text()
+                    summary.update()
                 else:
                     state.papers = _result["papers"]
                     state.scores = _result["scores"]
                     state.status_text = f"完成！共 {len(_result['scores'])} 篇"
-                    refresh_results_table()
-                    summary.value = _summary_text()
                     results_area.visible = True
                     save_to_library_btn.visible = True
                     search_multi_toggle.visible = True
-                    results_area.update()
+                    refresh_results_table()
+                    summary.value = _summary_text()
+                    summary.update()
+                unload_cross_encoder()
             finally:
                 state.is_searching = False
                 progress_bar.visible = False
                 search_btn.disabled = False
                 status_text.value = state.status_text
+                # 表单区控件只需一次批量更新
                 progress_bar.update()
                 search_btn.update()
                 status_text.update()
@@ -786,8 +814,9 @@ def build_project_page():
     # 初始化分区（恢复已有状态）
     refresh_all_zones()
 
-    # ── 页面布局：左侧可滚动检索区 + 右侧固定详情侧边栏 ──
-    scrollable_left = ft.Column([
+    # ── 页面布局：上方可滚动检索区 + 下方结果列表区 + 右侧详情侧边栏 ──
+    # 关键：_search_list 的 expand=True 必须落在非滚动父链中才能拿到有效高度
+    scrollable_form = ft.Column([
         ft.Text("PaperPilot", size=28, weight=ft.FontWeight.W_600),
         ft.Text("智能文献检索与筛选", size=14),
         ft.Divider(height=20),
@@ -813,12 +842,16 @@ def build_project_page():
         ft.Divider(height=12),
         ft.Row([search_btn, progress_bar], spacing=16),
         status_text,
-        ft.Divider(height=8),
+    ], spacing=8, scroll=ft.ScrollMode.AUTO, expand=_form_weight)
+
+    left_side = ft.Column([
+        scrollable_form,
+        ft.Divider(height=1, color=ft.Colors.OUTLINE_VARIANT),
         results_area,
-    ], spacing=8, scroll=ft.ScrollMode.AUTO, expand=True)
+    ], spacing=0, expand=True)
 
     return ft.Row([
-        scrollable_left,
+        left_side,
         ft.VerticalDivider(width=1),
         sidebar,
     ], spacing=0, expand=True)
@@ -827,9 +860,11 @@ def build_project_page():
 # ── 文献详情 ──
 def show_paper_detail(paper: dict):
     """在右侧侧边栏展示论文详情。"""
+    global _sidebar_busy
     sb = detail_sidebar
-    if sb is None:
+    if sb is None or _sidebar_busy:
         return
+    _sidebar_busy = True
     from paperpilot.fetcher import get_article_type_label
     sb._title.value = paper.get("title", "")
     source = {"arxiv": "arXiv", "openalex": "OpenAlex", "local_pdf": "本地"}.get(
@@ -854,7 +889,7 @@ def show_paper_detail(paper: dict):
     links = []
     read_btn = ft.TextButton("阅读原文", icon=ft.Icons.OPEN_IN_BROWSER)
     import_btn = ft.TextButton("导入PDF", icon=ft.Icons.UPLOAD,
-                               visible=False)
+                               visible=True)
     # 保存当前 paper 引用，供回调闭包使用
     _current_paper = paper.copy()
 
@@ -928,33 +963,38 @@ def show_paper_detail(paper: dict):
 
     read_btn.on_click = _on_read
 
-    def _on_import(e, p=_current_paper):
-        # PowerShell 文件选择器 → 导入 PDF
-        import subprocess, tempfile, os as _os
-        script = (
-            'Add-Type -AssemblyName System.Windows.Forms\n'
-            '$f=New-Object System.Windows.Forms.OpenFileDialog\n'
-            "$f.Filter='PDF Files (*.pdf)|*.pdf'\n"
-            "$f.Title='选择下载好的 PDF 文件'\n"
-            "if($f.ShowDialog() -eq 'OK'){Write-Output $f.FileName}\n"
-        )
-        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".ps1",
-                                          delete=False, encoding="utf-8")
-        tmp.write(script)
-        tmp.close()
-        try:
-            r = subprocess.run(
-                ["powershell", "-ExecutionPolicy", "Bypass", "-File", tmp.name],
-                capture_output=True, text=True, timeout=120,
-            )
-            selected = r.stdout.strip()
-        finally:
-            _os.unlink(tmp.name)
+    async def _on_import(e, p=_current_paper):
+        import_result = {"selected": None, "done": False}
 
+        def _bg_pick():
+            try:
+                import tkinter as _tk
+                from tkinter import filedialog as _fd
+                root = _tk.Tk()
+                root.withdraw()
+                root.attributes("-topmost", True)
+                selected = _fd.askopenfilename(
+                    title="选择下载好的 PDF 文件",
+                    filetypes=[("PDF Files", "*.pdf")],
+                )
+                root.destroy()
+                if selected:
+                    import_result["selected"] = selected
+            except Exception:
+                pass
+            import_result["done"] = True
+
+        import threading as _th
+        _th.Thread(target=_bg_pick, daemon=True).start()
+
+        import asyncio as _a
+        while not import_result["done"]:
+            await _a.sleep(0.3)
+
+        selected = import_result["selected"]
         if not selected:
             return
 
-        # 复制到缓存目录
         from pathlib import Path as _Path
         from paperpilot.downloader import DEFAULT_CACHE_DIR as _CACHE_DIR
         doi = p.get("doi", "")
@@ -971,23 +1011,19 @@ def show_paper_detail(paper: dict):
         import shutil
         shutil.copy2(selected, str(dest))
 
-        # 更新数据库中的 pdf_path
         from paperpilot import library as _lib
         doi_for_update = p.get("doi")
         if doi_for_update:
             _lib.set_paper_pdf_path(doi=doi_for_update, pdf_path=str(dest))
-            # 更新当前 paper dict
             p["pdf_path"] = str(dest)
 
-        # 打开阅读器
-        import_btn.visible = False
-        import_btn.update()
         theme = THEMES[state.theme_name]["seed"]
         dm = state.dark_mode
-        threading.Thread(target=open_full_reader, args=(p,),
-                         kwargs={"theme_seed": theme, "dark_mode": dm},
-                         daemon=True).start()
-        read_btn.update()
+        _th.Thread(
+            target=open_full_reader, args=(p,),
+            kwargs={"theme_seed": theme, "dark_mode": dm},
+            daemon=True,
+        ).start()
 
     import_btn.on_click = _on_import
 
@@ -1001,9 +1037,6 @@ def show_paper_detail(paper: dict):
                 _wb.open(doi_url)
             dlg.open = False
             dlg.update()
-            # 显示导入PDF按钮
-            import_btn.visible = True
-            import_btn.update()
 
         def _cancel(e):
             dlg.open = False
@@ -1013,10 +1046,8 @@ def show_paper_detail(paper: dict):
             title=ft.Text("无法自动获取全文"),
             content=ft.Text(
                 "该论文无法自动下载 PDF 或提取全文。\n\n"
-                "请先通过学校订阅手动下载 PDF：\n"
-                "1. 点击「去下载」在浏览器中打开\n"
-                "2. 下载 PDF 到本地\n"
-                "3. 回到此处点击「导入PDF」选择文件\n\n"
+                "请先点击「去下载」在浏览器中打开，\n"
+                "下载 PDF 后回到此处点击「导入PDF」选择文件。\n\n"
                 f"论文 DOI: {doi or '无'}"
             ),
             actions=[
@@ -1040,32 +1071,55 @@ def show_paper_detail(paper: dict):
     sb._links.controls = links
     sb.visible = True
     sb.update()
+    _sidebar_busy = False
 
 
 # ── 推荐页 ──
-results_table = ft.DataTable(
-    columns=[
-        ft.DataColumn(ft.Text("#"), numeric=True),
-        ft.DataColumn(ft.Text("标题"), on_sort=lambda e: sort_table("title")),
-        ft.DataColumn(ft.Text("作者"), on_sort=lambda e: sort_table("authors")),
-        ft.DataColumn(ft.Text("年份"), numeric=True, on_sort=lambda e: sort_table("year")),
-        ft.DataColumn(ft.Text("来源")),
-        ft.DataColumn(ft.Text("引用"), numeric=True, on_sort=lambda e: sort_table("citations")),
-        ft.DataColumn(ft.Text("得分"), numeric=True, on_sort=lambda e: sort_table("score")),
-        ft.DataColumn(ft.Text("类型")),
-    ],
-    rows=[],
-    sort_column_index=5,
-    sort_ascending=False,
-    border=_border(ft.Colors.OUTLINE_VARIANT),
-    expand=True,
-)
 _sort_ascending = False
 _sort_column = "score"
+_search_list = ft.ListView(expand=True, spacing=0)
 
+
+def _build_search_header():
+    """构建检索结果表头（支持点击排序）。"""
+    def _hdr(label, column, width=None, expand=None):
+        arrow = ""
+        if column and _sort_column == column:
+            arrow = " ▲" if not _sort_ascending else " ▼"
+        return ft.Container(
+            content=ft.TextButton(
+                content=ft.Text(f"{label}{arrow}", size=12,
+                                weight=ft.FontWeight.W_600),
+                on_click=lambda e, c=column: sort_table(c) if c else None,
+                style=ft.ButtonStyle(padding=ft.padding.Padding(left=4, top=4, right=4, bottom=4)),
+            ),
+            width=width, expand=expand,
+            padding=ft.padding.Padding(left=4, right=4),
+            bgcolor=ft.Colors.SURFACE_CONTAINER,
+            border=ft.border.Border(bottom=ft.BorderSide(1, ft.Colors.OUTLINE_VARIANT)),
+        )
+
+    cols = [_hdr("#", None, width=34),
+            _hdr("标题", "title", expand=4),
+            _hdr("作者", "authors", expand=2),
+            _hdr("年份", "year", width=52),
+            _hdr("来源", None, width=66),
+            _hdr("引用", "citations", width=50),
+            _hdr("得分", "score", width=62),
+            _hdr("类型", None, width=56)]
+    return ft.Row(cols, spacing=0)
+
+
+_last_sort_time = 0
 
 def sort_table(column: str):
-    global _sort_ascending, _sort_column
+    global _sort_ascending, _sort_column, _last_sort_time
+    import time
+    now = time.time()
+    if now - _last_sort_time < 0.25:  # 250ms 防抖
+        return
+    _last_sort_time = now
+
     if _sort_column == column:
         _sort_ascending = not _sort_ascending
     else:
@@ -1111,34 +1165,10 @@ def _type_badge(paper: dict) -> ft.Container:
 
 
 def refresh_results_table():
+    global _search_list, _search_checkboxes
     scored = state.scores
-    results_table.rows.clear()
-
-    # 根据多选模式切换列
-    if _search_multi:
-        results_table.columns = [
-            ft.DataColumn(ft.Text("☐")),
-            ft.DataColumn(ft.Text("#"), numeric=True),
-            ft.DataColumn(ft.Text("标题"), on_sort=lambda e: sort_table("title")),
-            ft.DataColumn(ft.Text("作者"), on_sort=lambda e: sort_table("authors")),
-            ft.DataColumn(ft.Text("年份"), numeric=True, on_sort=lambda e: sort_table("year")),
-            ft.DataColumn(ft.Text("来源")),
-            ft.DataColumn(ft.Text("引用"), numeric=True, on_sort=lambda e: sort_table("citations")),
-            ft.DataColumn(ft.Text("得分"), numeric=True, on_sort=lambda e: sort_table("score")),
-            ft.DataColumn(ft.Text("类型")),
-        ]
-    else:
-        results_table.columns = [
-            ft.DataColumn(ft.Text("#"), numeric=True),
-            ft.DataColumn(ft.Text("标题"), on_sort=lambda e: sort_table("title")),
-            ft.DataColumn(ft.Text("作者"), on_sort=lambda e: sort_table("authors")),
-            ft.DataColumn(ft.Text("年份"), numeric=True, on_sort=lambda e: sort_table("year")),
-            ft.DataColumn(ft.Text("来源")),
-            ft.DataColumn(ft.Text("引用"), numeric=True, on_sort=lambda e: sort_table("citations")),
-            ft.DataColumn(ft.Text("得分"), numeric=True, on_sort=lambda e: sort_table("score")),
-            ft.DataColumn(ft.Text("类型")),
-        ]
-
+    _search_checkboxes.clear()
+    rows = [_build_search_header()]
     for i, (paper, score) in enumerate(scored):
         year_str = str(paper.get("year") or "—")
         cit = paper.get("cited_by_count")
@@ -1146,25 +1176,43 @@ def refresh_results_table():
         source_label = {"arxiv": "arXiv", "openalex": "OpenAlex", "local_pdf": "本地"}
         src = source_label.get(paper.get("source", ""), paper.get("source", ""))
 
-        color = (
+        score_color = (
             ft.Colors.GREEN if score >= 0.4
             else ft.Colors.ORANGE if score >= 0.2
             else ft.Colors.OUTLINE
         )
-        score_widget = ft.Text(f"{score:.3f}", color=color)
 
-        base_cells = [
-            ft.DataCell(ft.Text(str(i + 1))),
-            ft.DataCell(ft.Container(
-                ft.Text(paper.get("title", "")[:80]),
-                on_click=lambda e, p=paper: show_paper_detail(p),
-            )),
-            ft.DataCell(ft.Text((paper.get("authors") or "")[:40])),
-            ft.DataCell(ft.Text(year_str)),
-            ft.DataCell(ft.Text(src)),
-            ft.DataCell(ft.Text(cit_str)),
-            ft.DataCell(score_widget),
-            ft.DataCell(_type_badge(paper)),
+        def _cell(content, width=None, expand=None):
+            return ft.Container(
+                content=ft.Text(content, size=12, max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
+                width=width, expand=expand,
+                padding=ft.padding.Padding(left=4, top=6, right=4, bottom=6),
+            )
+
+        def _badge_cell(paper):
+            badge = _type_badge(paper)
+            return ft.Container(
+                content=badge, width=56,
+                padding=ft.padding.Padding(left=4, top=2, right=4, bottom=2),
+            )
+
+        def _score_cell(value):
+            return ft.Container(
+                content=ft.Text(f"{value:.3f}", size=12, color=score_color,
+                                weight=ft.FontWeight.W_600),
+                width=62,
+                padding=ft.padding.Padding(left=4, top=6, right=4, bottom=6),
+            )
+
+        cells = [
+            _cell(str(i + 1), width=34),
+            _cell(paper.get("title", "")[:80], expand=4),
+            _cell((paper.get("authors") or "")[:40], expand=2),
+            _cell(year_str, width=52),
+            _cell(src, width=66),
+            _cell(cit_str, width=50),
+            _score_cell(score),
+            _badge_cell(paper),
         ]
 
         if _search_multi:
@@ -1172,17 +1220,22 @@ def refresh_results_table():
             cb = ft.Checkbox(
                 value=is_checked,
                 on_change=lambda e, idx=i: _search_check_handler(e, idx),
+                scale=0.85,
             )
-            results_table.rows.append(ft.DataRow(cells=[ft.DataCell(cb)] + base_cells))
-        else:
-            results_table.rows.append(ft.DataRow(cells=base_cells))
+            _search_checkboxes.append(cb)
+            cells.insert(0, ft.Container(content=cb, width=34,
+                         padding=ft.padding.Padding(left=4)))
 
-    # 更新全选复选框
-    if _search_multi and len(scored) > 0:
-        from paperpilot.fetcher import get_article_type_label  # keep existing import path
-        pass  # search_select_all_cb handled inside build_project_page
+        row = ft.Container(
+            content=ft.Row(cells, spacing=0),
+            on_click=lambda e, p=paper: show_paper_detail(p),
+            border=ft.border.Border(
+                bottom=ft.BorderSide(1, ft.Colors.OUTLINE_VARIANT)),
+        )
+        rows.append(row)
 
-    results_table.update()
+    _search_list.controls = rows
+    _search_list.update()
 
 
 def build_results_page():
@@ -1288,7 +1341,6 @@ def build_results_page():
             refresh_project_list()
             refresh_paper_list()
             selected_project_title.update()
-            paper_count_text.update()
             dlg.open = False
             dlg.update()
 
@@ -1314,20 +1366,7 @@ def build_results_page():
         width=120,
     )
 
-    paper_table = ft.DataTable(
-        columns=[
-            ft.DataColumn(ft.Text("#"), numeric=True),
-            ft.DataColumn(ft.Text("标题")),
-            ft.DataColumn(ft.Text("作者")),
-            ft.DataColumn(ft.Text("年份"), numeric=True),
-            ft.DataColumn(ft.Text("得分"), numeric=True),
-            ft.DataColumn(ft.Text("状态")),
-            ft.DataColumn(ft.Text("操作")),
-        ],
-        rows=[],
-        border=_border(ft.Colors.OUTLINE_VARIANT),
-        expand=True,
-    )
+    _library_list = ft.ListView(expand=True, spacing=0)
 
     empty_hint = ft.Text("", size=13, color=ft.Colors.OUTLINE)
 
@@ -1342,29 +1381,24 @@ def build_results_page():
     )
     multi_select_count = ft.Text("", size=13)
 
-    def _ensure_multi_columns():
-        """根据多选模式切换 DataTable 列定义。"""
-        if _multi_select:
-            paper_table.columns = [
-                ft.DataColumn(ft.Text("☐")),
-                ft.DataColumn(ft.Text("#"), numeric=True),
-                ft.DataColumn(ft.Text("标题")),
-                ft.DataColumn(ft.Text("作者")),
-                ft.DataColumn(ft.Text("年份"), numeric=True),
-                ft.DataColumn(ft.Text("得分"), numeric=True),
-                ft.DataColumn(ft.Text("状态")),
-                ft.DataColumn(ft.Text("操作")),
-            ]
-        else:
-            paper_table.columns = [
-                ft.DataColumn(ft.Text("#"), numeric=True),
-                ft.DataColumn(ft.Text("标题")),
-                ft.DataColumn(ft.Text("作者")),
-                ft.DataColumn(ft.Text("年份"), numeric=True),
-                ft.DataColumn(ft.Text("得分"), numeric=True),
-                ft.DataColumn(ft.Text("状态")),
-                ft.DataColumn(ft.Text("操作")),
-            ]
+    def _build_library_header():
+        """构建文献库列表表头。"""
+        def _hdr(label, width=None, expand=None):
+            return ft.Container(
+                content=ft.Text(label, size=12, weight=ft.FontWeight.W_600),
+                width=width, expand=expand,
+                padding=ft.padding.Padding(left=4, right=4),
+                bgcolor=ft.Colors.SURFACE_CONTAINER,
+                border=ft.border.Border(bottom=ft.BorderSide(1, ft.Colors.OUTLINE_VARIANT)),
+            )
+        cols = [_hdr("#", width=34),
+                _hdr("标题", expand=3),
+                _hdr("作者", expand=2),
+                _hdr("年份", width=48),
+                _hdr("得分", width=56),
+                _hdr("状态", width=100),
+                _hdr("操作", width=80)]
+        return ft.Row(cols, spacing=0)
 
     def on_toggle_multi_select(e):
         nonlocal _multi_select
@@ -1377,14 +1411,9 @@ def build_results_page():
             multi_select_toggle.text = "多选"
             multi_select_toggle.icon = ft.Icons.CHECKLIST
         multi_select_bar.visible = _multi_select
-        _ensure_multi_columns()
         refresh_paper_list()
         multi_select_toggle.update()
         multi_select_bar.update()
-        try:
-            paper_table.update()
-        except RuntimeError:
-            pass
 
     def on_select_all(e):
         if e.control.value:
@@ -1529,6 +1558,7 @@ def build_results_page():
                 upload_progress.color = ft.Colors.GREEN
             upload_progress.update()
             refresh_paper_list()
+            unload_cross_encoder()
 
         _page.run_task(_poll_sort)
 
@@ -1680,25 +1710,22 @@ def build_results_page():
 
     def refresh_paper_list():
         """从数据库刷新当前课题的论文列表。"""
-        paper_table.rows.clear()
         status_val = status_filter_dd.value
         sf = None if status_val == "all" else status_val
         papers = library.get_project_papers(_selected_project_id, status_filter=sf) if _selected_project_id else []
         _project_papers[:] = papers
 
         if not papers:
-            paper_table.rows.clear()
+            _library_list.controls = [_build_library_header()]
             empty_hint.value = "此课题暂无保存的论文，请在检索页保存结果到此课题"
             empty_hint.update()
-            try:
-                paper_table.update()
-            except RuntimeError:
-                pass
+            _library_list.update()
             return
 
         empty_hint.value = ""
 
         status_colors = {"unread": ft.Colors.OUTLINE, "skimmed": ft.Colors.AMBER, "deep_read": ft.Colors.GREEN}
+        rows = [_build_library_header()]
 
         for i, p in enumerate(papers):
             title = (p.get("title") or "")[:60]
@@ -1716,7 +1743,7 @@ def build_results_page():
                 icon=ft.Icons.OPEN_IN_BROWSER,
                 tooltip="打开全文",
                 on_click=lambda e, paper=p: _on_read_paper(paper),
-                icon_size=18,
+                icon_size=16,
             )
             if not is_full_reader_available():
                 read_btn.disabled = True
@@ -1729,54 +1756,74 @@ def build_results_page():
                     ft.dropdown.Option("deep_read", "精读"),
                 ],
                 value=status,
-                width=90,
-                text_size=12,
+                width=86,
+                text_size=11,
+                content_padding=ft.padding.Padding(left=4, right=4),
             )
             status_dd.on_change = lambda e, ppid=pp_id: _on_status_change(ppid, e.control.value)
 
-            # 操作列
+            # 删除按钮
             delete_btn = ft.IconButton(
                 icon=ft.Icons.DELETE,
                 tooltip="删除",
-                icon_size=18,
+                icon_size=16,
                 on_click=lambda e, pid=pp_id: _on_single_delete(e, pid),
             )
-            action_cell = ft.DataCell(ft.Row([read_btn, delete_btn], spacing=2))
+
+            def _cell(content, width=None, expand=None):
+                return ft.Container(
+                    content=content if isinstance(content, ft.Control)
+                           else ft.Text(content, size=12, max_lines=2,
+                                        overflow=ft.TextOverflow.ELLIPSIS),
+                    width=width, expand=expand,
+                    padding=ft.padding.Padding(left=4, top=6, right=4, bottom=6),
+                )
+
+            base_cells = [
+                _cell(str(i + 1), width=34),
+                _cell(ft.Text(title, size=12, max_lines=1,
+                      overflow=ft.TextOverflow.ELLIPSIS), expand=3),
+                _cell(ft.Text(authors, size=12, max_lines=1,
+                      overflow=ft.TextOverflow.ELLIPSIS), expand=2),
+                _cell(year, width=48),
+                ft.Container(
+                    content=ft.Text(f"{score:.3f}", size=12, color=score_color,
+                                    weight=ft.FontWeight.W_600),
+                    width=56,
+                    padding=ft.padding.Padding(left=4, top=6, right=4, bottom=6),
+                ),
+                ft.Container(
+                    content=ft.Row([
+                        ft.Container(width=8, height=8, border_radius=4,
+                                     bgcolor=status_color),
+                        status_dd,
+                    ], spacing=4),
+                    width=100,
+                    padding=ft.padding.Padding(left=4, top=2, right=4, bottom=2),
+                ),
+                ft.Container(
+                    content=ft.Row([read_btn, delete_btn], spacing=0),
+                    width=80,
+                    padding=ft.padding.Padding(top=2, bottom=2),
+                ),
+            ]
 
             if _multi_select:
-                # 多选模式：复选框列 + 操作列仅阅读
                 is_checked = pp_id in _selected_ids
                 cb = ft.Checkbox(
                     value=is_checked,
                     on_change=lambda e, pid=pp_id: on_check_one(e, pid),
+                    scale=0.85,
                 )
-                paper_table.rows.append(ft.DataRow(cells=[
-                    ft.DataCell(cb),
-                    ft.DataCell(ft.Text(str(i + 1))),
-                    ft.DataCell(ft.Text(title)),
-                    ft.DataCell(ft.Text(authors)),
-                    ft.DataCell(ft.Text(year)),
-                    ft.DataCell(ft.Text(f"{score:.3f}", color=score_color)),
-                    ft.DataCell(ft.Row([
-                        ft.Container(width=8, height=8, border_radius=4, bgcolor=status_color),
-                        status_dd,
-                    ], spacing=4)),
-                    ft.DataCell(read_btn),
-                ]))
-            else:
-                # 正常模式
-                paper_table.rows.append(ft.DataRow(cells=[
-                    ft.DataCell(ft.Text(str(i + 1))),
-                    ft.DataCell(ft.Text(title)),
-                    ft.DataCell(ft.Text(authors)),
-                    ft.DataCell(ft.Text(year)),
-                    ft.DataCell(ft.Text(f"{score:.3f}", color=score_color)),
-                    ft.DataCell(ft.Row([
-                        ft.Container(width=8, height=8, border_radius=4, bgcolor=status_color),
-                        status_dd,
-                    ], spacing=4)),
-                    ft.DataCell(ft.Row([read_btn, delete_btn], spacing=2)),
-                ]))
+                base_cells.insert(0, ft.Container(content=cb, width=34,
+                                   padding=ft.padding.Padding(left=4)))
+
+            row = ft.Container(
+                content=ft.Row(base_cells, spacing=0),
+                border=ft.border.Border(
+                    bottom=ft.BorderSide(1, ft.Colors.OUTLINE_VARIANT)),
+            )
+            rows.append(row)
 
         # 更新全选复选框状态
         if _multi_select:
@@ -1786,10 +1833,9 @@ def build_results_page():
         else:
             select_all_cb.visible = False
 
-        try:
-            paper_table.update()
-        except RuntimeError:
-            pass
+        paper_count_text.value = f"共 {len(papers)} 篇论文" if papers else ""
+        _library_list.controls = rows
+        _library_list.update()
 
     def on_select_project(project_id: int | None):
         """选中课题时刷新论文列表。"""
@@ -1807,10 +1853,8 @@ def build_results_page():
                 sort_btn.tooltip = "CE 语义排序"
             else:
                 sort_btn.disabled = True
-        refresh_project_list()
+        # 课题列表本身未变化，无需 refresh_project_list()
         refresh_paper_list()
-        selected_project_title.update()
-        paper_count_text.update()
 
     def _on_read_paper(paper: dict):
         """打开 PDF 阅读器（后台线程，避免 CDP 抓取阻塞 UI）。"""
@@ -1916,7 +1960,7 @@ def build_results_page():
             ], spacing=4),
             ft.Divider(height=8),
             empty_hint,
-            ft.Column([paper_table], expand=True, scroll=ft.ScrollMode.AUTO),
+            _library_list,
         ], spacing=6, expand=True),
         expand=True,
         padding=ft.padding.Padding(top=8, left=8, bottom=8, right=0),

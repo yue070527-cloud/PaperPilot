@@ -432,3 +432,18 @@ def rank_papers(
         final.append((paper, score))
     final.sort(key=lambda x: -x[1])
     return final[:top_k]
+
+
+def unload_cross_encoder():
+    """释放 cross-encoder 模型内存（~942MB）。
+
+    模型文件不会被删除，下次调用 rank_papers 时自动重新加载。
+    检索完成后调用此函数，可释放近 1GB 内存。
+    """
+    global _cross_encoder
+    if _cross_encoder is not None:
+        print("[CE] Unloading cross-encoder to free memory...", flush=True)
+        _cross_encoder = None
+        import gc
+        gc.collect()
+        print("[CE] Unloaded (~942MB freed).", flush=True)

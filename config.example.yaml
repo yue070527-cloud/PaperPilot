@@ -21,3 +21,4 @@ ui:
   title: PaperPilot
   theme: cyan
   dark_mode: true
+  pdf_render_scale: 2.5

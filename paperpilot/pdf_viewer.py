@@ -109,160 +109,222 @@ _PDFJS_HTML = """\
     --seed: __SEED__;
     --bg: __BG__;
     --text: __TEXT__;
-    --titlebar-bg: __TITLEBAR_BG__;
-    --titlebar-h: 38px;
+    --bar-bg: __TITLEBAR_BG__;
+    --bar-h: 40px;
     --btn-hover: __BTN_HOVER__;
 }
 * { margin:0; padding:0; box-sizing:border-box; }
 body {
     background: var(--bg); color: var(--text);
     font-family: "Segoe UI", system-ui, sans-serif;
-    overflow: hidden; user-select: none;
+    overflow: hidden;
 }
-/* 自定义标题栏 */
-.titlebar {
-    height: var(--titlebar-h); background: var(--titlebar-bg);
-    display: flex; align-items: center; padding: 0 6px;
-    -webkit-app-region: drag;
-}
-.pywebview-drag-region {
-    flex: 1; height: 100%; display: flex; align-items: center;
-    padding-left: 10px; font-size: 13px; font-weight: 500;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.win-btn {
-    width: 34px; height: 28px; border: none; background: transparent;
-    color: var(--text); cursor: pointer; border-radius: 4px;
-    font-size: 14px; display: flex; align-items: center; justify-content: center;
-    -webkit-app-region: no-drag;
-}
-.win-btn:hover { background: var(--btn-hover); }
-.win-btn.close:hover { background: #E81123; color: #fff; }
-/* 页码导航栏 */
-.controls {
-    height: 32px; background: var(--titlebar-bg);
-    display: flex; align-items: center; justify-content: center;
+/* 顶部导航栏 */
+.navbar {
+    height: var(--bar-h); background: var(--bar-bg);
+    display: flex; align-items: center; padding: 0 12px;
     gap: 10px; font-size: 13px;
 }
-.controls button {
+.navbar .title {
+    font-weight: 600; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; flex: 1;
+}
+.navbar button {
     background: var(--btn-hover); border: none; color: var(--text);
-    width: 28px; height: 24px; border-radius: 4px; cursor: pointer; font-size: 12px;
+    height: 26px; min-width: 28px; border-radius: 4px; cursor: pointer;
+    font-size: 13px; padding: 0 8px;
 }
-.controls button:hover { background: color-mix(in srgb, var(--seed) 40%, var(--btn-hover)); }
-/* PDF 画布 */
+.navbar button:hover { background: color-mix(in srgb, var(--seed) 40%, var(--btn-hover)); }
+.navbar button:disabled { opacity: 0.35; cursor: default; }
+.navbar button:disabled:hover { background: var(--btn-hover); }
+.navbar input {
+    width: 48px; text-align: center; background: var(--btn-hover); border: none;
+    color: var(--text); border-radius: 4px; padding: 3px 4px; font-size: 12px;
+}
+.navbar .sep { width: 1px; height: 18px; background: var(--btn-hover); }
+/* 滚动视口 */
 #viewer {
-    height: calc(100vh - var(--titlebar-h) - 32px);
+    height: calc(100vh - var(--bar-h));
     overflow-y: auto; display: flex; flex-direction: column;
-    align-items: center; padding: 12px;
+    align-items: center; padding: 16px; gap: 8px;
 }
-canvas {
-    margin: 4px 0;
-    box-shadow: 0 2px 12px rgba(0,0,0,0.25);
-    border-radius: 2px;
+/* 页面容器 */
+.page-container {
+    position: relative; box-shadow: 0 2px 16px rgba(0,0,0,0.3);
+    border-radius: 2px; line-height: 0; flex-shrink: 0;
 }
-/* loading / error */
+.page-container canvas { display: block; border-radius: 2px; }
+/* 文字层 — scale-factor 由 JS 动态设置，提升标题等大字的对齐精度 */
+.textLayer {
+    position: absolute; left: 0; top: 0; right: 0; bottom: 0;
+    overflow: hidden; line-height: 1.0;
+    user-select: text !important; cursor: text; z-index: 1;
+}
+.textLayer span {
+    color: transparent !important; position: absolute; white-space: pre;
+    cursor: text; transform-origin: 0% 0%;
+}
+.textLayer ::selection,
+.textLayer ::-moz-selection {
+    background: rgba(0, 150, 200, 0.35); color: transparent !important;
+}
+/* loading */
 #status {
     position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-    font-size: 15px; opacity: 0.8;
+    font-size: 15px; opacity: 0.7;
 }
 </style>
 </head>
 <body>
-<div class="titlebar">
-    <div class="pywebview-drag-region" id="title-text">__TITLE__</div>
-    <button class="win-btn" onclick="pywebview.window.minimize()" title="最小化">&#x2014;</button>
-    <button class="win-btn" onclick="pywebview.window.maximize()" title="最大化">&#x25A1;</button>
-    <button class="win-btn close" onclick="pywebview.window.close()" title="关闭">&#x2715;</button>
-</div>
-<div class="controls">
-    <button onclick="prevPage()" title="上一页">&#x25C0;</button>
-    <span id="page-info">-- / --</span>
-    <button onclick="nextPage()" title="下一页">&#x25B6;</button>
-    <input type="number" id="goto-input" min="1" max="1"
-           style="width:50px;text-align:center;background:var(--btn-hover);border:none;color:var(--text);border-radius:4px;padding:2px 4px;">
+<div class="navbar">
+    <span class="title" id="title-text">__TITLE__</span>
+    <span class="sep"></span>
+    <button onclick="scrollToPrevPage()" id="btn-prev" disabled>&#x25B2; 上一页</button>
+    <span id="page-info" style="min-width:60px;text-align:center;">-- / --</span>
+    <button onclick="scrollToNextPage()" id="btn-next" disabled>&#x25BC; 下一页</button>
+    <span class="sep"></span>
+    <input type="number" id="goto-input" min="1" max="1" value="1">
     <button onclick="gotoPage()">跳转</button>
 </div>
 <div id="viewer"></div>
 <div id="status">Loading PDF...</div>
 <script>
-pdfjsLib.GlobalWorkerOptions.workerSrc =
-    '__PDFJS_WORKER__';
+pdfjsLib.GlobalWorkerOptions.workerSrc = '__PDFJS_WORKER__';
 
 var __PDF_DATA__ = '__PDF_BASE64__';
 var __PDF_SRC__ = '__PDF_PATH__';
 
-var currentPage = 1;
 var totalPages = 1;
 var pdfDoc = null;
+var renderedPages = {};  // {pageNum: container element}
+var currentVisible = 1;
 
-function renderPage(num) {
-    pdfDoc.getPage(num).then(function(page) {
-        var scale = 1.5;
+// ── 渲染单页（含文字层）──
+function buildPage(num) {
+    if (renderedPages[num]) return Promise.resolve(renderedPages[num]);
+    return pdfDoc.getPage(num).then(function(page) {
+        var scale = __SCALE__;  // 渲染精度，由 config.yaml 控制
         var vp = page.getViewport({scale: scale});
+
         var canvas = document.createElement('canvas');
-        canvas.id = 'page-' + num;
         canvas.width = vp.width;
         canvas.height = vp.height;
         var ctx = canvas.getContext('2d');
-        page.render({canvasContext: ctx, viewport: vp}).promise.then(function() {
-            // Remove old canvas for this page
-            var old = document.getElementById('page-' + num);
-            if (old && old.parentNode) old.parentNode.removeChild(old);
-            var existing = document.getElementById('page-' + num);
-            if (!existing) {
-                document.getElementById('viewer').appendChild(canvas);
-            }
-            // Scroll to page
-            canvas.scrollIntoView({behavior: 'smooth', block: 'start'});
+
+        return page.render({canvasContext: ctx, viewport: vp}).promise.then(function() {
+            return page.getTextContent().then(function(textContent) {
+                var container = document.createElement('div');
+                container.className = 'page-container';
+                container.id = 'page-' + num;
+                container.style.width = vp.width + 'px';
+                container.style.height = vp.height + 'px';
+                container.dataset.page = num;
+                container.appendChild(canvas);
+
+                var textLayer = document.createElement('div');
+                textLayer.className = 'textLayer';
+                textLayer.style.setProperty('--scale-factor', vp.scale);
+                textLayer.style.width = vp.width + 'px';
+                textLayer.style.height = vp.height + 'px';
+                container.appendChild(textLayer);
+
+                pdfjsLib.renderTextLayer({
+                    textContentSource: textContent,
+                    container: textLayer,
+                    viewport: vp,
+                    textDivs: []
+                });
+
+                renderedPages[num] = container;
+                return container;
+            });
         });
     });
 }
 
+// ── 加载 PDF → 渲染全部页面（滚动模式）──
 function loadPdf(src) {
     pdfjsLib.getDocument(src).promise.then(function(pdf) {
         pdfDoc = pdf;
         totalPages = pdf.numPages;
-        document.getElementById('title-text').textContent += ' (' + totalPages + ' pp)';
+        document.getElementById('title-text').textContent += '  (' + totalPages + ' pp)';
         document.getElementById('goto-input').max = totalPages;
-        document.getElementById('page-info').textContent = '1 / ' + totalPages;
         document.getElementById('status').style.display = 'none';
-        renderPage(1);
 
-        // Lazy render all other pages
-        for (var i = 2; i <= totalPages; i++) {
-            renderPage(i);
-        }
+        // 渲染首页，让用户立刻看到内容
+        buildPage(1).then(function(container) {
+            document.getElementById('viewer').appendChild(container);
+            document.getElementById('page-info').textContent = '1 / ' + totalPages;
+            document.getElementById('btn-prev').disabled = true;
+            document.getElementById('btn-next').disabled = (totalPages <= 1);
+            // 继续渲染其余页面
+            for (var i = 2; i <= totalPages; i++) renderInOrder(i);
+        });
     }).catch(function(e) {
-        document.getElementById('status').textContent = 'Error: ' + e.message;
+        document.getElementById('status').textContent = 'PDF load error: ' + e.message;
     });
 }
 
-function prevPage() {
-    if (currentPage <= 1) return;
-    currentPage--;
-    scrollToPage(currentPage);
+// ── 按顺序渲染（保持页码顺序，避免异步打乱）──
+var renderQueue = Promise.resolve();
+function renderInOrder(num) {
+    renderQueue = renderQueue.then(function() {
+        return buildPage(num).then(function(container) {
+            document.getElementById('viewer').appendChild(container);
+        });
+    });
 }
-function nextPage() {
-    if (currentPage >= totalPages) return;
-    currentPage++;
-    scrollToPage(currentPage);
+
+// ── IntersectionObserver: 滚到哪页就更新页码 ──
+var observer = new IntersectionObserver(function(entries) {
+    var best = null;
+    entries.forEach(function(e) {
+        if (e.isIntersecting) {
+            var pn = parseInt(e.target.dataset.page);
+            // 取可见面积最大的页
+            if (!best || e.intersectionRatio > best.ratio) {
+                best = {page: pn, ratio: e.intersectionRatio};
+            }
+        }
+    });
+    if (best && best.page !== currentVisible) {
+        currentVisible = best.page;
+        document.getElementById('page-info').textContent = best.page + ' / ' + totalPages;
+        document.getElementById('goto-input').value = best.page;
+        document.getElementById('btn-prev').disabled = (best.page <= 1);
+        document.getElementById('btn-next').disabled = (best.page >= totalPages);
+    }
+}, {threshold: [0, 0.25, 0.5, 0.75, 1.0]});
+
+// 每页容器插入 DOM 后注册 observer
+var origAppend = document.getElementById('viewer').appendChild.bind(document.getElementById('viewer'));
+document.getElementById('viewer').appendChild = function(el) {
+    origAppend(el);
+    if (el.classList && el.classList.contains('page-container')) {
+        observer.observe(el);
+    }
+};
+
+// ── 导航 ──
+function scrollToPrevPage() {
+    if (currentVisible <= 1) return;
+    var el = document.getElementById('page-' + (currentVisible - 1));
+    if (el) el.scrollIntoView({behavior: 'smooth', block: 'start'});
+}
+function scrollToNextPage() {
+    if (currentVisible >= totalPages) return;
+    var el = document.getElementById('page-' + (currentVisible + 1));
+    if (el) el.scrollIntoView({behavior: 'smooth', block: 'start'});
 }
 function gotoPage() {
     var n = parseInt(document.getElementById('goto-input').value);
     if (n >= 1 && n <= totalPages) {
-        currentPage = n;
-        scrollToPage(n);
+        var el = document.getElementById('page-' + n);
+        if (el) el.scrollIntoView({behavior: 'smooth', block: 'start'});
     }
 }
-function scrollToPage(n) {
-    currentPage = n;
-    document.getElementById('page-info').textContent = n + ' / ' + totalPages;
-    document.getElementById('goto-input').value = n;
-    var canvas = document.getElementById('page-' + n);
-    if (canvas) {
-        canvas.scrollIntoView({behavior: 'smooth', block: 'start'});
-    }
-}
+
+// 键盘：上下箭头/PgUp/PgDn 滚动（利用 browser 原生行为），同时更新页码由 observer 自动完成
 
 // Start
 var pdfSrc;
@@ -296,109 +358,12 @@ h2 { font-weight:500; } p { opacity:0.7; margin-top:12px; }
 """
 
 
-_ARTICLE_VIEWER_HTML = """\
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>__TITLE__</title>
-<style>
-:root {
-    --seed: __SEED__;
-    --bg: __BG__;
-    --text: __TEXT__;
-    --titlebar-bg: __TITLEBAR_BG__;
-    --titlebar-h: 38px;
-    --btn-hover: __BTN_HOVER__;
-    --muted: __MUTED__;
-    --border: __BORDER__;
-}
-* { margin:0; padding:0; box-sizing:border-box; }
-body {
-    background: var(--bg); color: var(--text);
-    font-family: "Segoe UI", system-ui, sans-serif;
-    overflow: hidden; user-select: none;
-}
-/* 标题栏 — 与 PDF 阅读器完全一致 */
-.titlebar {
-    height: var(--titlebar-h); background: var(--titlebar-bg);
-    display: flex; align-items: center; padding: 0 6px;
-    -webkit-app-region: drag;
-}
-.pywebview-drag-region {
-    flex: 1; height: 100%; display: flex; align-items: center;
-    padding-left: 10px; font-size: 13px; font-weight: 500;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.win-btn {
-    width: 34px; height: 28px; border: none; background: transparent;
-    color: var(--text); cursor: pointer; border-radius: 4px;
-    font-size: 14px; display: flex; align-items: center; justify-content: center;
-    -webkit-app-region: no-drag;
-}
-.win-btn:hover { background: var(--btn-hover); }
-.win-btn.close:hover { background: #E81123; color: #fff; }
-/* 滚动内容区 */
-.scroll-container {
-    height: calc(100vh - var(--titlebar-h));
-    overflow-y: auto; overflow-x: hidden;
-}
-.article-body {
-    max-width: 860px; margin: 0 auto; padding: 32px 48px 64px;
-    font-family: Georgia, "Noto Serif SC", "Times New Roman", serif;
-    line-height: 1.85; font-size: 15px;
-}
-.article-body h2 {
-    font-size: 1.3em; font-weight: 600; margin: 32px 0 12px;
-    padding-bottom: 6px; border-bottom: 1px solid var(--border);
-}
-.article-body h3 { font-size: 1.1em; font-weight: 600; margin: 24px 0 8px; }
-.article-body h4 { font-size: 1em; font-weight: 600; margin: 20px 0 6px; }
-.article-body p { margin: 10px 0; text-align: justify; }
-.article-body a { color: var(--seed); text-decoration: none; }
-.article-body a:hover { text-decoration: underline; }
-.article-body img {
-    max-width: 100%; height: auto; display: block;
-    margin: 16px auto; border-radius: 4px;
-}
-.article-body figure { margin: 20px 0; text-align: center; }
-.article-body figcaption { font-size: 0.85em; color: var(--muted); margin-top: 6px; }
-.article-body table {
-    width: 100%; border-collapse: collapse; margin: 16px 0;
-    overflow-x: auto; display: block; font-size: 0.9em;
-}
-.article-body th, .article-body td {
-    border: 1px solid var(--border); padding: 6px 10px; text-align: left;
-}
-.article-body th { background: color-mix(in srgb, var(--seed) 15%, var(--bg)); font-weight: 600; }
-.article-body section { margin: 12px 0; }
-::-webkit-scrollbar { width: 6px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--seed) 30%, var(--bg)); border-radius: 3px; }
-</style>
-</head>
-<body>
-<div class="titlebar">
-    <div class="pywebview-drag-region">__TITLE__ <span style="font-weight:400;opacity:0.55;font-size:11px;">&nbsp;—&nbsp;HTML 全文</span></div>
-    <button class="win-btn" onclick="pywebview.window.minimize()" title="最小化">&#x2014;</button>
-    <button class="win-btn" onclick="pywebview.window.maximize()" title="最大化">&#x25A1;</button>
-    <button class="win-btn close" onclick="pywebview.window.close()" title="关闭">&#x2715;</button>
-</div>
-<div class="scroll-container">
-    <div class="article-body">
-        __ARTICLE_HTML__
-    </div>
-</div>
-</body>
-</html>
-"""
-
-
 def _build_reader_html(
     pdf_path: str | None,
     title: str,
     seed_color: str,
     dark_mode: bool,
+    scale: float = 2.5,
 ) -> str:
     """生成 PDF.js 阅读器的完整 HTML 页面。
 
@@ -407,6 +372,7 @@ def _build_reader_html(
         title: 论文标题
         seed_color: 主题种子色
         dark_mode: 是否夜间模式
+        scale: PDF 渲染精度 (2.5 / 3.0 / 4.0)
     """
     if dark_mode:
         bg = _blend_with(seed_color, 0.92, "#000000")
@@ -435,6 +401,7 @@ def _build_reader_html(
     html = html.replace("'__PDF_PATH__'", f"'file:///{abs_path}'" if abs_path else "''")
     html = html.replace("__PDFJS_SCRIPT__", pdfjs_script)
     html = html.replace("__PDFJS_WORKER__", pdfjs_worker)
+    html = html.replace("__SCALE__", str(scale))
 
     return html
 
@@ -534,6 +501,14 @@ def open_full_reader(
     if _webview is None:
         return False
 
+    # 从 config 读取 PDF 渲染精度
+    try:
+        from paperpilot.config import load_config
+        cfg = load_config()
+        scale = float(cfg.get("ui", {}).get("pdf_render_scale", 2.5))
+    except Exception:
+        scale = 2.5
+
     pdf_path = paper.get("pdf_path")
     url = paper.get("url")
     doi = paper.get("doi")
@@ -544,14 +519,14 @@ def open_full_reader(
 
     # 1. 本地 PDF 文件
     if pdf_path and os.path.isfile(pdf_path):
-        return _open_pdfjs_window(pdf_path, title, theme_seed, dark_mode, x, y)
+        return _open_pdfjs_window(pdf_path, title, theme_seed, dark_mode, x, y, scale)
 
     # 2. 直链下载（arXiv/Nature/Springer 等）
     if _download_pdf is not None:
         try:
             pdf_path = _download_pdf(paper)
             if pdf_path and os.path.isfile(pdf_path):
-                return _open_pdfjs_window(pdf_path, title, theme_seed, dark_mode, x, y)
+                return _open_pdfjs_window(pdf_path, title, theme_seed, dark_mode, x, y, scale)
         except Exception:
             pass
 
@@ -588,13 +563,14 @@ def _open_pdfjs_window(
     dark_mode: bool,
     x: int | None,
     y: int | None,
+    scale: float = 2.5,
 ) -> bool:
     """生成 PDF.js HTML 并在 pywebview 窗口中打开。"""
-    html = _build_reader_html(pdf_path, title, theme_seed, dark_mode)
+    html = _build_reader_html(pdf_path, title, theme_seed, dark_mode, scale)
     return _create_window({
         "title": title,
         "html": html,
-        "frameless": True,
+        "frameless": False,
         "width": 900,
         "height": 700,
         "x": x,
@@ -624,51 +600,51 @@ def _open_html_window(
     x: int | None,
     y: int | None,
 ) -> bool:
-    """在 pywebview 窗口中渲染 HTML 全文（匹配 PDF.js 阅读器风格）。"""
+    """加载缓存 HTML 文件，注入文字选择修复 + 去除外链，pywebview 渲染。"""
     try:
         raw = Path(html_path).read_text(encoding="utf-8")
     except Exception:
         return _open_error_window(title, theme_seed, dark_mode, x, y)
 
-    # 提取正文（跳过 <h1> 标题，标题栏已显示论文名）
-    body_match = re.search(r'<body>\s*<h1>[^<]*</h1>\s*(.*)</body>', raw, re.DOTALL)
-    if not body_match:
-        body_match = re.search(r'<body>(.*?)</body>', raw, re.DOTALL)
-    article_html = body_match.group(1).strip() if body_match else raw
+    # ── 1. 注入文字选择修复样式 ──
+    fix_css = """<style>
+    body, body * { user-select: text !important; -webkit-user-select: text !important; cursor: auto !important; }
+    a { cursor: pointer !important; }
+    ::selection, ::-moz-selection { background: rgba(0,150,200,0.35) !important; }
+</style>"""
+    raw = raw.replace("</head>", fix_css + "\n</head>")
 
-    # 颜色计算（与 _build_reader_html 一致）
-    if dark_mode:
-        bg = _blend_with(theme_seed, 0.92, "#000000")
-        text = "#e0e0e0"
-        titlebar_bg = _blend_with(theme_seed, 0.7, "#000000")
-        btn_hover = _blend_with(theme_seed, 0.4, "#000000")
-        muted = "#999"
-        border = "#333"
-    else:
-        bg = "#ffffff"
-        text = "#1a1a1a"
-        titlebar_bg = _blend_with(theme_seed, 0.3, "#ffffff")
-        btn_hover = _blend_with(theme_seed, 0.1, "#ffffff")
-        muted = "#666"
-        border = "#e0e0e0"
+    # ── 2. 去除正文链接，保留图片链接 ──
+    def _keep_image_hrefs(m: re.Match) -> str:
+        full = m.group(0)
+        href = m.group(1)
+        # 保留 .jpg/.png/.gif/.svg/.webp/.jpeg 链接 + 下载类链接
+        img_exts = (".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".bmp", ".tif", ".tiff")
+        href_lower = href.lower()
+        if any(href_lower.endswith(ext) for ext in img_exts):
+            return full
+        if "download" in href_lower or "/picture/" in href_lower or "/image/" in href_lower:
+            return full
+        # 其他链接：仅保留文字，移除 href
+        return full.replace(f'href="{href}"', "").replace(f"href='{href}'", "")
 
-    safe_title = title.replace("\\", "\\\\").replace("`", "\\`")
+    raw = re.sub(r'<a\s[^>]*href="([^"]*)"[^>]*>', _keep_image_hrefs, raw)
+    raw = re.sub(r"<a\s[^>]*href='([^']*)'[^>]*>", _keep_image_hrefs, raw)
 
-    html = _ARTICLE_VIEWER_HTML
-    html = html.replace("__TITLE__", safe_title)
-    html = html.replace("__SEED__", theme_seed)
-    html = html.replace("__BG__", bg)
-    html = html.replace("__TEXT__", text)
-    html = html.replace("__TITLEBAR_BG__", titlebar_bg)
-    html = html.replace("__BTN_HOVER__", btn_hover)
-    html = html.replace("__MUTED__", muted)
-    html = html.replace("__BORDER__", border)
-    html = html.replace("__ARTICLE_HTML__", article_html)
+    # ── 3. 写入临时文件，通过 url 加载（保持页面完整性）──
+    import tempfile
+    tmp_dir = Path.home() / ".paperpilot_pdf_cache"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".html", delete=False, encoding="utf-8", dir=str(tmp_dir)
+    ) as f:
+        f.write(raw)
+        tmp_path = f.name
 
     return _create_window({
         "title": title,
-        "html": html,
-        "frameless": True,
+        "url": f"file:///{tmp_path.replace(chr(92), '/')}",
+        "frameless": False,
         "width": 960,
         "height": 750,
         "x": x,
@@ -739,7 +715,7 @@ def _open_text_window(
     return _create_window({
         "title": title,
         "html": html,
-        "frameless": True,
+        "frameless": False,
         "width": 900,
         "height": 700,
         "x": x,
@@ -769,7 +745,7 @@ def _open_html_window(
     return _create_window({
         "title": title,
         "html": html,
-        "frameless": True,
+        "frameless": False,
         "width": 900,
         "height": 700,
         "x": x,
@@ -797,7 +773,7 @@ def _open_error_window(
     return _create_window({
         "title": title,
         "html": html,
-        "frameless": True,
+        "frameless": False,
         "width": 500,
         "height": 300,
         "x": x,

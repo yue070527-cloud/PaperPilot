@@ -33,6 +33,12 @@ test*.txt
 test*.json
 test*.py
 docs/
+app_copy.py
+DOWNLOADER_GUIDE.md
+
+# Downloads & scrapers
+downloads/
+paper-scraper-main/
 
 # Local config
 .env
