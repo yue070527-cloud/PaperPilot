@@ -273,6 +273,28 @@ def get_project_papers(
         session.close()
 
 
+def set_paper_pdf_path(doi: str, pdf_path: str) -> bool:
+    """根据 DOI 设置论文的本地 PDF 路径。
+
+    Args:
+        doi: 论文 DOI
+        pdf_path: PDF 文件绝对路径
+
+    Returns:
+        是否成功更新
+    """
+    session = _get_session()
+    try:
+        paper = session.query(Paper).filter(Paper.doi == doi).first()
+        if not paper:
+            return False
+        paper.pdf_path = pdf_path
+        session.commit()
+        return True
+    finally:
+        session.close()
+
+
 def update_paper_status(project_paper_id: int, status: str) -> bool:
     """更新论文阅读状态。
 

@@ -850,18 +850,187 @@ def show_paper_detail(paper: dict):
         meta_parts.append(f"引用次数: {cit}")
     sb._meta.value = "  |  ".join(meta_parts)
     sb._abstract.value = paper.get("abstract", "") or "（无摘要）"
-    # 可点击链接
+    # ── 可点击链接 ──
     links = []
-    url = paper.get("url")
-    if url:
-        links.append(ft.TextButton("打开原文", icon=ft.Icons.OPEN_IN_BROWSER,
-                                    on_click=lambda e, p=paper: threading.Thread(
-                                        target=open_full_reader,
-                                        args=(p,),
-                                        kwargs={"theme_seed": THEMES[state.theme_name]["seed"],
-                                                "dark_mode": state.dark_mode},
-                                        daemon=True,
-                                    ).start()))
+    read_btn = ft.TextButton("阅读原文", icon=ft.Icons.OPEN_IN_BROWSER)
+    import_btn = ft.TextButton("导入PDF", icon=ft.Icons.UPLOAD,
+                               visible=False)
+    # 保存当前 paper 引用，供回调闭包使用
+    _current_paper = paper.copy()
+
+    def _on_read(e, p=_current_paper):
+        read_btn.disabled = True
+        read_btn.text = "正在检查..."
+        read_btn.icon = ft.Icons.HOURGLASS_EMPTY
+        read_btn.update()
+
+        import_result = {"path": None}
+
+        def _bg_try():
+            """后台线程：依次尝试缓存 → 下载 → CDP → 返回结果。"""
+            try:
+                # 1. 检查 PDF 缓存
+                from pathlib import Path as _P
+                from paperpilot.downloader import cache_pdf, fetch_full_text
+                pdf_path = cache_pdf(p)
+                if pdf_path and _P(pdf_path).is_file():
+                    import_result["ok"] = True
+                    import_result["action"] = ("pdf", pdf_path)
+                    import_result["done"] = True
+                    return
+
+                # 2. 尝试 CDP 全文提取
+                html_path = fetch_full_text(p)
+                if html_path and _P(html_path).is_file():
+                    import_result["ok"] = True
+                    import_result["action"] = ("html", html_path)
+                    import_result["done"] = True
+                    return
+            except Exception:
+                pass
+
+            import_result["ok"] = False
+            import_result["done"] = True
+
+        import threading as _th
+        _th.Thread(target=_bg_try, daemon=True).start()
+
+        async def _poll_read():
+            import asyncio as _a
+            while not import_result.get("done"):
+                await _a.sleep(0.5)
+
+            read_btn.text = "阅读原文"
+            read_btn.icon = ft.Icons.OPEN_IN_BROWSER
+            read_btn.disabled = False
+            read_btn.update()
+
+            if import_result.get("ok"):
+                # 自动获取成功 → 打开阅读器
+                action = import_result.get("action")
+                if action:
+                    atype, apath = action
+                    if atype == "pdf":
+                        p["pdf_path"] = apath
+                    theme = THEMES[state.theme_name]["seed"]
+                    dm = state.dark_mode
+                    threading.Thread(
+                        target=open_full_reader, args=(p,),
+                        kwargs={"theme_seed": theme, "dark_mode": dm},
+                        daemon=True,
+                    ).start()
+                return
+
+            # 自动获取失败 → 弹出对话框
+            _show_manual_download_dialog(p)
+
+        _page.run_task(_poll_read)
+
+    read_btn.on_click = _on_read
+
+    def _on_import(e, p=_current_paper):
+        # PowerShell 文件选择器 → 导入 PDF
+        import subprocess, tempfile, os as _os
+        script = (
+            'Add-Type -AssemblyName System.Windows.Forms\n'
+            '$f=New-Object System.Windows.Forms.OpenFileDialog\n'
+            "$f.Filter='PDF Files (*.pdf)|*.pdf'\n"
+            "$f.Title='选择下载好的 PDF 文件'\n"
+            "if($f.ShowDialog() -eq 'OK'){Write-Output $f.FileName}\n"
+        )
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".ps1",
+                                          delete=False, encoding="utf-8")
+        tmp.write(script)
+        tmp.close()
+        try:
+            r = subprocess.run(
+                ["powershell", "-ExecutionPolicy", "Bypass", "-File", tmp.name],
+                capture_output=True, text=True, timeout=120,
+            )
+            selected = r.stdout.strip()
+        finally:
+            _os.unlink(tmp.name)
+
+        if not selected:
+            return
+
+        # 复制到缓存目录
+        from pathlib import Path as _Path
+        from paperpilot.downloader import DEFAULT_CACHE_DIR as _CACHE_DIR
+        doi = p.get("doi", "")
+        if doi:
+            safe = doi.replace("/", "_").replace("\\", "_")
+            dest = _Path(_CACHE_DIR) / f"{safe}.pdf"
+        else:
+            import hashlib
+            t = p.get("title", "") or selected
+            h = hashlib.sha256(t.encode()).hexdigest()[:16]
+            dest = _Path(_CACHE_DIR) / f"{h}.pdf"
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        import shutil
+        shutil.copy2(selected, str(dest))
+
+        # 更新数据库中的 pdf_path
+        from paperpilot import library as _lib
+        doi_for_update = p.get("doi")
+        if doi_for_update:
+            _lib.set_paper_pdf_path(doi=doi_for_update, pdf_path=str(dest))
+            # 更新当前 paper dict
+            p["pdf_path"] = str(dest)
+
+        # 打开阅读器
+        import_btn.visible = False
+        import_btn.update()
+        theme = THEMES[state.theme_name]["seed"]
+        dm = state.dark_mode
+        threading.Thread(target=open_full_reader, args=(p,),
+                         kwargs={"theme_seed": theme, "dark_mode": dm},
+                         daemon=True).start()
+        read_btn.update()
+
+    import_btn.on_click = _on_import
+
+    def _show_manual_download_dialog(p):
+        import webbrowser as _wb
+        doi = p.get("doi", "")
+        doi_url = f"https://doi.org/{doi}" if doi else p.get("url", "")
+
+        def _go_download(e):
+            if doi_url:
+                _wb.open(doi_url)
+            dlg.open = False
+            dlg.update()
+            # 显示导入PDF按钮
+            import_btn.visible = True
+            import_btn.update()
+
+        def _cancel(e):
+            dlg.open = False
+            dlg.update()
+
+        dlg = ft.AlertDialog(
+            title=ft.Text("无法自动获取全文"),
+            content=ft.Text(
+                "该论文无法自动下载 PDF 或提取全文。\n\n"
+                "请先通过学校订阅手动下载 PDF：\n"
+                "1. 点击「去下载」在浏览器中打开\n"
+                "2. 下载 PDF 到本地\n"
+                "3. 回到此处点击「导入PDF」选择文件\n\n"
+                f"论文 DOI: {doi or '无'}"
+            ),
+            actions=[
+                ft.TextButton("取消", on_click=_cancel),
+                ft.FilledButton("去下载", on_click=_go_download),
+            ],
+        )
+        _page.overlay.append(dlg)
+        dlg.open = True
+        _page.update()
+
+    links.append(read_btn)
+    links.append(import_btn)
+
     doi = paper.get("doi")
     if doi:
         import webbrowser
