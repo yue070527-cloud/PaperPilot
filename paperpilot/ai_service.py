@@ -15,6 +15,7 @@ import os
 import re
 import urllib.request
 import urllib.error
+import uuid
 from pathlib import Path
 
 from paperpilot.config import load_config
@@ -115,6 +116,8 @@ class AIService:
     def __init__(self, api_key: str | None = None, model: str | None = None):
         self._api_key = api_key
         self._model = model
+        self._conversations: dict[int, object] = {}  # project_id → ConversationManager
+        self._qa_sessions: dict[str, list[dict]] = {}  # session_id → messages
 
     @property
     def is_available(self) -> bool:
@@ -511,6 +514,334 @@ class AIService:
 
         results.sort(key=lambda x: x["ai_score"], reverse=True)
         return results
+
+    _CHAT_SYSTEM = (
+        "你是 PaperPilot 的 AI 研究助手，帮助用户理解和管理他们的学术文献库。\n\n"
+        "## 当前状态\n"
+        "你正在与用户讨论一个具体的科研课题。你的回答基于：\n"
+        "1. 文献库中已有的论文信息（标题、作者、摘要等）\n"
+        "2. 此前对话的压缩摘要（如果存在）\n"
+        "3. 用户当前问题中附带的论文详情\n\n"
+        "## 能力\n"
+        "- 回答关于特定论文的问题：方法、结论、创新点、局限性等\n"
+        "- 对比多篇论文：找出共同点、差异、各自优势\n"
+        "- 课题讨论：分析研究趋势、建议技术路线、识别研究空白\n"
+        "- 文献推荐：基于用户需求从文献库中推荐相关论文\n\n"
+        "## 风格\n"
+        "- 用中文回答，专业术语保留英文原名\n"
+        "- 引用论文时使用「标题（作者, 年份）」格式\n"
+        "- 如果问题超出文献库信息范围，诚实说明，可以基于常识补充建议\n"
+        "- 保持学术但友好的语气，像实验室讨论一样自然\n"
+        "- 回答简洁但有深度，避免冗长的背景铺垫"
+    )
+
+    _COMPRESS_SYSTEM = (
+        "你是一个对话摘要助手。请将以下论文课题讨论对话压缩为简短的摘要。\n\n"
+        "要求：\n"
+        "1. 保留用户关注的核心问题（具体论文、方法、结论等）\n"
+        "2. 保留 AI 给出的关键建议和结论\n"
+        "3. 丢弃寒暄和过程性讨论\n"
+        "4. 中文输出，不超过 500 字"
+    )
+
+    def chat(
+        self,
+        project_id: int,
+        project_name: str,
+        message: str,
+        topic_desc: str = "",
+        papers: list[dict] | None = None,
+        project_papers: list[dict] | None = None,
+    ) -> dict:
+        """课题对话：发送消息并获取 AI 回复（自动管理上下文）。
+
+        Args:
+            project_id: 课题数据库 ID
+            project_name: 课题名（用于持久化路径）
+            message: 用户消息文本
+            topic_desc: 课题描述（首次对话时初始化 system prompt）
+            papers: 用户显式选中的论文详情列表
+            project_papers: 课题下全部论文（用于自动检测 @引用 / 标题匹配）
+
+        Returns:
+            {"reply": str, "compressed": bool}
+        """
+        if not self.is_available:
+            return {"reply": "AI 服务未配置。请在 config.yaml 中设置 DeepSeek API Key。",
+                    "compressed": False}
+
+        from paperpilot.conversation import ConversationManager
+
+        # 懒加载 ConversationManager
+        if project_id not in self._conversations:
+            cm = ConversationManager(project_name, topic_desc)
+            self._conversations[project_id] = cm
+        else:
+            cm = self._conversations[project_id]
+            if topic_desc:
+                cm.update_topic_desc(topic_desc)
+
+        # 自动检测论文引用（@mention / 标题匹配）
+        auto_papers: list[dict] = []
+        if project_papers:
+            auto_papers = self._detect_paper_refs(message, project_papers)
+
+        # 合并显式选中 + 自动检测，去重
+        all_papers: list[dict] = list(papers or [])
+        for ap in auto_papers:
+            ap_title = (ap.get("title") or "").strip().lower()
+            if not any((p.get("title") or "").strip().lower() == ap_title
+                       for p in all_papers):
+                all_papers.append(ap)
+
+        # 添加用户消息
+        attached_refs = None
+        if all_papers:
+            attached_refs = []
+            for p in all_papers:
+                ref = p.get("doi") or p.get("title", "")[:60]
+                attached_refs.append(ref)
+        cm.add_user_message(message, attached_papers=attached_refs,
+                           paper_details=all_papers if all_papers else None)
+
+        # 压缩检查
+        was_compressed = False
+        if cm.needs_compression():
+            batch = cm.get_compress_batch()
+            if batch:
+                summary = self._compress_messages(batch)
+                if summary:
+                    cm.apply_compression(summary, batch)
+                    was_compressed = True
+
+        # 构建论文目录（用于 system prompt 注入）
+        paper_catalog = None
+        if all_papers:
+            paper_catalog = []
+            for p in all_papers:
+                title = (p.get("title") or "无标题")[:100]
+                authors = (p.get("authors") or "未知").split(",")[0].strip()
+                year = p.get("year", "")
+                paper_catalog.append(f"- {title} ({authors}, {year})")
+
+        # 构建 API 消息
+        sys_prompt = self._CHAT_SYSTEM
+        if topic_desc:
+            sys_prompt += f"\n\n当前课题：{project_name}\n课题描述：{topic_desc}"
+
+        messages = cm.build_api_messages(sys_prompt, paper_catalog)
+
+        # 调用 API
+        reply = self._call_api(messages, temperature=0.6, max_tokens=3000, timeout=120)
+
+        # 添加助手回复
+        if reply:
+            cm.add_assistant_message(reply)
+
+        return {"reply": reply, "compressed": was_compressed}
+
+    def _compress_messages(self, messages: list[dict]) -> str | None:
+        """调用 API 将一批消息压缩为摘要。"""
+        if not messages:
+            return None
+
+        # 格式化为可读文本
+        lines = []
+        for m in messages:
+            role = "用户" if m["role"] == "user" else "助手"
+            content = m.get("content", "")[:2000]
+            lines.append(f"[{role}]: {content}")
+
+        compress_prompt = "\n\n".join(lines)
+        api_messages = [
+            {"role": "system", "content": self._COMPRESS_SYSTEM},
+            {"role": "user", "content": f"请压缩以下对话：\n\n{compress_prompt}"},
+        ]
+
+        try:
+            summary = self._call_api(api_messages, temperature=0.2, max_tokens=800, timeout=60)
+            return summary.strip() if summary else None
+        except Exception:
+            logger.warning("压缩对话失败", exc_info=True)
+            return None
+
+    # ── 论文问答 ──
+
+    _QUESTION_TRIGGERS = {
+        '方法', '实验', '数据', '细节', '具体', '怎么', '如何实现',
+        '图', '表', '证据', '样本', '参数', '指标', '测量', '统计',
+        'protocol', 'procedure', '全文', '正文', '原文',
+        'method', 'experiment', 'data', 'detail', 'figure', 'table',
+        '怎么做', '用了什么', '如何', '怎样', '流程', '步骤',
+        '不足', '局限', '缺陷', '改进', 'limitation',
+        '结果', '发现', '结论', '证明', '验证',
+    }
+
+    def _detect_paper_refs(self, message: str,
+                           project_papers: list[dict]) -> list[dict]:
+        """从用户消息中检测论文引用。
+
+        两层检测：
+        1. @mention：@论文标题（或部分标题）
+        2. 标题子串：消息中包含标题 ≥12 字符的连续片段
+        """
+        matched: list[dict] = []
+        msg_lower = message.lower()
+
+        # 提取 @mention 文本
+        at_mentions = re.findall(r'@(.+?)(?:$|[\n@,\.。，!！?？])', message)
+        at_texts = [m.strip().lower() for m in at_mentions if len(m.strip()) >= 3]
+
+        for paper in project_papers:
+            title = (paper.get("title") or "").strip()
+            if len(title) < 8:
+                continue
+            title_lower = title.lower()
+
+            # ① 完整标题出现在消息中
+            if title_lower in msg_lower:
+                if paper not in matched:
+                    matched.append(paper)
+                continue
+
+            # ② @mention 匹配
+            for at_text in at_texts:
+                if len(at_text) >= 3 and (at_text in title_lower
+                                          or title_lower in at_text):
+                    if paper not in matched:
+                        matched.append(paper)
+                    break
+            else:
+                # ③ 子串匹配：标题 ≥15 字符时，检查 12 字符滑动窗口
+                if len(title) >= 15:
+                    for i in range(len(title_lower) - 11):
+                        chunk = title_lower[i:i + 12]
+                        # 跳过纯空白/标点片段
+                        if chunk in msg_lower and not chunk.isspace() and any(
+                            c.isalnum() for c in chunk
+                        ):
+                            if paper not in matched:
+                                matched.append(paper)
+                            break
+
+        return matched
+
+    def _needs_full_text(self, question: str) -> bool:
+        """判断问题是否需要全文（而非仅摘要）。"""
+        q = question.lower()
+        return any(t.lower() in q for t in self._QUESTION_TRIGGERS)
+
+    def ask_question(
+        self,
+        paper: dict,
+        question: str,
+        full_text: str | None = None,
+        session_id: str | None = None,
+    ) -> str:
+        """针对单篇论文的深度问答。
+
+        默认注入摘要；若问题涉及方法/数据/细节且全文可获取，则注入全文。
+
+        Args:
+            paper: paper dict（需含 title, abstract）
+            question: 用户问题
+            full_text: 论文全文（可选，为 None 时按需自动获取）
+            session_id: 多轮对话会话 ID（可选）
+
+        Returns:
+            AI 回答文本，失败返回空字符串
+        """
+        if not self.is_available:
+            return ""
+
+        title = (paper.get("title") or "").strip()
+        abstract = (paper.get("abstract") or "").strip()
+        if not title:
+            return ""
+
+        # 按需获取全文
+        if not full_text and self._needs_full_text(question):
+            full_text, _ = get_full_text_for_paper(paper)
+
+        # 构建论文内容
+        content = f"论文标题：《{title}》\n"
+        if abstract:
+            content += f"摘要：{abstract[:1000]}\n"
+        if full_text:
+            content += f"\n全文（{len(full_text)} 字符）：\n{full_text[:30000]}\n"
+
+        system = (
+            "你是一位资深学术审稿人。请基于提供的论文内容回答用户问题。\n\n"
+            "要求：\n"
+            "- 用中文回答，专业术语保留英文原名\n"
+            "- 引用论文中的具体内容支撑你的回答\n"
+            "- 论文未涉及的问题，诚实说明而非编造\n"
+            "- 回答简洁有深度，避免冗长的背景铺垫"
+        )
+
+        messages: list[dict] = [{"role": "system", "content": system}]
+
+        # 多轮对话：追加历史
+        if session_id and session_id in self._qa_sessions:
+            messages.extend(self._qa_sessions[session_id])
+
+        messages.append({
+            "role": "user",
+            "content": f"{content}\n\n用户问题：{question}",
+        })
+
+        reply = self._call_api(messages, temperature=0.5, max_tokens=2000,
+                               timeout=120)
+
+        # 保存多轮对话历史
+        if session_id and reply:
+            if session_id not in self._qa_sessions:
+                self._qa_sessions[session_id] = []
+            self._qa_sessions[session_id].append({
+                "role": "user", "content": question,
+            })
+            self._qa_sessions[session_id].append({
+                "role": "assistant", "content": reply,
+            })
+
+        return reply
+
+    def log_message(self, project_id: int, project_name: str,
+                    role: str, content: str, topic_desc: str = "") -> None:
+        """保存一条消息到课题对话记录（不调用 API）。
+
+        供 deep_read 等非 chat() 流程使用，确保所有 Agent 面板的
+        AI 交互都计入 conversation.json。
+        """
+        from paperpilot.conversation import ConversationManager
+
+        if project_id not in self._conversations:
+            cm = ConversationManager(project_name, topic_desc)
+            self._conversations[project_id] = cm
+        else:
+            cm = self._conversations[project_id]
+            if topic_desc:
+                cm.update_topic_desc(topic_desc)
+
+        if role in ("user", "system"):
+            cm.add_user_message(content)
+        else:
+            cm.add_assistant_message(content)
+
+    def get_conversation_info(self, project_id: int) -> dict | None:
+        """获取课题对话的摘要信息（不修改对话）。"""
+        cm = self._conversations.get(project_id)
+        if cm is None:
+            return None
+        return {
+            "total_rounds": cm.total_rounds,
+            "estimated_tokens": cm.estimated_tokens,
+            "is_empty": cm.is_empty,
+            "compressed_count": len(cm.compressed_summaries),
+            "display_messages": cm.display_messages,
+            "compressed_summaries": cm.compressed_summaries,
+            "has_more_history": cm.has_more_history,
+        }
 
 
 # ── 持久化 ──

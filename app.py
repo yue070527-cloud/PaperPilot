@@ -78,6 +78,9 @@ _search_selected_ids = set()  # 检索结果多选已选索引
 _agent_msg_list: ft.ListView | None = None
 _agent_input: ft.TextField | None = None
 _ai_service = AIService()  # DeepSeek API 封装实例
+_agent_project_id: int | None = None
+_agent_project_name: str = ""
+_agent_topic_desc: str = ""
 
 
 def _agent_theme_colors():
@@ -132,6 +135,60 @@ def send_agent_message(text: str, role: str = "user"):
         _agent_msg_list.update()
     except RuntimeError:
         pass  # 控件尚未挂载到页面，跳过更新
+
+
+def clear_agent_messages():
+    """清空 Agent 对话面板。"""
+    global _agent_msg_list
+    if _agent_msg_list is not None:
+        _agent_msg_list.controls.clear()
+        try:
+            _agent_msg_list.update()
+        except RuntimeError:
+            pass
+
+
+def load_agent_conversation():
+    """从磁盘加载当前课题的对话历史到面板。"""
+    global _agent_msg_list, _agent_project_id, _agent_project_name, _agent_topic_desc, _ai_service
+    if _agent_msg_list is None or _agent_project_id is None:
+        return
+
+    clear_agent_messages()
+
+    # 直接从磁盘读取，不依赖 AI service 缓存
+    from paperpilot.conversation import ConversationManager
+    cm = ConversationManager(_agent_project_name, _agent_topic_desc)
+
+    # 注入到 AI service 缓存，保证 chat() 能找到已有上下文
+    _ai_service._conversations[_agent_project_id] = cm
+
+    # 显示压缩摘要
+    for cs in cm.compressed_summaries:
+        text = f"📋 历史摘要：{cs.get('rounds_summary', '')}"
+        send_agent_message(text, role="agent")
+
+    # 显示最近的对话消息
+    for msg in cm.display_messages:
+        role = "user" if msg["role"] == "user" else "agent"
+        send_agent_message(msg["content"], role=role)
+
+
+def set_agent_project(project_id: int | None, project_name: str = "",
+                      topic_desc: str = ""):
+    """设置 Agent 当前关联的课题，自动加载历史对话。"""
+    global _agent_project_id, _agent_project_name, _agent_topic_desc
+    if _agent_project_id != project_id:
+        _agent_project_id = project_id
+        _agent_project_name = project_name
+        _agent_topic_desc = topic_desc
+        if project_id is not None:
+            load_agent_conversation()
+    else:
+        _agent_project_id = project_id
+        _agent_project_name = project_name
+        _agent_topic_desc = topic_desc
+
 _search_select_count_ref = None  # 多选计数 UI
 _search_check_handler = None  # _on_search_check_one 引用
 _search_checkboxes: list = []  # 复选框控件引用，用于全选免重建
@@ -1694,6 +1751,7 @@ def build_results_page():
                 repo_manager.move_project_to_recycle(proj.name)
             library.delete_project(pid)
             _selected_project_id = None
+            set_agent_project(None)
             selected_project_title.value = "请选择一个课题"
             paper_count_text.value = ""
             refresh_project_list()
@@ -2549,6 +2607,7 @@ def build_results_page():
             paper_count_text.value = ""
             sort_btn.disabled = True
             ai_sort_btn.disabled = True
+            set_agent_project(None)
         else:
             proj = library.get_project(project_id)
             if proj:
@@ -2556,6 +2615,7 @@ def build_results_page():
                 sort_btn.disabled = False
                 sort_btn.tooltip = "CE 语义排序"
                 ai_sort_btn.disabled = not _ai_service.is_available
+                set_agent_project(project_id, proj.name, proj.description or "")
             else:
                 sort_btn.disabled = True
                 ai_sort_btn.disabled = True
@@ -2658,7 +2718,14 @@ def build_results_page():
         title = (paper.get("title") or "论文")[:40]
         pp_id = paper.get("project_paper_id")
 
+        def _save_msg(role: str, text: str):
+            """将消息写入当前课题的对话记录。"""
+            if _agent_project_id is not None:
+                _ai_service.log_message(
+                    _agent_project_id, _agent_project_name, role, text, _agent_topic_desc)
+
         send_agent_message(f"正在精读：《{title}》...\n\n正在获取全文，请稍候 🔍", role="agent")
+        _save_msg("user", f"[精读请求] 请精读论文：《{title}》")
 
         _done = threading.Event()
         _result: dict = {}
@@ -2717,6 +2784,7 @@ def build_results_page():
 
             if _error:
                 send_agent_message(f"精读失败：{_error}", role="agent")
+                _save_msg("assistant", f"精读失败：{_error}")
                 return
 
             # 刷新文献列表，使状态变化（unread→skimmed）立即反映到 UI
@@ -2724,13 +2792,14 @@ def build_results_page():
 
             r = _result
             if r.get("_truncated"):
-                send_agent_message(
+                trunc_msg = (
                     f"无法精读：《{title}》\n\n"
                     f"该论文在 HTML 源中仅含摘要，正文无法获取。\n\n"
                     f"建议：下载 PDF 文件后导入到文献库，再重新精读。\n"
-                    f"操作：点击论文旁的 📥 按钮 → 选择 PDF 文件 → 导入成功后再点 📖",
-                    role="agent",
+                    f"操作：点击论文旁的 📥 按钮 → 选择 PDF 文件 → 导入成功后再点 📖"
                 )
+                send_agent_message(trunc_msg, role="agent")
+                _save_msg("assistant", trunc_msg)
                 return
 
             r = _result
@@ -2752,6 +2821,7 @@ def build_results_page():
                 f"（完整结果已保存到本地 outputs/deep_read/）"
             )
             send_agent_message(msg, role="agent")
+            _save_msg("assistant", msg)
 
         _page.run_task(_poll)
 
@@ -2768,38 +2838,120 @@ def build_results_page():
         refresh_paper_list()
         status_filter_row.update()
 
-    # ── 导出（B 负责 UI，A 负责数据转换） ──
+    # ── 导出 ──
+    def _get_export_papers() -> list[dict]:
+        """获取待导出的论文列表（多选模式取选中，否则取全部）。"""
+        if _multi_select and _selected_ids:
+            return [p for p in _project_papers if p["project_paper_id"] in _selected_ids]
+        return _project_papers
+
+    def _do_export(ext: str, label: str, convert):
+        papers = _get_export_papers()
+        if not papers:
+            return
+        content = convert(papers)
+
+        # 默认文件名
+        proj_name = ""
+        if _selected_project_id is not None:
+            proj = library.get_project(_selected_project_id)
+            if proj:
+                import re
+                proj_name = "_" + re.sub(r"[^\w\s\-]", "", proj.name)[:30]
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"PaperPilot{proj_name}_{ts}.{ext}"
+
+        result = {"path": None, "done": False}
+
+        def _bg_dialog():
+            try:
+                import tkinter as _tk
+                from tkinter import filedialog as _fd
+                root = _tk.Tk()
+                root.withdraw()
+                root.attributes("-topmost", True)
+                selected = _fd.asksaveasfilename(
+                    title=f"导出为 {label}",
+                    defaultextension=f".{ext}",
+                    initialfile=default_name,
+                    filetypes=[(f"{label} 文件", f"*.{ext}")],
+                )
+                root.destroy()
+                if selected:
+                    result["path"] = selected
+            except Exception:
+                pass
+            result["done"] = True
+
+        import threading as _th
+        _th.Thread(target=_bg_dialog, daemon=True).start()
+
+        async def _poll():
+            import asyncio
+            while not result["done"]:
+                await asyncio.sleep(0.2)
+
+            path = result["path"]
+            if path:
+                try:
+                    from paperpilot.export import save_file
+                    save_file(content, path)
+                    _show_export_done(label, path)
+                except OSError as ex:
+                    _show_export_error(str(ex))
+
+        _page.run_task(_poll)
+
     def on_export_bibtex(e):
         try:
             from paperpilot.export import to_bibtex
-            content = to_bibtex(_project_papers)
-            _save_export_file("bib", content)
         except ImportError:
             _show_export_unavailable()
+            return
+        _do_export("bib", "BibTeX", to_bibtex)
 
     def on_export_csv(e):
         try:
             from paperpilot.export import to_csv
-            content = to_csv(_project_papers)
-            _save_export_file("csv", content)
         except ImportError:
             _show_export_unavailable()
+            return
+        _do_export("csv", "CSV", to_csv)
 
-    def _save_export_file(ext: str, content: str):
-        import subprocess, tempfile
-        path = tempfile.mktemp(suffix=f".{ext}", prefix="paperpilot_export_")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-        try:
-            subprocess.Popen(["start", "", path], shell=True)
-        except Exception:
-            pass
+    def _show_export_done(fmt: str, path: str):
+        dlg = ft.AlertDialog(
+            title=ft.Text("导出完成"),
+            content=ft.Column([
+                ft.Text(f"已导出为 {fmt} 格式"),
+                ft.Text(path, size=11, color=ft.Colors.OUTLINE,
+                       font_family="Consolas"),
+            ], spacing=8, tight=True),
+            actions=[ft.TextButton("确定", on_click=lambda e: _close_dlg(dlg))],
+        )
+        _page.overlay.append(dlg)
+        dlg.open = True
+        _page.update()
+
+    def _show_export_error(msg: str):
+        dlg = ft.AlertDialog(
+            title=ft.Text("导出失败"),
+            content=ft.Text(msg, size=13),
+            actions=[ft.TextButton("确定", on_click=lambda e: _close_dlg(dlg))],
+        )
+        _page.overlay.append(dlg)
+        dlg.open = True
+        _page.update()
+
+    def _close_dlg(dlg):
+        dlg.open = False
+        dlg.update()
 
     def _show_export_unavailable():
         dlg = ft.AlertDialog(
             title=ft.Text("导出功能暂不可用"),
             content=ft.Text("导出模块尚未完成，请等待后续更新。"),
-            actions=[ft.TextButton("确定", on_click=lambda e: (setattr(dlg, 'open', False), dlg.update()))],
+            actions=[ft.TextButton("确定", on_click=lambda e: _close_dlg(dlg))],
         )
         _page.overlay.append(dlg)
         dlg.open = True
@@ -3168,8 +3320,37 @@ def main(page: ft.Page):
         send_agent_message(text, role="user")
         _agent_input.value = ""
         _agent_input.update()
-        # TODO: 后续接入 AI 服务，这里暂时 echo
-        send_agent_message("收到你的消息，AI 服务接入后会在这里回复你~", role="agent")
+
+        # 加载课题论文列表（供 chat() 自动检测 @引用 / 标题匹配）
+        _proj_papers = None
+        if _agent_project_id is not None:
+            try:
+                _proj_papers = library.get_project_papers(_agent_project_id)
+            except Exception:
+                pass
+
+        # 调用 AI 服务
+        import threading
+        def _bg_chat():
+            try:
+                result = _ai_service.chat(
+                    project_id=_agent_project_id or 0,
+                    project_name=_agent_project_name or "通用",
+                    message=text,
+                    topic_desc=_agent_topic_desc,
+                    project_papers=_proj_papers,
+                )
+                reply = result.get("reply", "抱歉，AI 服务暂时无法回复。")
+                send_agent_message(reply, role="agent")
+            except Exception as ex:
+                err_msg = f"出错了：{ex}"
+                send_agent_message(err_msg, role="agent")
+                if _agent_project_id is not None:
+                    _ai_service.log_message(
+                        _agent_project_id, _agent_project_name or "通用",
+                        "assistant", err_msg, _agent_topic_desc)
+
+        threading.Thread(target=_bg_chat, daemon=True).start()
 
     _agent_input.on_submit = _on_agent_send
 
