@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 # ── 常量 ────────────────────────────────────────────────────────
 
 _ARXIV_PDF = "https://arxiv.org/pdf/{}.pdf"
+_ARXIV_HTML = "https://arxiv.org/html/{}"
 _NATURE_PDF = "https://www.nature.com/articles/{}.pdf"
 _SPRINGER_PDF = "https://link.springer.com/content/pdf/{}.pdf"
 _ARXIV_ID_RE = re.compile(r"(\d{4}\.\d{4,5})(?:v\d+)?")
@@ -284,391 +285,86 @@ def _cleanup_cache(cache_dir: Path, max_mb: int = MAX_CACHE_MB) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 工具函数
-# ══════════════════════════════════════════════════════════════════
-
-def _is_port_open(port: int) -> bool:
-    import socket
-    try:
-        s = socket.create_connection(("127.0.0.1", port), timeout=1)
-        s.close()
-        return True
-    except Exception:
-        return False
-
-
-def _find_free_port(start: int = 9230, end: int = 9299) -> int:
-    for p in range(start, end):
-        if not _is_port_open(p):
-            return p
-    return start
-
-
-def _bring_window_to_front() -> None:
-    """跨平台: 将浏览器窗口提到前台 (加速 Cloudflare JS 挑战)。"""
-    import sys as _sys
-    if _sys.platform == "win32":
-        import ctypes
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-
-        def enum_callback(hwnd, _):
-            if not user32.IsWindowVisible(hwnd):
-                return True
-            buf = ctypes.create_unicode_buffer(260)
-            user32.GetWindowTextW(hwnd, buf, 260)
-            title = buf.value
-            if not title or len(title) < 3:
-                return True
-            pid = ctypes.c_ulong()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            h = kernel32.OpenProcess(0x0400 | 0x0010, False, pid)
-            if h:
-                nb = ctypes.create_unicode_buffer(260)
-                sz = ctypes.c_ulong(260)
-                if kernel32.QueryFullProcessImageNameW(h, 0, nb, ctypes.byref(sz)):
-                    name = nb.value.lower()
-                    if any(k in name for k in ("msedge", "chrome", "chromium")):
-                        kernel32.CloseHandle(h)
-                        user32.ShowWindow(hwnd, 9)
-                        user32.SetForegroundWindow(hwnd)
-                        return False
-                kernel32.CloseHandle(h)
-            return True
-
-        WEP = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
-        user32.EnumWindows(WEP(enum_callback), 0)
-
-
-def _find_chromium_browser() -> Path | None:
-    import os as _os
-    import sys as _sys
-
-    def _check(path: str) -> Path | None:
-        p = Path(_os.path.expandvars(path)) if "$" in path or "%" in path else Path(path)
-        return p if p.exists() else None
-
-    if _sys.platform == "win32":
-        candidates = [
-            "%ProgramFiles(x86)%\\Microsoft\\Edge\\Application\\msedge.exe",
-            "%ProgramFiles%\\Microsoft\\Edge\\Application\\msedge.exe",
-            "%ProgramFiles%\\Google\\Chrome\\Application\\chrome.exe",
-            "%ProgramFiles(x86)%\\Google\\Chrome\\Application\\chrome.exe",
-            "%LOCALAPPDATA%\\Microsoft\\Edge\\Application\\msedge.exe",
-            "%LOCALAPPDATA%\\Google\\Chrome\\Application\\chrome.exe",
-        ]
-    elif _sys.platform == "darwin":
-        candidates = [
-            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        ]
-    else:
-        candidates = [
-            "/usr/bin/microsoft-edge",
-            "/usr/bin/google-chrome",
-            "/usr/bin/chromium-browser",
-            "/usr/bin/chromium",
-        ]
-
-    for c in candidates:
-        result = _check(c)
-        if result:
-            return result
-    return None
-
-
-def _kill_profile_zombies(profile_dir: Path) -> int:
-    """杀掉占用指定 profile 目录的僵尸 Edge 进程，避免 profile 锁冲突。"""
-    import psutil
-    target = str(profile_dir.resolve())
-    killed = 0
-    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-        try:
-            info = proc.info
-            name = (info["name"] or "").lower()
-            cmd = " ".join(info["cmdline"] or [])
-            if name in ("msedge.exe", "msedge", "chrome.exe", "chrome") and target in cmd:
-                proc.kill()
-                killed += 1
-        except Exception:
-            pass
-    if killed:
-        logger.info("BrowserSession: 清理 %d 个僵尸进程", killed)
-    return killed
-
-
-# ══════════════════════════════════════════════════════════════════
-# BrowserSession — 屏幕外 CDP 浏览器
-# ══════════════════════════════════════════════════════════════════
-
-DEFAULT_PROFILE = Path.home() / "pp_edge_trusted"
-
-_STEALTH_SCRIPT = """
-Object.defineProperty(navigator, 'webdriver', { get: () => false });
-Object.defineProperty(navigator, 'plugins', {
-    get: () => {
-        const arr = [
-            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
-            { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
-            { name: 'Native Client', filename: 'internal-nacl-plugin' },
-        ];
-        arr.item = i => arr[i] || null;
-        arr.namedItem = n => arr.find(p => p.name === n) || null;
-        arr.refresh = () => {};
-        Object.setPrototypeOf(arr, PluginArray.prototype);
-        return arr;
-    },
-});
-window.chrome = { runtime: {}, loadTimes: () => {}, csi: () => {}, app: {} };
-delete window.__playwright__binding__;
-delete window.__pwInitScripts;
-delete window.__playwright__;
-"""
-
-
-class BrowserSession:
-    """屏幕外 CDP 浏览器，持久化 profile（cookie/CARSI/CF 信任复用）。"""
-
-    def __init__(
-        self,
-        profile_dir: str | Path | None = None,
-        port: int | None = None,
-    ):
-        self._profile = Path(profile_dir) if profile_dir else DEFAULT_PROFILE
-        self._port = port or _find_free_port()
-        self._proc: subprocess.Popen | None = None
-        self._pw = None
-        self._browser = None
-
-    @property
-    def cdp_url(self) -> str:
-        return f"http://127.0.0.1:{self._port}"
-
-    # ── 生命周期 ──
-
-    def start(self) -> bool:
-        """启动屏幕外 Edge 并连接 Playwright。"""
-        import subprocess as _sp
-        _kill_profile_zombies(self._profile)
-        browser_path = _find_chromium_browser()
-        if not browser_path:
-            logger.error("BrowserSession: 未找到浏览器")
-            return False
-
-        self._profile.mkdir(parents=True, exist_ok=True)
-
-        # 清理标签页恢复文件，防止 Edge 恢复上次访问的页面而非打开 about:blank
-        for f in ("Current Tabs", "Last Tabs", "Current Session", "Last Session"):
-            fp = self._profile / "Default" / f
-            try:
-                if fp.is_file():
-                    fp.unlink()
-            except Exception:
-                pass
-        sessions_dir = self._profile / "Default" / "Sessions"
-        if sessions_dir.exists():
-            try:
-                import shutil
-                shutil.rmtree(sessions_dir, ignore_errors=True)
-            except Exception:
-                pass
-
-        args = [
-            str(browser_path),
-            f"--remote-debugging-port={self._port}",
-            f"--user-data-dir={self._profile}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--restore-last-session=false",
-            "--disable-session-crashed-bubble",
-            "--disable-features=RestoreSession",
-            "--disable-blink-features=AutomationControlled",
-            "--window-size=1024,768",
-            "--window-position=-32000,-32000",
-            "about:blank",
-        ]
-        try:
-            self._proc = _sp.Popen(
-                args,
-                stdout=_sp.DEVNULL,
-                stderr=_sp.DEVNULL,
-            )
-        except Exception as e:
-            logger.error("BrowserSession: 启动失败 — %s", e)
-            return False
-
-        # 等待 CDP 就绪
-        for _ in range(30):
-            time.sleep(0.5)
-            if _is_port_open(self._port):
-                break
-        else:
-            logger.warning("BrowserSession: CDP 端口启动超时")
-            return True  # 继续尝试连接
-
-        from playwright.sync_api import sync_playwright
-        self._pw = sync_playwright().start()
-        self._browser = self._pw.chromium.connect_over_cdp(self.cdp_url)
-        logger.info("BrowserSession: 已就绪 port=%d", self._port)
-        return True
-
-    def stop(self) -> None:
-        if self._browser:
-            try:
-                self._browser.close()
-            except Exception:
-                pass
-            self._browser = None
-        if self._pw:
-            try:
-                self._pw.stop()
-            except Exception:
-                pass
-            self._pw = None
-        if self._proc:
-            try:
-                self._proc.terminate()
-            except Exception:
-                pass
-            self._proc = None
-
-    def __enter__(self) -> "BrowserSession":
-        self.start()
-        return self
-
-    def __exit__(self, *args) -> None:
-        self.stop()
-
-    # ── 页面操作 ──
-
-    def new_page(self):
-        """创建带反检测脚本的页面。"""
-        ctx = self._browser.contexts[0] if self._browser.contexts else self._browser.new_context()
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        page.add_init_script(_STEALTH_SCRIPT)
-        return page
-
-    def navigate(self, page, url: str, timeout: int = 30) -> bool:
-        """导航到 URL，等 domcontentloaded。返回是否成功。"""
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
-            return True
-        except Exception:
-            return False
-
-    def _set_window_visible(self, page, visible: bool) -> None:
-        """CDP: 将浏览器窗口移到屏幕内或屏幕外。"""
-        try:
-            cdp = page.context.new_cdp_session(page)
-            result = cdp.send("Browser.getWindowForTarget")
-            win_id = result.get("windowId")
-            bounds = result.get("bounds", {})
-            w = bounds.get("width", 1024)
-            h = bounds.get("height", 768)
-            left = 100 if visible else -32000
-            top = 100 if visible else -32000
-            cdp.send("Browser.setWindowBounds", {
-                "windowId": win_id,
-                "bounds": {"left": left, "top": top, "width": w, "height": h},
-            })
-        except Exception:
-            pass
-
-    def wait_for_content(
-        self, page, timeout: int = 60
-    ) -> bool:
-        """等待页面正文渲染（过 CF + JS 加载）。
-
-        窗口默认屏幕外，仅当 CF 挑战卡住超过 12 秒时才临时拉到屏幕内，
-        挑战通过后立即隐藏——尽可能减少闪窗。
-        """
-        deadline = time.time() + timeout
-        saw_body = False
-        cf_stuck_since = 0.0  # CF 首次出现时间
-        window_visible = False
-        while time.time() < deadline:
-            time.sleep(1.5)
-            title = ""
-            try:
-                title = (page.title() or "").lower()
-            except Exception:
-                pass
-
-            # 页面尚未完成初始加载（title 为空），继续等待
-            if title == "":
-                continue
-
-            # CF 挑战进行中（精确匹配，避免学术标题中 "challenges" 误触发）
-            cf_titles = ("just a moment...", "请稍候…", "checking your browser",
-                         "attention required", "ddos-guard", "one more step")
-            cf_active = title in cf_titles or "cloudflare" in title
-
-            if cf_active:
-                # CF 持续超过 12 秒 → 临时拉窗口到屏幕内加速
-                now = time.time()
-                if cf_stuck_since == 0:
-                    cf_stuck_since = now
-                elif now - cf_stuck_since > 12 and not window_visible:
-                    self._set_window_visible(page, True)
-                    _bring_window_to_front()
-                    window_visible = True
-                continue
-
-            cf_stuck_since = 0.0
-            # CF 过了就把窗口藏回去
-            if window_visible:
-                self._set_window_visible(page, False)
-                window_visible = False
-
-            try:
-                has_body = page.evaluate("""
-                    () => {
-                        const sel = document.querySelector('#body')
-                            || document.querySelector('.Body')
-                            || document.querySelector('article')
-                            || document.querySelector('main')
-                            || document.querySelector('[class*="article-body"]');
-                        if (!sel) return false;
-                        return sel.textContent.trim().length > 2000;
-                    }
-                """)
-                if has_body:
-                    if not saw_body:
-                        saw_body = True
-                        continue
-                    return True
-            except Exception:
-                pass
-
-        # 超时前兜底：如果窗口还是可见的，藏回去
-        if window_visible:
-            try:
-                self._set_window_visible(page, False)
-            except Exception:
-                pass
-        return False
-
-
-# ══════════════════════════════════════════════════════════════════
 # HTML 全文提取
 # ══════════════════════════════════════════════════════════════════
 
 HTML_CACHE_DIR = Path.home() / ".paperpilot_html_cache"
 
 
-def fetch_full_text(
-    paper: dict,
-    timeout: int = 60,
-) -> str | None:
-    """提取论文全文为自包含 HTML 文件（文字 + 图片 base64）。
+def _fetch_arxiv_html(paper: dict) -> str | None:
+    """arXiv HTTP 快速路径：无需 CDP 浏览器，直接 requests 抓取。
 
-    流程：屏幕外 CDP 浏览器 → 文章页 → 等 CF + JS 渲染 →
-          提取正文容器 HTML → 图片转 base64 → 缓存为 HTML 文件
+    arXiv 的 HTML 版本（arxiv.org/html/{id}）是服务端渲染的纯 HTML，
+    不需要 JS 执行，所以用简单的 HTTP GET 即可获取全文。
+
+    Returns:
+        缓存 HTML 文件路径，或 None
+    """
+    doi = paper.get("doi", "") or ""
+    url = paper.get("url", "") or ""
+    arxiv_id = None
+    m = _ARXIV_ID_RE.search(doi or url)
+    if m:
+        arxiv_id = m.group(1)
+    if not arxiv_id:
+        return None
+
+    cache_path = _html_cache_path(paper)
+    if cache_path.exists() and cache_path.stat().st_size > 0:
+        return str(cache_path)
+
+    import urllib.request
+    import urllib.error
+    html_url = _ARXIV_HTML.format(arxiv_id)
+    logger.info("arXiv HTTP 快速路径: %s", html_url)
+
+    try:
+        req = urllib.request.Request(
+            html_url,
+            headers={"User-Agent": UA},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, urllib.error.HTTPError) as e:
+        logger.warning("arXiv HTTP 抓取失败: %s", e)
+        return None
+
+    soup = BeautifulSoup(raw, "lxml")
+    # arXiv LaTeXML 转换后的正文容器
+    body = soup.select_one("div.ltx_page_main, article.ltx_document, main")
+    if not body:
+        # 回退：移除 nav/footer 后取 body
+        for tag in soup.select("nav, footer, script, style, .ltx_navbar"):
+            tag.decompose()
+        body = soup.find("body") or soup
+
+    # 移除导航/页脚等噪音
+    for tag in body.select("nav, footer, .ltx_navbar, .ltx_bibblock, .ltx_note_mark"):
+        tag.decompose()
+
+    body_html = str(body)
+    if len(body_html) < 500:
+        logger.warning("arXiv HTML 正文过短 (%d chars)，可能是仅摘要页面", len(body_html))
+        return None
+
+    title = paper.get("title", "") or (
+        (soup.title.string if soup.title else None) or arxiv_id
+    )
+    full_html = _build_article_page(title, body_html)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(full_html, encoding="utf-8")
+    logger.info("arXiv HTML 已缓存: %s (%d chars)", cache_path, len(full_html))
+    return str(cache_path)
+
+
+def fetch_full_text(paper: dict) -> str | None:
+    """获取论文全文 HTML 缓存文件（仅 arXiv HTTP 快速路径）。
+
+    其他出版商（SD/NEJM/Nature 等）的 HTML 提取暂不支持，
+    请通过 PDF 下载获取全文。
 
     Args:
         paper: paper dict，需含 url / doi
-        timeout: 最长等待秒数
 
     Returns:
         缓存 HTML 文件路径，或 None
@@ -684,51 +380,13 @@ def fetch_full_text(
         logger.info("HTML 缓存命中: %s", cache_path)
         return str(cache_path)
 
-    publisher = detect_publisher(paper)
-    logger.info("HTML 提取 [%s]: %s", publisher, url[:80])
+    # arXiv HTTP 快速路径（服务端渲染，无需浏览器）
+    if _ARXIV_ID_RE.search(doi or url):
+        return _fetch_arxiv_html(paper)
 
-    session = BrowserSession()
-    try:
-        if not session.start():
-            return None
-
-        page = session.new_page()
-
-        # SD: 用 / 代替 /abs/，确保看到完整文章页
-        article_url = url.replace("/abs/", "/")
-        session.navigate(page, article_url)
-
-        if not session.wait_for_content(page, timeout=timeout):
-            logger.warning("HTML 提取: 等待正文超时 [%s]", publisher)
-            session.stop()
-            return None
-
-        time.sleep(2)
-
-        # 提取正文 HTML（含图片 base64）
-        html = _extract_article_html(page, publisher)
-        if not html:
-            session.stop()
-            return None
-
-        # 组装完整 HTML 页面
-        title = paper.get("title", "") or _safe_page_title(page)
-        full_html = _build_article_page(title, html)
-
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(full_html, encoding="utf-8")
-        logger.info("HTML 已缓存: %s (%d chars)", cache_path, len(full_html))
-
-        session.stop()
-        return str(cache_path)
-
-    except Exception as e:
-        logger.warning("HTML 提取异常: %s", e)
-        try:
-            session.stop()
-        except Exception:
-            pass
-        return None
+    # 其他来源暂不支持 HTML 提取
+    logger.info("HTML 提取: 非 arXiv 来源，跳过 (%s)", url[:80])
+    return None
 
 
 def _html_cache_path(paper: dict) -> Path:
@@ -739,106 +397,6 @@ def _html_cache_path(paper: dict) -> Path:
     title = paper.get("title", "") or paper.get("url", "") or str(id(paper))
     h = hashlib.sha256(title.encode()).hexdigest()[:16]
     return HTML_CACHE_DIR / f"{h}.html"
-
-
-def _safe_page_title(page) -> str:
-    try:
-        t = page.title()
-        return t if t and len(t) > 3 else "PaperPilot"
-    except Exception:
-        return "PaperPilot"
-
-
-def _extract_article_html(page, publisher: str) -> str | None:
-    """从已加载的页面中提取正文 HTML，图片转 base64。
-
-    不同出版商使用不同的正文选择器。
-    """
-    selectors = {
-        "sciencedirect": "#body",
-        "nejm": "article, .article-body, main",
-        "nature": "article, .c-article-body, main",
-        "springer": ".c-article-body, article, main",
-        "acs": "article, .article-body, main",
-        "wiley": "article, .article-body, main",
-        "science": "article, .article-body, main",
-        "ieee": "article, .article-body, main",
-        "iop": "article, .article-body, main",
-        "rsc": "article, .article-body, main",
-    }
-    sel = selectors.get(publisher, "article, main, [class*='article-body']")
-
-    html = page.evaluate(f"""
-        async () => {{
-            // 找到正文容器
-            let body = null;
-            const selectors = {sel!r}.split(',').map(s => s.trim());
-            for (const s of selectors) {{
-                body = document.querySelector(s);
-                if (body && body.textContent.trim().length > 2000) break;
-                body = null;
-            }}
-            if (!body) body = document.body;
-            if (!body) return null;
-
-            const clone = body.cloneNode(true);
-
-            // 移除不需要的元素
-            const remove = clone.querySelectorAll(
-                'script, noscript, template, style, '
-                + 'nav, header, footer, '
-                + '.nav, .navbar, .header, .footer, .sidebar, '
-                + '.references, .citation, .bibliography, '
-                + '.related, .recommend, .share, .toolbar, .menu, '
-                + '.metrics, .journal-info, .rights, .permissions, '
-                + 'button, .btn, [role="button"], '
-                + '.sr-only, .visually-hidden'
-            );
-            remove.forEach(el => el.remove());
-
-            // 图片转 base64
-            const images = clone.querySelectorAll('img');
-            for (const img of images) {{
-                const src = img.src || img.getAttribute('data-src') || '';
-                if (!src || src.startsWith('data:')) continue;
-                // 跳过小图标 / 1px 追踪像素
-                if (img.naturalWidth < 50 || img.width < 50) continue;
-                try {{
-                    const resp = await fetch(src, {{ mode: 'cors', credentials: 'include' }});
-                    if (!resp.ok) continue;
-                    const blob = await resp.blob();
-                    if (blob.size < 1024) continue;  // 跳过小于 1KB 的图
-                    const dataUrl = await new Promise((resolve, reject) => {{
-                        const reader = new FileReader();
-                        reader.onload = () => resolve(reader.result);
-                        reader.onerror = reject;
-                        reader.readAsDataURL(blob);
-                    }});
-                    img.src = dataUrl;
-                    // 移除懒加载属性，确保 pywebview 中正常显示
-                    img.removeAttribute('loading');
-                    img.removeAttribute('data-src');
-                    img.style.maxWidth = '100%';
-                    img.style.height = 'auto';
-                }} catch(e) {{}}
-            }}
-
-            // 修复表格样式
-            clone.querySelectorAll('table').forEach(t => {{
-                t.style.width = '100%';
-                t.style.overflowX = 'auto';
-                t.style.display = 'block';
-            }});
-
-            return clone.outerHTML;
-        }}
-    """)
-
-    if html and len(html) > 500:
-        return html
-    return None
-
-
 def _build_article_page(title: str, body_html: str) -> str:
     """组装完整的阅读页面。"""
     return f"""<!DOCTYPE html>

@@ -270,12 +270,9 @@ def rerank_with_cross_encoder(
             results.sort(key=lambda x: -(x[1] if x[1] is not None else 0))
             return results[:top_k]
 
-    # Normalize to [0, 1]
-    min_s, max_s = scores.min(), scores.max()
-    if max_s > min_s:
-        scores = (scores - min_s) / (max_s - min_s)
-    else:
-        scores = np.zeros_like(scores)
+    # Sigmoid normalization: preserves score differentiation
+    # Unlike min-max, sigmoid doesn't force the best paper to exactly 1.0
+    scores = 1 / (1 + np.exp(-scores))
 
     reranked = sorted(
         zip([p for p, _ in results], scores),
@@ -430,6 +427,13 @@ def rank_papers(
         kw_bonus = keyword_match_bonus(paper, primary_kw, secondary_kw, regular_kw)
         score += kw_bonus * kw_bonus_scale
         final.append((paper, score))
+
+    # 无摘要论文降权：仅凭标题无法准确评估内容相关性
+    for i, (paper, score) in enumerate(final):
+        abstract = (paper.get("abstract") or "").strip()
+        if len(abstract) < 50:
+            final[i] = (paper, score * 0.7)
+
     final.sort(key=lambda x: -x[1])
     return final[:top_k]
 

@@ -27,8 +27,9 @@ def _migrate_schema(engine):
     try:
         cursor = conn.cursor()
 
-        # 获取 papers 表已有列
+        # 获取已有列
         existing = {r[1] for r in cursor.execute("PRAGMA table_info(papers)")}
+        pp_existing = {r[1] for r in cursor.execute("PRAGMA table_info(project_papers)")}
 
         # 需要在 base 模型中声明但可能缺失的列
         needed = {
@@ -39,6 +40,16 @@ def _migrate_schema(engine):
             if col_name not in existing:
                 cursor.execute(f"ALTER TABLE papers ADD COLUMN {col_name} {col_type}")
                 print(f"[Library] 数据库迁移: papers 表新增列 {col_name}")
+
+        pp_needed = {
+            "ai_score": "FLOAT",
+            "ai_reason": "TEXT",
+        }
+
+        for col_name, col_type in pp_needed.items():
+            if col_name not in pp_existing:
+                cursor.execute(f"ALTER TABLE project_papers ADD COLUMN {col_name} {col_type}")
+                print(f"[Library] 数据库迁移: project_papers 表新增列 {col_name}")
 
         conn.commit()
     finally:
@@ -101,6 +112,20 @@ def get_project(project_id: int) -> Project | None:
         session.close()
 
 
+def update_project_name(project_id: int, new_name: str) -> bool:
+    """重命名课题。"""
+    session = _get_session()
+    try:
+        project = session.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return False
+        project.name = new_name
+        session.commit()
+        return True
+    finally:
+        session.close()
+
+
 def delete_project(project_id: int) -> bool:
     """删除课题及其关联数据（级联删除 papers/keywords/feedback）。"""
     session = _get_session()
@@ -117,17 +142,26 @@ def delete_project(project_id: int) -> bool:
 
 # ── 论文管理 ──
 
-def _find_or_create_paper(session: Session, paper_dict: dict) -> Paper:
+def _find_or_create_paper(session: Session, paper_dict: dict) -> tuple[Paper, bool]:
     """在 session 内查找或创建 Paper 记录。
 
     去重策略：DOI 优先 → 标题 + 年份。
+    如果找到已有记录且 paper_dict 有 pdf_path，自动补填 pdf_path。
+
+    Returns:
+        (Paper, pdf_updated) — pdf_updated 表示是否对已有记录补填了 pdf_path
     """
+    pdf_path = paper_dict.get("pdf_path")
+
     # 1. DOI 匹配
     doi = paper_dict.get("doi")
     if doi:
         existing = session.query(Paper).filter(Paper.doi == doi).first()
         if existing:
-            return existing
+            if pdf_path and not existing.pdf_path:
+                existing.pdf_path = pdf_path
+                return existing, True
+            return existing, False
 
     # 2. 标题 + 年份匹配
     title = (paper_dict.get("title") or "").strip()
@@ -137,8 +171,14 @@ def _find_or_create_paper(session: Session, paper_dict: dict) -> Paper:
         if year is not None:
             q = q.filter(Paper.year == year)
         existing = q.first()
+        # 年份不匹配时退回到纯标题匹配（PDF 年份提取可能不准）
+        if not existing and year is not None:
+            existing = session.query(Paper).filter(Paper.title == title).first()
         if existing:
-            return existing
+            if pdf_path and not existing.pdf_path:
+                existing.pdf_path = pdf_path
+                return existing, True
+            return existing, False
 
     # 3. 新建
     paper = Paper(
@@ -153,17 +193,18 @@ def _find_or_create_paper(session: Session, paper_dict: dict) -> Paper:
     )
     session.add(paper)
     session.flush()
-    return paper
+    return paper, False
 
 
 def save_papers_to_project(
     project_id: int,
     papers: list[dict],
     scores: list[tuple[dict, float]] | None = None,
-) -> int:
+) -> tuple[int, int]:
     """将检索结果保存到课题。
 
-    已存在于课题中的论文不重复添加（通过 ProjectPaper 去重）。
+    已存在于课题中的论文不重复添加（通过 ProjectPaper 去重），
+    但会补填缺失的 pdf_path。
 
     Args:
         project_id: 目标课题 ID
@@ -171,8 +212,10 @@ def save_papers_to_project(
         scores: rank_papers 返回的 [(paper, score), ...]，可选
 
     Returns:
-        本次新增的论文数量
+        (added, pdf_updated) — added 为新关联数，pdf_updated 为补填 PDF 路径数
     """
+    import json as _json
+
     # 构建 paper → score 映射
     score_map: dict[str, float] = {}
     if scores:
@@ -183,14 +226,18 @@ def save_papers_to_project(
 
     session = _get_session()
     added = 0
+    pdf_updated = 0
     try:
         project = session.query(Project).filter(Project.id == project_id).first()
         if not project:
-            return 0
+            return 0, 0
 
         for paper_dict in papers:
-            paper = _find_or_create_paper(session, paper_dict)
+            paper, was_pdf_updated = _find_or_create_paper(session, paper_dict)
             paper_id = paper.id
+
+            if was_pdf_updated:
+                pdf_updated += 1
 
             # 检查是否已关联到该课题
             existing = (
@@ -201,12 +248,24 @@ def save_papers_to_project(
                 )
                 .first()
             )
-            if existing:
-                continue
-
             # 获取分数
             key = (paper_dict.get("doi") or paper_dict.get("title", "")).strip().lower()
             total_score = score_map.get(key, 0.0)
+            ai_score = paper_dict.get("ai_score")
+            ai_reason = paper_dict.get("ai_reason")
+
+            if existing:
+                # 已有关联：补充 AI 分数（如果 paper 带了且 ProjectPaper 没有）
+                updated = False
+                if ai_score is not None and existing.ai_score is None:
+                    existing.ai_score = int(ai_score)
+                    updated = True
+                if ai_reason and not existing.ai_reason:
+                    existing.ai_reason = _json.dumps(ai_reason, ensure_ascii=False) if isinstance(ai_reason, dict) else str(ai_reason)
+                    updated = True
+                if updated:
+                    pdf_updated += 1  # 复用计数
+                continue
 
             pp = ProjectPaper(
                 project_id=project_id,
@@ -214,6 +273,8 @@ def save_papers_to_project(
                 total_score=total_score,
                 score_similarity=total_score,
                 status="unread",
+                ai_score=int(ai_score) if ai_score is not None else None,
+                ai_reason=_json.dumps(ai_reason, ensure_ascii=False) if isinstance(ai_reason, dict) else (str(ai_reason) if ai_reason else None),
             )
             session.add(pp)
             added += 1
@@ -222,7 +283,7 @@ def save_papers_to_project(
     finally:
         session.close()
 
-    return added
+    return added, pdf_updated
 
 
 def get_project_papers(
@@ -263,6 +324,8 @@ def get_project_papers(
                 "doi": paper.doi,
                 "pdf_path": paper.pdf_path,
                 "total_score": pp.total_score,
+                "ai_score": pp.ai_score,
+                "ai_reason": pp.ai_reason,
                 "status": pp.status,
                 "ai_notes": pp.ai_notes,
                 "user_notes": pp.user_notes,
@@ -321,6 +384,30 @@ def update_paper_status(project_paper_id: int, status: str) -> bool:
         session.close()
 
 
+def save_deep_read_notes(project_paper_id: int, notes: str, status: str = "deep_read") -> bool:
+    """保存 AI 精读笔记到论文记录，同时更新阅读状态。
+
+    Args:
+        project_paper_id: ProjectPaper 的 ID
+        notes: AI 精读结果（JSON 字符串或纯文本）
+        status: 同步更新的阅读状态，默认 "deep_read"
+
+    Returns:
+        True 表示更新成功
+    """
+    session = _get_session()
+    try:
+        pp = session.query(ProjectPaper).filter(ProjectPaper.id == project_paper_id).first()
+        if not pp:
+            return False
+        pp.ai_notes = notes
+        pp.status = status
+        session.commit()
+        return True
+    finally:
+        session.close()
+
+
 def update_paper_scores(project_id: int, scored: list[tuple[dict, float]]) -> int:
     """用 rank_papers 结果批量更新 ProjectPaper 分数。
 
@@ -358,6 +445,58 @@ def update_paper_scores(project_id: int, scored: list[tuple[dict, float]]) -> in
             if pp:
                 pp.total_score = float(score)
                 pp.score_similarity = float(score)
+                updated += 1
+
+        session.commit()
+    finally:
+        session.close()
+
+    return updated
+
+
+def update_paper_ai_scores(project_id: int, ai_results: list[dict],
+                         paper_dicts: list[dict] | None = None) -> int:
+    """将 AI 精排结果写入 ProjectPaper。
+
+    优先通过 paper_dicts[index] 中的 project_paper_id 匹配；
+    否则按 ProjectPaper 在数据库中的顺序匹配（仅当 paper_dicts 顺序
+    与数据库顺序一致时有效）。
+
+    Args:
+        project_id: 课题 ID
+        ai_results: score_papers 返回的 [{index, ai_score, tier, ai_reason}, ...]
+        paper_dicts: 传入 score_papers 的论文列表（含 project_paper_id）
+
+    Returns:
+        更新的 ProjectPaper 记录数
+    """
+    import json
+    session = _get_session()
+    updated = 0
+    try:
+        for item in ai_results:
+            idx = item.get("index", -1)
+            pp_id = None
+            if paper_dicts and 0 <= idx < len(paper_dicts):
+                pp_id = paper_dicts[idx].get("project_paper_id")
+
+            if pp_id is not None:
+                pp = session.query(ProjectPaper).filter(ProjectPaper.id == pp_id).first()
+            else:
+                # 回退：按数据库顺序匹配
+                pps = (
+                    session.query(ProjectPaper)
+                    .filter(ProjectPaper.project_id == project_id)
+                    .order_by(ProjectPaper.id)
+                    .all()
+                )
+                pp = pps[idx] if 0 <= idx < len(pps) else None
+
+            if pp:
+                pp.ai_score = float(item.get("ai_score", 0))
+                reason = dict(item.get("ai_reason", {}))
+                reason["tier"] = item.get("tier", "")
+                pp.ai_reason = json.dumps(reason, ensure_ascii=False)
                 updated += 1
 
         session.commit()

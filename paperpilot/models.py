@@ -62,6 +62,10 @@ class ProjectPaper(Base):
     score_recency = Column(Float, default=0.0, comment="时效性得分")
     total_score = Column(Float, default=0.0, comment="加权总分")
 
+    # AI 精排分（Phase 2）
+    ai_score = Column(Float, nullable=True, comment="AI 精排分数 0-100")
+    ai_reason = Column(Text, nullable=True, comment="AI 打分理由 JSON")
+
     # 阅读状态
     status = Column(
         String(20), default="unread",

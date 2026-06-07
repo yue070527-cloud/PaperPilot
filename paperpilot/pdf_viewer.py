@@ -456,10 +456,45 @@ def _create_window(create_kwargs: dict) -> bool:
         args_path = f.name
 
     script = (
-        "import json,webview,os\n"
+        "import json,webview,os,sys,threading,time\n"
         f"with open({args_path!r},'r',encoding='utf-8') as f:\n"
         "  k=json.load(f)\n"
         f"os.unlink({args_path!r})\n"
+        # Background thread: bring window to foreground after it's created
+        "def _bring_front():\n"
+        "    if sys.platform!='win32': return\n"
+        "    import ctypes\n"
+        "    ktitle=k.get('title','')\n"
+        "    ctypes.windll.user32.AllowSetForegroundWindow(-1)\n"
+        # Retry loop: window title may take a moment to appear
+        "    hwnd=None\n"
+        "    for _ in range(15):\n"
+        "        time.sleep(0.2)\n"
+        "        hwnd=ctypes.windll.user32.FindWindowW(None,ktitle)\n"
+        "        if hwnd: break\n"
+        "    if not hwnd:\n"
+        # Fallback: find any window whose title starts with ktitle
+        "        import ctypes.wintypes as wt\n"
+        "        titles=[]\n"
+        "        def _enum(h,_):\n"
+        "            buf=wt.create_unicode_buffer(256)\n"
+        "            ctypes.windll.user32.GetWindowTextW(h,buf,256)\n"
+        "            t=buf.value\n"
+        "            if t and t.startswith(ktitle[:30]): titles.append(h); return False\n"
+        "            return True\n"
+        "        ctypes.windll.user32.EnumWindows(wt.WINFUNCTYPE(wt.BOOL,wt.HWND,wt.LPARAM)(_enum),0)\n"
+        "        if titles: hwnd=titles[0]\n"
+        "    if hwnd:\n"
+        "        HWND_TOPMOST=-1; HWND_NOTOPMOST=-2\n"
+        "        SWP_NOMOVE=0x0002; SWP_NOSIZE=0x0001; SWP_SHOWWINDOW=0x0040\n"
+        "        ctypes.windll.user32.SetWindowPos(hwnd,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW)\n"
+        "        ctypes.windll.user32.ShowWindow(hwnd,9)\n"
+        "        ctypes.windll.user32.SetForegroundWindow(hwnd)\n"
+        "        time.sleep(0.3)\n"
+        "        ctypes.windll.user32.SetWindowPos(hwnd,HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE)\n"
+        "t=threading.Thread(target=_bring_front,daemon=True)\n"
+        "t.start()\n"
+        # Main thread: create and start webview (must be on main thread)
         "webview.create_window(**k)\n"
         "webview.start(gui='edgechromium')\n"
         f"{cleanup_script}\n"
@@ -483,11 +518,11 @@ def open_full_reader(
 ) -> bool:
     """打开 pywebview 独立阅读窗口。
 
-    PDF 来源优先级：
-    1. paper["pdf_path"] — 已下载到本地的 PDF 文件 → PDF.js 渲染
-    2. downloader.cache_pdf(paper) — 直链下载（arXiv/Nature/Springer 等） → PDF.js 渲染
-    3. downloader.fetch_full_text(paper) — HTML 全文提取（SD/NEJM 等 CF 站点） → pywebview 渲染
-    4. 都没有 → 显示错误提示
+    全文来源优先级：
+    1. paper["pdf_path"] — 课题仓库 / 缓存 / 原始路径本地文件
+    2. repo_manager 缓存 (cache/pdfs/) — 检索页已下载过的 PDF
+    3. downloader.cache_pdf(paper) — 直链下载 → 存入 repo 缓存
+    4. 都没有 → 返回 False
 
     Args:
         paper: paper dict 格式（跨模块数据协议）
@@ -517,43 +552,57 @@ def open_full_reader(
     # 标记：pdf_path 设了但文件不存在（用于最终错误提示）
     missing_local = pdf_path and not os.path.isfile(pdf_path)
 
-    # 1. 本地 PDF 文件
+    # 1. 本地 PDF 文件（课题仓库 / repo 缓存 / 原始路径）
     if pdf_path and os.path.isfile(pdf_path):
         return _open_pdfjs_window(pdf_path, title, theme_seed, dark_mode, x, y, scale)
 
-    # 2. 直链下载（arXiv/Nature/Springer 等）
+    # 1.5. 课题仓库 catalog（DB 记录的路径可能过期，catalog 是权威来源）
+    try:
+        from paperpilot import repo_manager as _rm_cat
+        catalog_results = _rm_cat.find_in_all_catalogs(paper)
+        if catalog_results:
+            cat_path = catalog_results[0][2]
+            if cat_path and os.path.isfile(cat_path):
+                paper["pdf_path"] = cat_path
+                return _open_pdfjs_window(cat_path, title, theme_seed, dark_mode, x, y, scale)
+    except Exception:
+        pass
+
+    # 2. repo_manager 缓存（检索页下载后缓存到 cache/pdfs/）
+    try:
+        from paperpilot import repo_manager as _rm
+        cached = _rm.get_cached_pdf(paper)
+        if cached and os.path.isfile(cached):
+            paper["pdf_path"] = cached
+            return _open_pdfjs_window(cached, title, theme_seed, dark_mode, x, y, scale)
+    except Exception:
+        pass
+
+    # 3. 直链下载（arXiv/Nature/Springer 等）→ 存入 repo 缓存
     if _download_pdf is not None:
         try:
-            pdf_path = _download_pdf(paper)
-            if pdf_path and os.path.isfile(pdf_path):
-                return _open_pdfjs_window(pdf_path, title, theme_seed, dark_mode, x, y, scale)
+            downloaded = _download_pdf(paper)
+            if downloaded and os.path.isfile(downloaded):
+                try:
+                    from paperpilot import repo_manager as _rm2
+                    repo_path = _rm2.cache_pdf(paper, downloaded)
+                    if repo_path:
+                        downloaded = repo_path
+                except Exception:
+                    pass
+                paper["pdf_path"] = downloaded
+                return _open_pdfjs_window(downloaded, title, theme_seed, dark_mode, x, y, scale)
         except Exception:
             pass
 
-    # 3. HTML 全文提取（SD/NEJM 等 CF 站点）
-    if _fetch_full_text is not None:
-        try:
-            html_path = _fetch_full_text(paper)
-            if html_path and os.path.isfile(html_path):
-                return _open_html_window(html_path, title, theme_seed, dark_mode, x, y)
-        except Exception:
-            pass
-
-    # 4. DOI 回退
-    if doi:
-        doi_url = doi if doi.startswith("http") else f"https://doi.org/{doi}"
-        return _open_url_window(doi_url, title, x, y)
-
-    # 5. 本地文件丢失提示
+    # 4. 本地文件丢失提示
     if missing_local:
-        return _open_error_window(
-            title, theme_seed, dark_mode, x, y,
-            message="PDF 文件已移动或删除",
-            detail=f"原路径: {paper['pdf_path']}",
-        )
+        logger.info("本地 PDF 文件丢失: %s", paper.get("pdf_path"))
+        return False
 
-    # 6. 无法获取全文
-    return _open_error_window(title, theme_seed, dark_mode, x, y)
+    # 5. 无法获取全文
+    logger.info("无法获取全文: %s", title)
+    return False
 
 
 def _open_pdfjs_window(
@@ -573,19 +622,6 @@ def _open_pdfjs_window(
         "frameless": False,
         "width": 900,
         "height": 700,
-        "x": x,
-        "y": y,
-        "min_size": (400, 300),
-    })
-
-
-def _open_url_window(url: str, title: str, x: int | None, y: int | None) -> bool:
-    """用 pywebview 直接加载远程 URL。"""
-    return _create_window({
-        "title": title,
-        "url": url,
-        "width": 1000,
-        "height": 750,
         "x": x,
         "y": y,
         "min_size": (400, 300),
@@ -727,31 +763,6 @@ def _open_text_window(
 def _escape_html(text: str) -> str:
     """转义 HTML 特殊字符。"""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def _open_html_window(
-    html_path: str,
-    title: str,
-    theme_seed: str,
-    dark_mode: bool,
-    x: int | None,
-    y: int | None,
-) -> bool:
-    """在 pywebview 窗口中渲染自包含 HTML 文件。"""
-    try:
-        html = Path(html_path).read_text(encoding="utf-8")
-    except Exception:
-        return _open_error_window(title, theme_seed, dark_mode, x, y)
-    return _create_window({
-        "title": title,
-        "html": html,
-        "frameless": False,
-        "width": 900,
-        "height": 700,
-        "x": x,
-        "y": y,
-        "min_size": (400, 300),
-    })
 
 
 def _open_error_window(

@@ -48,3 +48,8 @@ config.yaml
 # OS
 .DS_Store
 Thumbs.db
+
+# User data
+repository/
+outputs/
+*.log

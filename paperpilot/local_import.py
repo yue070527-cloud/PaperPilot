@@ -62,11 +62,13 @@ def extract_pdf(file_path: str) -> dict | None:
         if len(full_text) > 8000:
             break
 
-    # 扫描件检测：前 3 页文字总量 < 100 字符视为扫描件
+    # 扫描件检测：跳过第 1 页（可能是封面图），检查前 5 页文字总量
+    # 阈值降低到 50 字符，避免误判图片较多的正常论文
     text_check = ""
-    for i in range(min(3, len(doc))):
+    start_page = 1 if len(doc) > 1 else 0  # 跳过可能的封面页
+    for i in range(start_page, min(start_page + 5, len(doc))):
         text_check += doc[i].get_text()
-    if len(text_check.strip()) < 100:
+    if len(text_check.strip()) < 50:
         doc.close()
         return None
 
@@ -191,10 +193,18 @@ _YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 
 def _extract_year(metadata: dict, text: str) -> int | None:
     """从 metadata 或正文中推断发表年份。"""
-    # 1. metadata
+    # 1. metadata — 先处理 PDF 日期格式 D:YYYYMMDD...
     for key in ("creationDate", "modDate", "date"):
-        val = metadata.get(key, "")
-        m = _YEAR_RE.search(str(val))
+        val = str(metadata.get(key, ""))
+        if not val:
+            continue
+        # PDF 日期: "D:20160125173023+05'30'" → 提取开头的年份
+        m = re.match(r"D:(\d{4})", val)
+        if m:
+            year = int(m.group(1))
+            if 1900 <= year <= 2100:
+                return year
+        m = _YEAR_RE.search(val)
         if m:
             return int(m.group())
 
