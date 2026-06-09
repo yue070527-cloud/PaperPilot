@@ -169,13 +169,22 @@ class AIService:
                     },
                 )
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    body = json.loads(resp.read().decode("utf-8"))
-                return body.get("choices", [{}])[0].get("message", {}).get("content", "")
-            except (urllib.error.URLError, urllib.error.HTTPError) as e:
+                    raw = resp.read().decode("utf-8")
+                    body = json.loads(raw)
+                content = body.get("choices", [{}])[0].get("message", {}).get("content", "")
+                # API 可能返回错误响应（非 choices 格式）
+                if not content and "error" in body:
+                    logger.warning(f"API returned error: {body['error']}")
+                return content
+            except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
                 if attempt == 1:
-                    logger.warning(f"API call failed (attempt 1): {e}, retrying...")
+                    logger.warning(
+                        f"API call failed (attempt 1, {type(e).__name__}): {e}, retrying..."
+                    )
                     continue
-                logger.warning(f"API call failed (attempt 2): {e}")
+                logger.warning(
+                    f"API call failed (attempt 2, {type(e).__name__}): {e}"
+                )
             except json.JSONDecodeError as e:
                 logger.warning(f"API response parse error: {e}")
                 break
@@ -223,7 +232,10 @@ class AIService:
                     f"Truncated JSON recovery: salvaged {len(items)} items"
                 )
                 return items
-        logger.warning("Failed to parse JSON from API response")
+        logger.warning(
+            f"Failed to parse JSON from API response "
+            f"(len={len(content)}, preview={content[:300]})"
+        )
         return {}
 
     # ── RLM 分层阅读 ──
