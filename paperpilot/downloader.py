@@ -86,7 +86,21 @@ def _direct_download(paper: dict) -> bytes | None:
     Returns:
         PDF bytes 或 None
     """
-    from curl_cffi import requests as cffi
+    try:
+        from curl_cffi import requests as _http
+        _HAS_CFFI = True
+    except ImportError:
+        import requests as _http
+        _HAS_CFFI = False
+
+    def _get(url, timeout=15, impersonate=None, allow_redirects=True):
+        """HTTP GET，自动适配 curl_cffi / requests 的 impersonate 差异。"""
+        kwargs = {"headers": headers, "timeout": timeout}
+        if allow_redirects is not True:
+            kwargs["allow_redirects"] = allow_redirects
+        if _HAS_CFFI and impersonate:
+            kwargs["impersonate"] = impersonate
+        return _http.get(url, **kwargs)
 
     doi = paper.get("doi", "")
     url = paper.get("url", "")
@@ -104,8 +118,8 @@ def _direct_download(paper: dict) -> bytes | None:
         arxiv_id = m.group(1)
     if arxiv_id:
         try:
-            resp = cffi.get(_ARXIV_PDF.format(arxiv_id), headers=headers,
-                          timeout=15, impersonate="chrome120")
+            resp = _get(_ARXIV_PDF.format(arxiv_id), timeout=15,
+                       impersonate="chrome120")
             if resp.status_code == 200 and resp.content[:5] == b"%PDF-":
                 logger.info("PDF 来源: arXiv 直链")
                 return resp.content
@@ -119,8 +133,8 @@ def _direct_download(paper: dict) -> bytes | None:
         nature_id = m.group(1)
     if nature_id:
         try:
-            resp = cffi.get(_NATURE_PDF.format(nature_id), headers=headers,
-                          timeout=15, impersonate="chrome120")
+            resp = _get(_NATURE_PDF.format(nature_id), timeout=15,
+                       impersonate="chrome120")
             if resp.status_code == 200 and resp.content[:5] == b"%PDF-":
                 logger.info("PDF 来源: Nature 直链")
                 return resp.content
@@ -130,8 +144,8 @@ def _direct_download(paper: dict) -> bytes | None:
     # ③ Springer
     if doi:
         try:
-            resp = cffi.get(_SPRINGER_PDF.format(doi), headers=headers,
-                          timeout=15, impersonate="chrome120")
+            resp = _get(_SPRINGER_PDF.format(doi), timeout=15,
+                       impersonate="chrome120")
             if resp.status_code == 200 and resp.content[:5] == b"%PDF-":
                 logger.info("PDF 来源: Springer 直链")
                 return resp.content
@@ -143,7 +157,7 @@ def _direct_download(paper: dict) -> bytes | None:
     if guessed:
         try:
             imp = "chrome124" if "wiley.com" in guessed else "chrome120"
-            resp = cffi.get(guessed, headers=headers, timeout=15, impersonate=imp)
+            resp = _get(guessed, timeout=15, impersonate=imp)
             if resp.status_code == 200 and resp.content[:5] == b"%PDF-":
                 logger.info("PDF 来源: %s", guessed[:80])
                 return resp.content
@@ -154,15 +168,13 @@ def _direct_download(paper: dict) -> bytes | None:
     if doi:
         try:
             doi_url = f"https://doi.org/{doi}"
-            resp = cffi.get(doi_url, headers=headers, timeout=15,
-                          impersonate="chrome120", allow_redirects=True)
+            resp = _get(doi_url, timeout=15, impersonate="chrome120")
             if resp.status_code == 200:
                 soup = BeautifulSoup(resp.text, "lxml")
                 meta = soup.find("meta", attrs={"name": "citation_pdf_url"})
                 if meta and meta.get("content"):
                     pdf_url = meta["content"]
-                    pdf_resp = cffi.get(pdf_url, headers=headers, timeout=15,
-                                      impersonate="chrome120")
+                    pdf_resp = _get(pdf_url, timeout=15, impersonate="chrome120")
                     if pdf_resp.status_code == 200 and pdf_resp.content[:5] == b"%PDF-":
                         logger.info("PDF 来源: citation_pdf_url")
                         return pdf_resp.content

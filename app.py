@@ -1222,7 +1222,11 @@ def show_paper_detail(paper: dict):
                 from pathlib import Path as _P
 
                 # 1. 先查 repo_manager 缓存
-                cached = repo_manager.get_cached_pdf(p)
+                cached = None
+                try:
+                    cached = repo_manager.get_cached_pdf(p)
+                except Exception as ex:
+                    print(f"[_on_read] step=cache_lookup error={type(ex).__name__}: {ex}", flush=True)
                 if cached and _P(cached).is_file():
                     import_result["ok"] = True
                     import_result["action"] = ("pdf", cached)
@@ -1230,11 +1234,20 @@ def show_paper_detail(paper: dict):
                     return
 
                 # 2. 下载 PDF
-                from paperpilot.downloader import cache_pdf as _dl_cache_pdf
-                pdf_path = _dl_cache_pdf(p)
+                print(f"[_on_read] step=download title={p.get('title', '')[:80]}", flush=True)
+                pdf_path = None
+                try:
+                    from paperpilot.downloader import cache_pdf as _dl_cache_pdf
+                    pdf_path = _dl_cache_pdf(p)
+                except Exception as ex:
+                    print(f"[_on_read] step=download error={type(ex).__name__}: {ex}", flush=True)
                 if pdf_path and _P(pdf_path).is_file():
                     # 3. 存入 repo_manager 缓存（LRU 管理）
-                    repo_path = repo_manager.cache_pdf(p, pdf_path)
+                    repo_path = None
+                    try:
+                        repo_path = repo_manager.cache_pdf(p, pdf_path)
+                    except Exception as ex:
+                        print(f"[_on_read] step=repo_cache error={type(ex).__name__}: {ex}", flush=True)
                     final_path = repo_path if repo_path else pdf_path
                     import_result["ok"] = True
                     import_result["action"] = ("pdf", final_path)
@@ -1242,7 +1255,9 @@ def show_paper_detail(paper: dict):
                     return
             except Exception as ex:
                 import_result["error"] = str(ex)
-                print(f"[_on_read] bg_try error: {ex}", flush=True)
+                print(f"[_on_read] bg_try error={type(ex).__name__}: {ex}", flush=True)
+                import traceback
+                traceback.print_exc()
 
             import_result["ok"] = False
             import_result["done"] = True
