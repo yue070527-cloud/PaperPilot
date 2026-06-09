@@ -767,7 +767,7 @@ def build_project_page():
             ai_score_btn.content = ft.Text("AI 精排")
 
             if not _results:
-                _ai_score_status.value = "AI 评分失败，请检查网络"
+                _ai_score_status.value = "AI 评分失败：网络超时 / API 繁忙 / 返回格式异常，可减少评分篇数后重试"
                 _ai_score_status.update()
                 ai_score_btn.update()
                 return
@@ -2112,6 +2112,9 @@ def build_results_page():
                 await asyncio.sleep(0.5)
             if _ai_sort_result and isinstance(_ai_sort_result[0], Exception):
                 upload_progress.value = f"AI 排序失败: {_ai_sort_result[0]}"
+                upload_progress.color = ft.Colors.ERROR
+            elif not _ai_sort_result:
+                upload_progress.value = "AI 评分失败：网络超时 / API 繁忙 / 返回格式异常，可重试"
                 upload_progress.color = ft.Colors.ERROR
             else:
                 n = library.update_paper_ai_scores(

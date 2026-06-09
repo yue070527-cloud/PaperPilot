@@ -182,7 +182,7 @@ class AIService:
 
         return ""
 
-    def _parse_json_response(self, content: str) -> dict:
+    def _parse_json_response(self, content: str) -> dict | list:
         """从 LLM 回复中提取 JSON 块，失败返回空 dict。"""
         if not content:
             return {}
@@ -205,6 +205,24 @@ class AIService:
                 return json.loads(m.group(0))
             except json.JSONDecodeError:
                 pass
+        # 兜底：截断 JSON 数组恢复 —— 逐条提取完整 {...} 对象
+        arr_m = re.search(r"\[([\s\S]*)\]", content)
+        if arr_m:
+            inner = arr_m.group(1)
+            items = []
+            for obj_m in re.finditer(
+                r"\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\}",
+                inner,
+            ):
+                try:
+                    items.append(json.loads(obj_m.group(0)))
+                except json.JSONDecodeError:
+                    continue
+            if items:
+                logger.info(
+                    f"Truncated JSON recovery: salvaged {len(items)} items"
+                )
+                return items
         logger.warning("Failed to parse JSON from API response")
         return {}
 
@@ -473,9 +491,12 @@ class AIService:
             {"role": "user", "content": "\n".join(lines)},
         ]
 
-        # 输出 token 按篇数动态分配（每篇 ~80 tokens）+ 200 余量
-        dyn_tokens = max(3000, len(candidates) * 80 + 200)
+        # 输出 token 按篇数动态分配（每篇 ~200 tokens，含 4 维度中文理由）+ 500 余量
+        dyn_tokens = max(4000, len(candidates) * 200 + 500)
         content = self._call_api(messages, temperature=0.2, max_tokens=dyn_tokens, timeout=120)
+        if not content:
+            logger.warning("score_papers: API returned empty response")
+            return []
         raw = self._parse_json_response(content)
 
         # 解析结果
@@ -486,7 +507,14 @@ class AIService:
         elif isinstance(raw, dict) and "results" in raw:
             items = raw["results"]
         else:
+            logger.warning(
+                f"score_papers: JSON parse returned unexpected type "
+                f"{type(raw).__name__}, content preview: {content[:200]}"
+            )
             return []
+        logger.info(
+            f"score_papers: scored {len(items)}/{len(candidates)} papers"
+        )
 
         results = []
         for item in items:
