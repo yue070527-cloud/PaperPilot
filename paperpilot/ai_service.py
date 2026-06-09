@@ -482,12 +482,12 @@ class AIService:
 
         max_papers = min(max_papers, 50)
 
-        # 筛选有摘要的论文
-        candidates = []
+        # 收集候选论文（含无摘要的，标记 has_abstract）
+        candidates: list[tuple[int, dict, bool]] = []
         for i, p in enumerate(papers):
             abstract = (p.get("abstract") or "").strip()
-            if abstract and len(abstract) >= 80:
-                candidates.append((i, p))
+            has_abstract = bool(abstract and len(abstract) >= 80)
+            candidates.append((i, p, has_abstract))
             if len(candidates) >= max_papers:
                 break
 
@@ -510,7 +510,7 @@ class AIService:
         return all_results
 
     def _score_chunk(
-        self, topic_desc: str, chunk: list[tuple[int, dict]],
+        self, topic_desc: str, chunk: list[tuple[int, dict, bool]],
         chunk_idx: int, total: int,
     ) -> list[dict]:
         """对单批论文打分，返回 [{index, ai_score, ...}, ...]."""
@@ -519,10 +519,13 @@ class AIService:
         # 构建输入
         header = f"课题描述：{topic_desc}\n\n—— 待评分论文（第 {chunk_idx + 1} 批，共 {chunk_size} 篇）——"
         lines = [header]
-        for idx, (orig_i, p) in enumerate(chunk):
+        for idx, (orig_i, p, has_abstract) in enumerate(chunk):
             title = (p.get("title") or "无标题")[:120]
-            abstract = (p.get("abstract") or "")[:800]
-            lines.append(f"\n[{idx}] {title}\n摘要：{abstract}")
+            if has_abstract:
+                abstract = (p.get("abstract") or "")[:800]
+                lines.append(f"\n[{idx}] {title}\n摘要：{abstract}")
+            else:
+                lines.append(f"\n[{idx}] {title}\n摘要：（无摘要，仅基于标题评分）")
 
         messages = [
             {"role": "system", "content": self._SCORE_PAPERS_SYSTEM},
@@ -563,10 +566,13 @@ class AIService:
             idx = item.get("index", -1)
             if idx < 0 or idx >= chunk_size:
                 continue
-            orig_i, paper = chunk[idx]
+            orig_i, paper, has_abstract = chunk[idx]
+            score = int(item.get("score", 0))
+            if not has_abstract:
+                score = score // 2  # 仅标题评分，减半
             results.append({
                 "index": orig_i,
-                "ai_score": int(item.get("score", 0)),
+                "ai_score": score,
                 "tier": str(item.get("tier", "") or ""),
                 "ai_reason": {
                     "relevance": int(item.get("relevance", 0)),

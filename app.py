@@ -17,7 +17,7 @@ from paperpilot.local_import import scan_folder, extract_pdfs
 from paperpilot.pdf_viewer import open_full_reader, render_preview, is_full_reader_available
 from paperpilot.ai_service import AIService, save_deep_read_json, get_full_text_for_paper
 from paperpilot.library import save_deep_read_notes
-from paperpilot import repo_manager
+from paperpilot import repo_manager, downloader
 
 
 # ── 主题定义 ──
@@ -894,18 +894,63 @@ def build_project_page():
                 n = library.save_papers_to_project(pid, state.papers, state.scores)
                 papers_to_import = [s[0] for s in state.scores]
 
-            # 将 PDF 同步到课题仓库
+            # ── PDF 导入 + DB 更新（DOI 优先，标题回退）──
+            def _update_db_pdf(paper: dict, pdf_path: str) -> bool:
+                """将 pdf_path 写入数据库。DOI 匹配失败时回退到标题匹配。"""
+                doi = paper.get("doi") or ""
+                if doi and library.set_paper_pdf_path(doi, pdf_path):
+                    return True
+                title = paper.get("title") or ""
+                if title:
+                    year = paper.get("year")
+                    return library.set_paper_pdf_path_by_title(title, pdf_path, year)
+                return False
+
+            # 同步导入已有缓存
             imported = 0
             for paper in papers_to_import:
                 pdf = paper.get("pdf_path", "")
                 if not pdf or not os.path.isfile(str(pdf)):
-                    # 兜底：查 repo 缓存
                     pdf = repo_manager.get_cached_pdf(paper)
                 if pdf and os.path.isfile(str(pdf)):
-                    repo_manager.import_pdf(paper, project_name)
+                    paper["pdf_path"] = pdf
+                    repo_path = repo_manager.import_pdf(paper, project_name)
+                    if repo_path:
+                        _update_db_pdf(paper, repo_path)
                     imported += 1
 
+            # 后台自动下载未缓存的论文 PDF（静默，无弹窗）
+            _papers_need_dl = [
+                p for p in papers_to_import
+                if not (p.get("pdf_path") and os.path.isfile(str(p.get("pdf_path"))))
+            ]
+            if _papers_need_dl:
+                def _auto_download():
+                    dl_ok = 0
+                    for paper in _papers_need_dl:
+                        try:
+                            cache_path = downloader.cache_pdf(paper)
+                            if cache_path and os.path.isfile(cache_path):
+                                paper["pdf_path"] = cache_path
+                                repo_path = repo_manager.import_pdf(paper, project_name)
+                                if repo_path:
+                                    _update_db_pdf(paper, repo_path)
+                                dl_ok += 1
+                        except Exception:
+                            pass
+                    if dl_ok:
+                        print(f"[auto-dl] Downloaded {dl_ok}/{len(_papers_need_dl)} papers for '{project_name}'", flush=True)
+                        global _refresh_paper_list_cb
+                        if _refresh_paper_list_cb is not None:
+                            try:
+                                _refresh_paper_list_cb(pid)
+                            except Exception:
+                                pass
+                threading.Thread(target=_auto_download, daemon=True).start()
+
             result_text.value = f"已保存 {n} 篇论文到文献库" + (f"，{imported} 篇 PDF 已导入" if imported else "")
+            if _papers_need_dl:
+                result_text.value += f"（{len(_papers_need_dl)} 篇后台下载中...）"
             result_text.color = ft.Colors.GREEN
             result_text.update()
             dlg.open = False
@@ -1401,6 +1446,7 @@ _sort_ascending = False
 _sort_column = "score"
 _search_list = ft.ListView(expand=True, spacing=0)
 _ai_scored = False  # 当前检索结果是否已 AI 精排
+_refresh_paper_list_cb = None  # 后台下载完成后的刷新回调
 
 
 def _build_search_header():
@@ -2321,9 +2367,13 @@ def build_results_page():
         dlg.open = True
         _page.update()
 
-    def refresh_paper_list():
+    def refresh_paper_list(target_pid=None):
         """从数据库刷新当前课题的论文列表（分页 + 精简控件）。"""
         nonlocal _pagination_page, _sort_mode
+        if target_pid is not None and target_pid != _selected_project_id:
+            return  # 回调来自其他课题，忽略
+        global _refresh_paper_list_cb
+        _refresh_paper_list_cb = refresh_paper_list
         status_val = _status_filter
         sf = None if status_val == "all" else status_val
         papers = library.get_project_papers(_selected_project_id, status_filter=sf) if _selected_project_id else []
@@ -2561,12 +2611,19 @@ def build_results_page():
                 dlg.open = True
                 _page.update()
 
+            # 已下载论文序号+标题变绿
+            pdf_path = p.get("pdf_path", "")
+            has_pdf = bool(pdf_path and os.path.isfile(str(pdf_path)))
+            title_color = ft.Colors.GREEN if has_pdf else None
+
             # ── 精简行布局（每行比原来少 ~5 个 Container）──
             cells = [
-                ft.Text(str(global_i), size=12, width=30),
+                ft.Text(str(global_i), size=12, width=30, color=title_color,
+                        weight=ft.FontWeight.W_600 if has_pdf else ft.FontWeight.W_400),
                 ft.Container(
                     content=ft.Text(title, size=12, max_lines=1,
-                                    overflow=ft.TextOverflow.ELLIPSIS),
+                                    overflow=ft.TextOverflow.ELLIPSIS,
+                                    color=title_color),
                     expand=3, padding=ft.padding.Padding(right=4),
                     on_click=lambda e, p=p: _show_detail_dialog(p),
                 ),
