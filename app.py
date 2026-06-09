@@ -1958,7 +1958,8 @@ def build_results_page():
             _selected_ids.clear()
             upload_progress.value = f"已删除 {n} 篇"
             upload_progress.color = ft.Colors.GREEN
-            upload_progress.update()
+            dlg.open = False
+            dlg.update()
             refresh_paper_list()
 
         def close_dlg(e):
@@ -2350,6 +2351,8 @@ def build_results_page():
                 if match:
                     repo_manager.remove_paper_from_catalog(proj.name, match)
             library.remove_paper_from_project(pp_id)
+            dlg.open = False
+            dlg.update()
             refresh_paper_list()
 
         def close_dlg(e):
@@ -2697,6 +2700,7 @@ def build_results_page():
         nonlocal _selected_project_id, _pagination_page
         _selected_project_id = project_id
         _pagination_page = 0
+        upload_progress.value = ""
         if project_id is None:
             selected_project_title.value = "请选择一个课题"
             paper_count_text.value = ""
@@ -2714,14 +2718,7 @@ def build_results_page():
             else:
                 sort_btn.disabled = True
                 ai_sort_btn.disabled = True
-        selected_project_title.update()
-        paper_count_text.update()
-        sort_btn.update()
-        try:
-            ai_sort_btn.update()
-        except RuntimeError:
-            pass
-        # 课题列表本身未变化，无需 refresh_project_list()
+        refresh_project_list()
         refresh_paper_list()
 
     def _on_read_paper(paper: dict):
