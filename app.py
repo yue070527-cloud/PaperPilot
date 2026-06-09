@@ -667,7 +667,6 @@ def build_project_page():
             ft.dropdown.Option("10", "10 篇"),
             ft.dropdown.Option("20", "20 篇"),
             ft.dropdown.Option("50", "50 篇"),
-            ft.dropdown.Option("100", "100 篇"),
         ],
         value="20",
         width=80,
@@ -2491,9 +2490,30 @@ def build_results_page():
                         pai_reason = _json2.loads(pai_reason_str)
                         tier = str(pai_reason.get("tier", ""))
                     except (_json2.JSONDecodeError, TypeError):
+                        pai_reason = {}
                         tier = ""
                     tier_badge = f" [{tier}]" if tier else ""
                     cparts.append(ft.Text(f"AI 评分: {int(pai_score)}{tier_badge}", size=13, weight=ft.FontWeight.W_600, color=ft.Colors.GREEN))
+                    # 展示各维度理由
+                    dims = [
+                        ("相关性", pai_reason.get("relevance"), pai_reason.get("reason_relevance", "")),
+                        ("方法", pai_reason.get("method"), pai_reason.get("reason_method", "")),
+                        ("创新", pai_reason.get("novelty"), pai_reason.get("reason_novelty", "")),
+                        ("时效", pai_reason.get("recency"), pai_reason.get("reason_recency", "")),
+                    ]
+                    for label, score_val, reason_text in dims:
+                        if reason_text:
+                            score_str = f"{int(score_val)}/10" if score_val is not None else ""
+                            cparts.append(ft.Text(
+                                f"  {label} {score_str}: {reason_text}",
+                                size=12, color=ft.Colors.OUTLINE,
+                            ))
+                    overall = pai_reason.get("overall", "")
+                    if overall:
+                        cparts.append(ft.Text(
+                            f"  综合: {overall}", size=12,
+                            color=ft.Colors.OUTLINE, weight=ft.FontWeight.W_500,
+                        ))
                 cparts.append(ft.Divider(height=8))
                 cparts.append(ft.Text("摘要", size=14, weight=ft.FontWeight.W_600))
                 cparts.append(ft.Text(pabstract, size=12))

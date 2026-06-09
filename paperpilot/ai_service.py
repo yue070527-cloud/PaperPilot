@@ -443,9 +443,9 @@ class AIService:
         "C 可选 40-54：弱相关，可能是背景或相关领域\n"
         "D 不推荐 0-39：基本无关或质量明显有问题\n\n"
         "## 理由写作要求\n"
-        "每个维度的 reason 控制在 1 句话（约 20-30 字），直接点出论文中具体的技术/方法/场景，"
+        "每个维度的 reason 必须写 1-3 句中文，具体引用论文中提到的技术/方法/场景，"
         "解释为什么给这个分数。不要写空洞套话。\n"
-        "reason_overall 是综合判断，一句话说明是否值得读全文及原因。\n\n"
+        "reason_overall 是综合判断，说明是否值得读全文及原因。\n\n"
         "## 无摘要处理\n"
         "如果论文没有摘要（abstract 为空或短于 80 字符），将 method、novelty 两项标为 0，"
         "仅基于标题评估 relevance 和 recency，tier 标注为 'no_abstract'，各 reason 写'仅标题，无法判断'。\n\n"
@@ -480,7 +480,7 @@ class AIService:
         if not self.is_available or not papers:
             return []
 
-        max_papers = min(max_papers, 100)
+        max_papers = min(max_papers, 50)
 
         # 筛选有摘要的论文
         candidates = []
@@ -576,6 +576,7 @@ class AIService:
                     "reason_relevance": str(item.get("reason_relevance", "") or ""),
                     "reason_method": str(item.get("reason_method", "") or ""),
                     "reason_novelty": str(item.get("reason_novelty", "") or ""),
+                    "reason_recency": str(item.get("reason_recency", "") or ""),
                     "overall": str(item.get("reason_overall", "") or ""),
                 },
             })
