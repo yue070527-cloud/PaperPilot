@@ -84,6 +84,22 @@ def _parse_arxiv_result(r) -> dict:
     }
 
 
+# arXiv API 频控：两次请求间隔 ≥ _ARXIV_RATE_LIMIT 秒
+_ARXIV_LAST_CALL = 0.0
+_ARXIV_RATE_LIMIT = 5.0  # arXiv 官方建议 ≤1 req/s，保守取 5s
+
+
+def _wait_arxiv_rate_limit():
+    """在 arXiv API 调用前等待，确保不触发限流。"""
+    global _ARXIV_LAST_CALL
+    elapsed = time.time() - _ARXIV_LAST_CALL
+    if elapsed < _ARXIV_RATE_LIMIT:
+        wait = _ARXIV_RATE_LIMIT - elapsed
+        print(f"[arXiv] 频控等待 {wait:.1f}s...", flush=True)
+        time.sleep(wait)
+    _ARXIV_LAST_CALL = time.time()
+
+
 def _fetch_arxiv_raw(query: str, max_results: int = 30,
                      year_min: str = "", year_max: str = "") -> list[dict]:
     """Fetch papers from arXiv with a raw query string (internal helper).
@@ -93,6 +109,9 @@ def _fetch_arxiv_raw(query: str, max_results: int = 30,
     """
     import concurrent.futures
     import random
+
+    _wait_arxiv_rate_limit()
+
     print(f"[arXiv] 开始抓取: query={query[:80]}... max={max_results}", flush=True)
 
     client = arxiv.Client(num_retries=2, delay_seconds=3)

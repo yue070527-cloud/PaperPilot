@@ -169,42 +169,59 @@ def find_in_all_catalogs(paper: dict) -> list[tuple[str, str, str]]:
 def import_pdf(paper: dict, project_name: str) -> str | None:
     """导入一篇论文的 PDF。
 
-    1. 生成规范文件名，拷贝到 project/pdfs/
-    2. 更新 catalog.json
-    3. 同步到其他已有该 DOI 的课题
+    1. 检查 catalog 是否已有该论文的 PDF → 已有且文件存在则直接返回
+    2. 生成规范文件名，拷贝到 project/pdfs/
+    3. 更新 catalog.json
+    4. 同步到其他已有该论文的课题
     """
+    pdf_dir = _pdf_dir(project_name)
+    key = _make_key(paper)
+
+    # ① 已有 PDF 且文件存在 → 直接返回，避免重复拷贝
+    if key:
+        catalog = load_catalog(project_name)
+        existing = catalog.get("papers", {}).get(key, {})
+        existing_name = existing.get("pdf_name", "")
+        if existing_name:
+            existing_path = pdf_dir / existing_name
+            if existing_path.is_file():
+                return str(existing_path)
+
+    # ② 需要导入：源文件必须有效
     src = paper.get("pdf_path")
     if not src or not os.path.isfile(src):
         return None
 
-    pdf_dir = _pdf_dir(project_name)
     pdf_dir.mkdir(parents=True, exist_ok=True)
 
     pdf_name = make_pdf_name(paper)
     dst = str(pdf_dir / pdf_name)
 
-    # 重名去重：同名但不同文件时加 hash 后缀
+    # ③ 同名文件：大小相同 → 跳过拷贝；大小不同 → 同 key 在 ① 已命中，
+    #    到这说明是同名不同论文，加 hash 后缀避免覆盖
     if os.path.isfile(dst):
-        existing_size = os.path.getsize(dst)
-        src_size = os.path.getsize(src)
-        if existing_size != src_size:
-            base = os.path.splitext(pdf_name)[0][:190]
-            key = _make_key(paper) or hashlib.md5(src.encode()).hexdigest()[:8]
-            suffix = key.replace("/", "_").replace(":", "_")[:12]
-            pdf_name = f"{base}_{suffix}.pdf"
-            dst = str(pdf_dir / pdf_name)
+        if os.path.getsize(dst) == os.path.getsize(src):
+            add_to_catalog(project_name, paper, pdf_name)
+            if dst != src:
+                _sync_to_other_projects(paper, dst, project_name)
+            return dst
+        base = os.path.splitext(pdf_name)[0][:190]
+        suffix = (key or hashlib.md5(str(src).encode()).hexdigest()[:8])
+        suffix = suffix.replace("/", "_").replace(":", "_")[:12]
+        pdf_name = f"{base}_{suffix}.pdf"
+        dst = str(pdf_dir / pdf_name)
 
-    # 拷贝
+    # ④ 拷贝
     if not os.path.isfile(dst):
         try:
             shutil.copy2(src, dst)
         except OSError:
-            dst = src  # 拷贝失败，保留原始路径
+            dst = src
 
-    # 更新本课题 catalog（不管拷贝是否成功都更新）
+    # ⑤ 更新 catalog
     add_to_catalog(project_name, paper, pdf_name)
 
-    # 同步到其他已有该论文的课题（仅当拷贝成功时）
+    # ⑥ 同步到其他已有该论文的课题
     if dst != src:
         _sync_to_other_projects(paper, dst, project_name)
 

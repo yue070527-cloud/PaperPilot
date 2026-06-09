@@ -250,11 +250,11 @@ def _run_pipeline(max_per: int, year_min: str, year_max: str,
     print(f"[PaperPilot] 副关键词: {secondary_en}")
     print(f"[PaperPilot] 普通关键词: {regular_en}")
 
-    # 3. 多主关键词独立检索
+    # 3. arXiv 检索（单次级联，避免多路并发触发限流）
     if use_arxiv:
         state.status_text = "arXiv 抓取中..."
         try:
-            arxiv_papers = fetch_multi_primary(
+            arxiv_papers, arxiv_level = fetch_with_cascade(
                 primary_kw=primary_kw_list,
                 secondary_kw=secondary_en,
                 regular_kw=regular_en,
@@ -264,7 +264,7 @@ def _run_pipeline(max_per: int, year_min: str, year_max: str,
                 year_min=year_min,
                 year_max=year_max,
             )
-            print(f"[PaperPilot] arXiv 返回: {len(arxiv_papers)} 篇 ({len(primary_kw_list)}路主关键词)")
+            print(f"[PaperPilot] arXiv 返回: {len(arxiv_papers)} 篇 (level={arxiv_level})")
             papers += arxiv_papers
         except Exception as e:
             print(f"[PaperPilot] arXiv 失败: {e}")

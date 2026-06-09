@@ -358,6 +358,36 @@ def set_paper_pdf_path(doi: str, pdf_path: str) -> bool:
         session.close()
 
 
+def set_paper_pdf_path_by_title(title: str, pdf_path: str,
+                                year: int | None = None) -> bool:
+    """根据标题（+ 年份）设置论文 PDF 路径，DOI 匹配失败时的回退。
+
+    Args:
+        title: 论文标题
+        pdf_path: PDF 文件绝对路径
+        year: 可选，论文年份（提高匹配精度）
+
+    Returns:
+        是否成功更新
+    """
+    session = _get_session()
+    try:
+        q = session.query(Paper).filter(Paper.title == title)
+        if year is not None:
+            q = q.filter(Paper.year == year)
+        paper = q.first()
+        if not paper:
+            return False
+        paper.pdf_path = pdf_path
+        session.commit()
+        return True
+    except Exception:
+        session.rollback()
+        return False
+    finally:
+        session.close()
+
+
 def update_paper_status(project_paper_id: int, status: str) -> bool:
     """更新论文阅读状态。
 
