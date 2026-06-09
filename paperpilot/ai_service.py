@@ -443,9 +443,9 @@ class AIService:
         "C 可选 40-54：弱相关，可能是背景或相关领域\n"
         "D 不推荐 0-39：基本无关或质量明显有问题\n\n"
         "## 理由写作要求\n"
-        "每个维度的 reason 必须写 1-3 句中文，具体引用论文中提到的技术/方法/场景，"
-        "解释为什么给这个分数。不要写空洞的套话如'本论文在该维度表现良好'。\n"
-        "reason_overall 是所有维度中最关键的一个判断，用于决策是否值得阅读全文。\n\n"
+        "每个维度的 reason 控制在 1 句话（约 20-30 字），直接点出论文中具体的技术/方法/场景，"
+        "解释为什么给这个分数。不要写空洞套话。\n"
+        "reason_overall 是综合判断，一句话说明是否值得读全文及原因。\n\n"
         "## 无摘要处理\n"
         "如果论文没有摘要（abstract 为空或短于 80 字符），将 method、novelty 两项标为 0，"
         "仅基于标题评估 relevance 和 recency，tier 标注为 'no_abstract'，各 reason 写'仅标题，无法判断'。\n\n"
@@ -461,6 +461,9 @@ class AIService:
         "注意：基于摘要内容判断，不要编造。"
     )
 
+    # 单批最多 25 篇，确保 max_tokens 不超 DeepSeek 8192 上限
+    _SCORE_CHUNK_SIZE = 25
+
     def score_papers(self, topic_desc: str, papers: list[dict],
                      max_papers: int = 20) -> list[dict]:
         """AI 精排：基于摘要批量打分。
@@ -468,7 +471,7 @@ class AIService:
         Args:
             topic_desc: 课题描述
             papers: paper dict 列表（仅含摘要）
-            max_papers: 最多评分篇数（默认 20，安全上限 100）
+            max_papers: 最多评分篇数（默认 20，上限 100）
 
         Returns:
             [{index, ai_score, ai_reason: {relevance, method, novelty, overall}}, ...]
@@ -477,7 +480,7 @@ class AIService:
         if not self.is_available or not papers:
             return []
 
-        max_papers = min(max_papers, 100)  # 安全上限
+        max_papers = min(max_papers, 100)
 
         # 筛选有摘要的论文
         candidates = []
@@ -491,9 +494,32 @@ class AIService:
         if not candidates:
             return []
 
+        # 拆批：每批最多 _SCORE_CHUNK_SIZE 篇
+        chunks = [
+            candidates[i:i + self._SCORE_CHUNK_SIZE]
+            for i in range(0, len(candidates), self._SCORE_CHUNK_SIZE)
+        ]
+        all_results = []
+        total = len(candidates)
+
+        for chunk_idx, chunk in enumerate(chunks):
+            chunk_results = self._score_chunk(topic_desc, chunk, chunk_idx, total)
+            all_results.extend(chunk_results)
+
+        all_results.sort(key=lambda x: x["ai_score"], reverse=True)
+        return all_results
+
+    def _score_chunk(
+        self, topic_desc: str, chunk: list[tuple[int, dict]],
+        chunk_idx: int, total: int,
+    ) -> list[dict]:
+        """对单批论文打分，返回 [{index, ai_score, ...}, ...]."""
+        chunk_size = len(chunk)
+
         # 构建输入
-        lines = [f"课题描述：{topic_desc}\n\n—— 待评分论文 ——"]
-        for idx, (orig_i, p) in enumerate(candidates):
+        header = f"课题描述：{topic_desc}\n\n—— 待评分论文（第 {chunk_idx + 1} 批，共 {chunk_size} 篇）——"
+        lines = [header]
+        for idx, (orig_i, p) in enumerate(chunk):
             title = (p.get("title") or "无标题")[:120]
             abstract = (p.get("abstract") or "")[:800]
             lines.append(f"\n[{idx}] {title}\n摘要：{abstract}")
@@ -503,11 +529,15 @@ class AIService:
             {"role": "user", "content": "\n".join(lines)},
         ]
 
-        # 输出 token 按篇数动态分配（每篇 ~200 tokens，含 4 维度中文理由）+ 500 余量
-        dyn_tokens = max(4000, len(candidates) * 200 + 500)
-        content = self._call_api(messages, temperature=0.2, max_tokens=dyn_tokens, timeout=120)
+        # token 配额：每篇 250 + 500 余量，上限 8000（DeepSeek 8192 安全边际）
+        dyn_tokens = min(8000, chunk_size * 250 + 500)
+        content = self._call_api(
+            messages, temperature=0.2, max_tokens=dyn_tokens, timeout=120,
+        )
         if not content:
-            logger.warning("score_papers: API returned empty response")
+            logger.warning(
+                f"score_papers: chunk {chunk_idx} API returned empty response"
+            )
             return []
         raw = self._parse_json_response(content)
 
@@ -520,22 +550,20 @@ class AIService:
             items = raw["results"]
         else:
             logger.warning(
-                f"score_papers: JSON parse returned unexpected type "
-                f"{type(raw).__name__}, content preview: {content[:200]}"
+                f"score_papers: chunk {chunk_idx} parse returned "
+                f"unexpected type {type(raw).__name__}, "
+                f"content preview: {content[:200]}"
             )
             return []
-        logger.info(
-            f"score_papers: scored {len(items)}/{len(candidates)} papers"
-        )
 
         results = []
         for item in items:
             if not isinstance(item, dict):
                 continue
             idx = item.get("index", -1)
-            if idx < 0 or idx >= len(candidates):
+            if idx < 0 or idx >= chunk_size:
                 continue
-            orig_i, paper = candidates[idx]
+            orig_i, paper = chunk[idx]
             results.append({
                 "index": orig_i,
                 "ai_score": int(item.get("score", 0)),
@@ -552,7 +580,10 @@ class AIService:
                 },
             })
 
-        results.sort(key=lambda x: x["ai_score"], reverse=True)
+        logger.info(
+            f"score_papers: chunk {chunk_idx} scored "
+            f"{len(results)}/{chunk_size} papers"
+        )
         return results
 
     _CHAT_SYSTEM = (
