@@ -71,8 +71,9 @@ class AppState:
 state = AppState()
 _page: ft.Page | None = None
 _refresh_library = None  # 文献页刷新函数引用，page_switcher 触发
-_search_multi = False  # 检索结果多选模式
 _search_selected_ids = set()  # 检索结果多选已选索引
+_agent_paper_selection: list = []  # 当前选中的论文列表，Agent 发送时自动作为上下文
+_clear_library_ui = None  # Agent 发消息后清除文献库复选框的回调
 
 # ── Agent 对话面板（全局常驻右侧）──
 _agent_msg_list: ft.ListView | None = None
@@ -102,6 +103,76 @@ def _agent_theme_colors():
         }
 
 
+def _reformat_tables(text: str) -> str:
+    """将 markdown 表格转为窄面板友好的列表格式。
+
+    3 列以上的表格会被转为列表：
+      原文: | 论文 | 方法 | 年份 |
+            |------|------|------|
+            | A    | BERT | 2023 |
+      输出: - **A**: 方法=BERT · 年份=2023
+
+    2 列以内的表格保持原始格式。
+    """
+    lines = text.split('\n')
+    result = []
+    header: list[str] = []
+    rows: list[list[str]] = []
+    in_table = False
+
+    def _flush():
+        nonlocal header, rows, in_table
+        if not rows:
+            header, rows = [], []
+            in_table = False
+            return
+        if len(header) <= 2:
+            # 窄表保持原样
+            result.append('| ' + ' | '.join(header) + ' |')
+            result.append('|' + '|'.join(['---' for _ in header]) + '|')
+            for row in rows:
+                padded = row + [''] * (len(header) - len(row))
+                result.append('| ' + ' | '.join(padded[:len(header)]) + ' |')
+        else:
+            result.append('')
+            for row in rows:
+                parts = []
+                first = row[0] if row else ''
+                for j in range(1, min(len(row), len(header))):
+                    val = row[j]
+                    if val:
+                        h = header[j] if j < len(header) else ''
+                        parts.append(f'{h}={val}' if h else val)
+                if first and parts:
+                    result.append(f'- **{first}**: {" · ".join(parts)}')
+                elif first:
+                    result.append(f'- **{first}**')
+                elif parts:
+                    result.append(f'- {" · ".join(parts)}')
+            result.append('')
+        header, rows = [], []
+        in_table = False
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('|') and '|' in stripped[1:]:
+            cells = [c.strip() for c in stripped.split('|')[1:-1]]
+            if not in_table:
+                in_table = True
+                header = cells
+            elif not all(c.replace('-', '').replace(':', '').strip() == '' for c in cells):
+                rows.append(cells)
+        else:
+            if in_table:
+                _flush()
+            result.append(line)
+
+    if in_table:
+        _flush()
+
+    return '\n'.join(result)
+
+
 def send_agent_message(text: str, role: str = "user"):
     """向 Agent 对话面板发送一条消息。"""
     global _agent_msg_list
@@ -117,10 +188,22 @@ def send_agent_message(text: str, role: str = "user"):
         fg = colors["agent_text"]
         label = "Agent"
 
+    if role == "agent":
+        try:
+            body = ft.Markdown(
+                _reformat_tables(text),
+                selectable=True,
+                extension_set="gitHubWeb",
+            )
+        except Exception:
+            body = ft.Text(text, size=13, color=fg, no_wrap=False, selectable=True)
+    else:
+        body = ft.Text(text, size=13, color=fg, no_wrap=False, selectable=True)
+
     bubble = ft.Container(
         content=ft.Column([
             ft.Text(label, size=11, color=fg, weight=ft.FontWeight.W_600, opacity=0.7),
-            ft.Text(text, size=13, color=fg, no_wrap=False, selectable=True),
+            body,
         ], spacing=2),
         bgcolor=bg,
         border_radius=12,
@@ -134,7 +217,176 @@ def send_agent_message(text: str, role: str = "user"):
     try:
         _agent_msg_list.update()
     except RuntimeError:
-        pass  # 控件尚未挂载到页面，跳过更新
+        pass
+
+
+def _show_thinking_bubble():
+    """在消息列表末尾添加一个"AI 正在思考"动画气泡。
+
+    Returns:
+        (content_text, stop_event) — 调用方在拿到结果后 stop_event.set()
+        停止动画，然后直接改 content_text.value 原地替换文字。
+    """
+    global _agent_msg_list
+    colors = _agent_theme_colors()
+    fg = colors["agent_text"]
+
+    content_text = ft.Text(
+        "AI 正在思考", size=13, color=fg,
+        no_wrap=False, selectable=True, italic=True,
+    )
+    bubble = ft.Container(
+        content=ft.Column([
+            ft.Text("Agent", size=11, color=fg, weight=ft.FontWeight.W_600, opacity=0.7),
+            content_text,
+        ], spacing=2),
+        bgcolor=colors["agent_bubble"],
+        border_radius=12,
+        padding=ft.padding.Padding(left=12, top=8, right=12, bottom=8),
+        expand=True,
+        clip_behavior=ft.ClipBehavior.HARD_EDGE,
+    )
+
+    _agent_msg_list.controls.append(bubble)
+    if len(_agent_msg_list.controls) > 200:
+        _agent_msg_list.controls.pop(0)
+    try:
+        _agent_msg_list.update()
+    except RuntimeError:
+        pass
+
+    stop_event = threading.Event()
+
+    def _animate():
+        dots = ["", ".", "..", "..."]
+        i = 0
+        while not stop_event.is_set():
+            content_text.value = f"AI 正在思考{dots[i % 4]}"
+            i += 1
+            try:
+                content_text.update()
+            except RuntimeError:
+                pass
+            stop_event.wait(0.5)
+
+    threading.Thread(target=_animate, daemon=True).start()
+    return content_text, stop_event
+
+
+def _scroll_agent_to_bottom():
+    """将 Agent 消息列表滚到底部。"""
+    if _agent_msg_list is None:
+        return
+
+    async def _do():
+        await asyncio.sleep(0.3)
+        await _agent_msg_list.scroll_to(offset=-1, duration=0)
+
+    try:
+        asyncio.get_running_loop().create_task(_do())
+    except RuntimeError:
+        pass
+
+
+def _trigger_agent_chat(message: str, papers: list | None = None):
+    """统一的 Agent 对话入口：思考动画 + 后台调用 chat() + 原地显示回复。
+
+    供 _on_agent_send 和 _trigger_compare_papers 共用。
+    """
+    global _agent_project_id, _agent_project_name, _agent_topic_desc, _ai_service
+    global _agent_paper_selection, _search_selected_ids
+
+    # 如果用户已手动选了论文，自动作为上下文
+    if not papers and _agent_paper_selection:
+        papers = list(_agent_paper_selection)
+
+    # 加载课题论文列表（供 chat() 自动检测 @引用 / 标题匹配）
+    _proj_papers = None
+    if _agent_project_id is not None:
+        try:
+            _proj_papers = library.get_project_papers(_agent_project_id)
+        except Exception:
+            pass
+
+    # 发送后清空选中状态
+    _agent_paper_selection.clear()
+    _search_selected_ids.clear()
+    if _clear_library_ui:
+        _clear_library_ui()
+    # 清除检索结果复选框 UI
+    for cb in _search_checkboxes:
+        cb.value = False
+        try:
+            cb.update()
+        except RuntimeError:
+            pass
+    if _search_select_count_ref:
+        _search_select_count_ref.value = "未选中"
+        try:
+            _search_select_count_ref.update()
+        except RuntimeError:
+            pass
+    if _search_compare_btn:
+        _search_compare_btn.visible = False
+        try:
+            _search_compare_btn.update()
+        except RuntimeError:
+            pass
+
+    content_text, thinking_stop = _show_thinking_bubble()
+
+    def _bg_chat():
+        try:
+            result = _ai_service.chat(
+                project_id=_agent_project_id or 0,
+                project_name=_agent_project_name or "通用",
+                message=message,
+                topic_desc=_agent_topic_desc,
+                papers=papers,
+                project_papers=_proj_papers,
+            )
+            reply = result.get("reply", "抱歉，AI 服务暂时无法回复。")
+
+            thinking_stop.set()
+            content_text.italic = False
+            content_text.value = reply
+            try:
+                content_text.update()
+            except RuntimeError:
+                pass
+
+        except Exception as ex:
+            thinking_stop.set()
+            content_text.italic = False
+            err_msg = f"出错了：{ex}"
+            content_text.value = err_msg
+            try:
+                content_text.update()
+            except RuntimeError:
+                pass
+            if _agent_project_id is not None:
+                _ai_service.log_message(
+                    _agent_project_id, _agent_project_name or "通用",
+                    "assistant", err_msg, _agent_topic_desc)
+
+    threading.Thread(target=_bg_chat, daemon=True).start()
+
+
+def _trigger_compare_papers(papers: list, source: str = "search"):
+    """在 Agent 面板发起论文对比分析。"""
+    n = len(papers)
+    if n < 2:
+        return
+    source_label = "检索结果" if source == "search" else "文献库"
+    visible_msg = f"对比分析 {n} 篇论文（来源：{source_label}）"
+    send_agent_message(visible_msg, role="user")
+
+    prompt = (
+        f"请对以下 {n} 篇论文进行全面的对比分析，"
+        f"从研究目标、方法、主要发现、创新点和局限性五个维度进行比较。"
+        f"请用表格或分点形式组织输出，方便快速理解各论文之间的异同。"
+    )
+    _trigger_agent_chat(prompt, papers=papers)
 
 
 def clear_agent_messages():
@@ -173,6 +425,9 @@ def load_agent_conversation():
         role = "user" if msg["role"] == "user" else "agent"
         send_agent_message(msg["content"], role=role)
 
+    _scroll_agent_to_bottom()
+
+
 
 def set_agent_project(project_id: int | None, project_name: str = "",
                       topic_desc: str = ""):
@@ -192,6 +447,7 @@ def set_agent_project(project_id: int | None, project_name: str = "",
 _search_select_count_ref = None  # 多选计数 UI
 _search_check_handler = None  # _on_search_check_one 引用
 _search_checkboxes: list = []  # 复选框控件引用，用于全选免重建
+_search_compare_btn = None  # 检索结果"对比分析"按钮引用
 results_summary: ft.Text | None = None
 detail_sidebar: ft.Container | None = None  # 右侧文献详情侧边栏
 _sidebar_busy = False  # 防竞态：侧边栏正在更新时拦截重复操作
@@ -596,24 +852,42 @@ def build_project_page():
     summary = ft.Text(_summary_text(), size=14)
     results_summary = summary
 
-    # ── 检索结果多选 ──
-    global _search_multi, _search_selected_ids
-    _search_multi = False
+    # ── 检索结果多选（始终可见）──
     _search_selected_ids = set()
 
-    search_multi_toggle = ft.TextButton(
-        content=ft.Text("多选", size=13),
-        icon=ft.Icons.CHECKLIST,
+    search_select_count = ft.Text("未选中", size=13)
+    search_compare_btn = ft.OutlinedButton(
+        content=ft.Text("对比分析"),
+        icon=ft.Icons.COMPARE,
+        tooltip="对比分析选中的论文（至少 2 篇）",
         visible=False,
+        disabled=True,
+        style=ft.ButtonStyle(padding=ft.padding.Padding(left=14, top=6, right=14, bottom=6)),
     )
-    search_select_count = ft.Text("", size=13)
-    search_select_all_cb = ft.Checkbox(label="全选", visible=False)
+    search_select_all_cb = ft.Checkbox(label="全选")
 
     def _update_search_count():
-        global _search_select_count_ref
+        global _search_select_count_ref, _search_compare_btn, _agent_paper_selection
+        n = len(_search_selected_ids)
         if _search_select_count_ref:
-            _search_select_count_ref.value = f"已选 {len(_search_selected_ids)} 篇"
+            _search_select_count_ref.value = f"已选 {n} 篇" if n else "未选中"
             _search_select_count_ref.update()
+        if _search_compare_btn:
+            _search_compare_btn.visible = (n >= 2)
+            try:
+                _search_compare_btn.update()
+            except RuntimeError:
+                pass
+        save_to_library_btn.content = ft.Text("保存选中" if n else "保存到文献库")
+        try:
+            save_to_library_btn.update()
+        except RuntimeError:
+            pass
+        # 同步到 Agent 自动上下文
+        if n:
+            _agent_paper_selection = [state.scores[i][0] for i in sorted(_search_selected_ids) if i < len(state.scores)]
+        else:
+            _agent_paper_selection.clear()
 
     def _on_search_select_all(e):
         checked = e.control.value
@@ -632,9 +906,7 @@ def build_project_page():
             _search_selected_ids.add(idx)
         else:
             _search_selected_ids.discard(idx)
-        if _search_select_count_ref:
-            _search_select_count_ref.value = f"已选 {len(_search_selected_ids)} 篇"
-            _search_select_count_ref.update()
+        _update_search_count()
 
     global _search_select_count_ref, _search_check_handler
     _search_select_count_ref = search_select_count
@@ -642,25 +914,17 @@ def build_project_page():
 
     search_select_all_cb.on_change = _on_search_select_all
 
-    def _on_toggle_search_multi(e):
-        global _search_multi
-        _search_multi = not _search_multi
-        _search_selected_ids.clear()
-        if _search_multi:
-            search_multi_toggle.text = "退出多选"
-            search_multi_toggle.icon = ft.Icons.CLOSE
-            save_to_library_btn.text = "保存选中"
-        else:
-            search_multi_toggle.text = "多选"
-            search_multi_toggle.icon = ft.Icons.CHECKLIST
-            save_to_library_btn.text = "保存到文献库"
-        search_select_all_cb.visible = _search_multi
-        search_select_count.visible = _search_multi
-        refresh_results_table()
-        search_multi_toggle.update()
-        save_to_library_btn.update()
 
-    search_multi_toggle.on_click = _on_toggle_search_multi
+    def _on_search_compare(e):
+        """对比分析检索结果选中的论文。"""
+        if len(_search_selected_ids) < 2:
+            return
+        sel = [state.scores[i][0] for i in sorted(_search_selected_ids) if i < len(state.scores)]
+        _trigger_compare_papers(sel, source="search")
+
+    search_compare_btn.on_click = _on_search_compare
+    global _search_compare_btn
+    _search_compare_btn = search_compare_btn
 
     ai_limit_dd = ft.Dropdown(
         options=[
@@ -705,7 +969,7 @@ def build_project_page():
         # 格式: [(original_index, paper_dict), ...]
         candidates_idx: list[tuple[int, dict]] = []
 
-        if _search_multi and _search_selected_ids:
+        if _search_selected_ids:
             for i in sorted(_search_selected_ids):
                 if i >= len(state.scores):
                     continue
@@ -731,7 +995,7 @@ def build_project_page():
             _ai_score_status.update()
             return
 
-        source_label = "已选" if (_search_multi and _search_selected_ids) else f"前 {limit}"
+        source_label = "已选" if _search_selected_ids else f"前 {limit}"
         ai_score_btn.disabled = True
         ai_score_btn.content = ft.Text("AI 评分中...")
         _ai_score_status.value = f"正在分析{source_label} {len(candidates_idx)} 篇论文..."
@@ -810,10 +1074,7 @@ def build_project_page():
     )
 
     def on_save_to_library(e):
-        """弹出对话框，选择课题保存检索结果（多选模式下仅保存选中论文）。"""
-        if _search_multi and not _search_selected_ids:
-            return  # 不弹窗，静默忽略
-
+        """弹出对话框，选择课题保存检索结果。有选中时保存选中，否则保存全部。"""
         projects = library.get_all_projects()
         project_options = [ft.dropdown.Option(str(p.id), p.name) for p in projects]
         project_dd = ft.Dropdown(
@@ -883,8 +1144,8 @@ def build_project_page():
                 result_text.update()
                 return
 
-            # 多选模式下仅保存选中论文
-            if _search_multi:
+            # 有选中时保存选中，否则保存全部
+            if _search_selected_ids:
                 sel_papers = [state.scores[i][0] for i in _search_selected_ids if i < len(state.scores)]
                 sel_scores = [(state.scores[i][0], state.scores[i][1]) for i in _search_selected_ids if i < len(state.scores)]
                 n = library.save_papers_to_project(pid, sel_papers, sel_scores)
@@ -963,7 +1224,7 @@ def build_project_page():
         dlg = ft.AlertDialog(
             title=ft.Text("保存到文献库"),
             content=ft.Column([
-                ft.Text(f"将 {len(_search_selected_ids) if _search_multi else len(state.scores)} 篇检索结果保存到："),
+                ft.Text(f"将 {len(_search_selected_ids) if _search_selected_ids else len(state.scores)} 篇检索结果保存到："),
                 save_mode,
                 project_dd,
                 new_name_field,
@@ -991,9 +1252,9 @@ def build_project_page():
         ft.Text("检索结果", size=22, weight=ft.FontWeight.W_600),
         summary,
         ft.Row([
-            search_multi_toggle,
             search_select_all_cb,
             search_select_count,
+            search_compare_btn,
             ai_limit_dd,
             ai_score_btn,
             _ai_score_status,
@@ -1145,7 +1406,6 @@ def build_project_page():
                     state.status_text = f"完成！共 {len(_result['scores'])} 篇"
                     results_area.visible = True
                     save_to_library_btn.visible = True
-                    search_multi_toggle.visible = True
                     ai_score_btn.visible = _ai_service.is_available
                     ai_limit_dd.visible = _ai_service.is_available
                     global _ai_scored
@@ -1469,7 +1729,8 @@ def _build_search_header():
         )
 
     if _ai_scored:
-        cols = [_hdr("#", None, width=34),
+        cols = [_hdr("", None, width=38),   # 复选框占位
+                _hdr("#", None, width=34),
                 _hdr("标题", "title", expand=4),
                 _hdr("作者", "authors", expand=2),
                 _hdr("年份", "year", width=52),
@@ -1479,7 +1740,8 @@ def _build_search_header():
                 _hdr("AI得分", None, width=52),
                 _hdr("类型", None, width=54)]
     else:
-        cols = [_hdr("#", None, width=34),
+        cols = [_hdr("", None, width=38),   # 复选框占位
+                _hdr("#", None, width=34),
                 _hdr("标题", "title", expand=4),
                 _hdr("作者", "authors", expand=2),
                 _hdr("年份", "year", width=52),
@@ -1642,16 +1904,15 @@ def refresh_results_table():
                 _badge_cell(paper),
             ]
 
-        if _search_multi:
-            is_checked = i in _search_selected_ids
-            cb = ft.Checkbox(
-                value=is_checked,
-                on_change=lambda e, idx=i: _search_check_handler(e, idx),
-                scale=0.85,
-            )
-            _search_checkboxes.append(cb)
-            cells.insert(0, ft.Container(content=cb, width=34,
-                         padding=ft.padding.Padding(left=4)))
+        is_checked = i in _search_selected_ids
+        cb = ft.Checkbox(
+            value=is_checked,
+            on_change=lambda e, idx=i: _search_check_handler(e, idx),
+            scale=0.85,
+        )
+        _search_checkboxes.append(cb)
+        cells.insert(0, ft.Container(content=cb, width=34,
+                     padding=ft.padding.Padding(left=4)))
 
         row = ft.Container(
             content=ft.Row(cells, spacing=0),
@@ -1877,16 +2138,20 @@ def build_results_page():
 
     empty_hint = ft.Text("", size=13, color=ft.Colors.OUTLINE)
 
-    # ── 多选模式 ──
-    _multi_select = False
+    # ── 多选（始终可见）──
     _selected_ids: set[int] = set()
+    _compare_btn = None  # 文献库"对比分析"按钮引用
 
-    multi_select_bar = ft.Row(visible=False, spacing=8)
-    multi_select_toggle = ft.TextButton(
-        content=ft.Text("多选", size=13),
-        icon=ft.Icons.CHECKLIST,
+    multi_select_bar = ft.Row(visible=True, spacing=8)
+    multi_select_count = ft.Text("未选中", size=13)
+    compare_btn = ft.OutlinedButton(
+        content=ft.Text("对比分析"),
+        icon=ft.Icons.COMPARE,
+        tooltip="对比分析选中的论文（至少 2 篇）",
+        visible=False,
+        disabled=True,
+        style=ft.ButtonStyle(padding=ft.padding.Padding(left=14, top=6, right=14, bottom=6)),
     )
-    multi_select_count = ft.Text("", size=13)
 
     def _build_library_header():
         """构建文献库列表表头。"""
@@ -1899,7 +2164,8 @@ def build_results_page():
                 border=ft.border.Border(bottom=ft.BorderSide(1, ft.Colors.OUTLINE_VARIANT)),
                 clip_behavior=ft.ClipBehavior.HARD_EDGE,
             )
-        cols = [_hdr("#", width=30),
+        cols = [_hdr("", width=38),   # 复选框占位
+                _hdr("#", width=30),
                 _hdr("标题", expand=3),
                 _hdr("作者", expand=2),
                 _hdr("年份", width=44),
@@ -1908,21 +2174,6 @@ def build_results_page():
                 _hdr("状态", width=60),
                 _hdr("操作", width=120)]
         return ft.Row(cols, spacing=0)
-
-    def on_toggle_multi_select(e):
-        nonlocal _multi_select
-        _multi_select = not _multi_select
-        _selected_ids.clear()
-        if _multi_select:
-            multi_select_toggle.text = "退出多选"
-            multi_select_toggle.icon = ft.Icons.CLOSE
-        else:
-            multi_select_toggle.text = "多选"
-            multi_select_toggle.icon = ft.Icons.CHECKLIST
-        multi_select_bar.visible = _multi_select
-        refresh_paper_list()
-        multi_select_toggle.update()
-        multi_select_bar.update()
 
     def on_select_all(e):
         if e.control.value:
@@ -1939,8 +2190,31 @@ def build_results_page():
         update_count()
 
     def update_count():
-        multi_select_count.value = f"已选 {len(_selected_ids)} 篇"
+        nonlocal _compare_btn
+        n = len(_selected_ids)
+        multi_select_count.value = f"已选 {n} 篇" if n else "未选中"
         multi_select_count.update()
+        if _compare_btn:
+            _compare_btn.visible = (n >= 2)
+            try:
+                _compare_btn.update()
+            except RuntimeError:
+                pass
+        # 同步到 Agent 自动上下文
+        global _agent_paper_selection
+        if n:
+            _agent_paper_selection = [p for p in _project_papers if p["project_paper_id"] in _selected_ids]
+        else:
+            _agent_paper_selection.clear()
+
+    def _clear_library():
+        """Agent 发消息后清除文献库选中状态。"""
+        _selected_ids.clear()
+        update_count()
+        refresh_paper_list()
+
+    global _clear_library_ui
+    _clear_library_ui = _clear_library
 
     def on_batch_delete(e):
         if not _selected_ids:
@@ -1961,6 +2235,7 @@ def build_results_page():
             dlg.open = False
             dlg.update()
             refresh_paper_list()
+            threading.Timer(3.0, lambda: setattr(upload_progress, "value", "") or upload_progress.update()).start()
 
         def close_dlg(e):
             dlg.open = False; dlg.update()
@@ -1977,7 +2252,16 @@ def build_results_page():
         dlg.open = True
         _page.update()
 
-    multi_select_toggle.on_click = on_toggle_multi_select
+
+    def _on_library_compare(e):
+        """对比分析文献库选中的论文。"""
+        if len(_selected_ids) < 2:
+            return
+        sel = [p for p in _project_papers if p["project_paper_id"] in _selected_ids]
+        _trigger_compare_papers(sel, source="library")
+
+    compare_btn.on_click = _on_library_compare
+    _compare_btn = compare_btn
 
     select_all_cb = ft.Checkbox(
         label="全选",
@@ -1989,6 +2273,7 @@ def build_results_page():
     multi_select_bar.controls = [
         _select_all_ref,
         multi_select_count,
+        compare_btn,
         ft.FilledTonalButton(
             content=ft.Text("删除选中"), icon=ft.Icons.DELETE,
             on_click=on_batch_delete,
@@ -2033,8 +2318,8 @@ def build_results_page():
             upload_progress.update()
             return
 
-        # 多选模式下仅处理选中的论文
-        if _multi_select and _selected_ids:
+        # 有选中时仅处理选中的论文
+        if _selected_ids:
             papers = [p for p in all_papers if p["project_paper_id"] in _selected_ids]
             if not papers:
                 upload_progress.value = "未选中任何论文"
@@ -2133,8 +2418,8 @@ def build_results_page():
             upload_progress.update()
             return
 
-        # 多选模式下仅处理选中的论文
-        if _multi_select and _selected_ids:
+        # 有选中时仅处理选中的论文
+        if _selected_ids:
             papers = [p for p in all_papers if p["project_paper_id"] in _selected_ids]
             if not papers:
                 upload_progress.value = "未选中任何论文"
@@ -2619,6 +2904,29 @@ def build_results_page():
             has_pdf = bool(pdf_path and os.path.isfile(str(pdf_path)))
             title_color = ft.Colors.GREEN if has_pdf else None
 
+            # ── AI 评分 reasons tooltip ──
+            _ai_tooltip = None
+            if ai_score_val is not None:
+                _reason_str = p.get("ai_reason") or ""
+                try:
+                    import json as _json3
+                    _reason = _json3.loads(_reason_str)
+                    _tt_lines = []
+                    if _reason.get("reason_relevance"):
+                        _tt_lines.append(f"相关性：{_reason['reason_relevance']}")
+                    if _reason.get("reason_method"):
+                        _tt_lines.append(f"方法：{_reason['reason_method']}")
+                    if _reason.get("reason_novelty"):
+                        _tt_lines.append(f"创新：{_reason['reason_novelty']}")
+                    if _reason.get("reason_recency"):
+                        _tt_lines.append(f"时效：{_reason['reason_recency']}")
+                    if _reason.get("overall"):
+                        _tt_lines.append(f"总评：{_reason['overall']}")
+                    if _tt_lines:
+                        _ai_tooltip = "\n".join(_tt_lines)
+                except Exception:
+                    pass
+
             # ── 精简行布局（每行比原来少 ~5 个 Container）──
             cells = [
                 ft.Text(str(global_i), size=12, width=30, color=title_color,
@@ -2636,7 +2944,8 @@ def build_results_page():
                 ft.Text(
                     str(int(ai_score_val)) if ai_score_val is not None else "—",
                     size=12, color=ai_color,
-                    weight=ft.FontWeight.W_600, width=42),
+                    weight=ft.FontWeight.W_600, width=42,
+                    tooltip=_ai_tooltip),
                 ft.Text(
                     f"{ce_score_val:.3f}",
                     size=12, color=ce_color, width=48),
@@ -2644,14 +2953,13 @@ def build_results_page():
                 ft.Row([read_btn, deep_read_btn, delete_btn], spacing=0, width=120),
             ]
 
-            if _multi_select:
-                is_checked = pp_id in _selected_ids
-                cb = ft.Checkbox(
-                    value=is_checked,
-                    on_change=lambda e, pid=pp_id: on_check_one(e, pid),
-                    scale=0.85,
-                )
-                cells.insert(0, cb)
+            is_checked = pp_id in _selected_ids
+            cb = ft.Checkbox(
+                value=is_checked,
+                on_change=lambda e, pid=pp_id: on_check_one(e, pid),
+                scale=0.85,
+            )
+            cells.insert(0, cb)
 
             row = ft.Container(
                 content=ft.Row(cells, spacing=0),
@@ -2662,12 +2970,9 @@ def build_results_page():
             rows.append(row)
 
         # 更新全选复选框状态
-        if _multi_select:
-            select_all_cb.value = (len(_selected_ids) == len(papers) and len(papers) > 0)
-            select_all_cb.visible = True
-            update_count()
-        else:
-            select_all_cb.visible = False
+        select_all_cb.value = (len(_selected_ids) == len(papers) and len(papers) > 0)
+        select_all_cb.visible = True
+        update_count()
 
         paper_count_text.value = f"共 {len(papers)} 篇论文" if papers else ""
         paper_count_text.update()
@@ -2932,8 +3237,8 @@ def build_results_page():
 
     # ── 导出 ──
     def _get_export_papers() -> list[dict]:
-        """获取待导出的论文列表（多选模式取选中，否则取全部）。"""
-        if _multi_select and _selected_ids:
+        """获取待导出的论文列表（有选中时取选中，否则取全部）。"""
+        if _selected_ids:
             return [p for p in _project_papers if p["project_paper_id"] in _selected_ids]
         return _project_papers
 
@@ -3087,7 +3392,6 @@ def build_results_page():
                     ),
                 ], expand=True, spacing=0),
                 ft.Row([
-                    multi_select_toggle,
                     upload_menu_btn,
                     sort_btn,
                     ai_sort_btn,
@@ -3412,37 +3716,7 @@ def main(page: ft.Page):
         send_agent_message(text, role="user")
         _agent_input.value = ""
         _agent_input.update()
-
-        # 加载课题论文列表（供 chat() 自动检测 @引用 / 标题匹配）
-        _proj_papers = None
-        if _agent_project_id is not None:
-            try:
-                _proj_papers = library.get_project_papers(_agent_project_id)
-            except Exception:
-                pass
-
-        # 调用 AI 服务
-        import threading
-        def _bg_chat():
-            try:
-                result = _ai_service.chat(
-                    project_id=_agent_project_id or 0,
-                    project_name=_agent_project_name or "通用",
-                    message=text,
-                    topic_desc=_agent_topic_desc,
-                    project_papers=_proj_papers,
-                )
-                reply = result.get("reply", "抱歉，AI 服务暂时无法回复。")
-                send_agent_message(reply, role="agent")
-            except Exception as ex:
-                err_msg = f"出错了：{ex}"
-                send_agent_message(err_msg, role="agent")
-                if _agent_project_id is not None:
-                    _ai_service.log_message(
-                        _agent_project_id, _agent_project_name or "通用",
-                        "assistant", err_msg, _agent_topic_desc)
-
-        threading.Thread(target=_bg_chat, daemon=True).start()
+        _trigger_agent_chat(text)
 
     _agent_input.on_submit = _on_agent_send
 

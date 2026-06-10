@@ -72,11 +72,17 @@ def extract_pdf(file_path: str) -> dict | None:
         doc.close()
         return None
 
+    # 提取第一页文字块（含字号信息），用于标题检测
+    first_page_blocks = doc[0].get_text("dict").get("blocks", []) if len(doc) > 0 else []
+
     # 元数据提取
     metadata = doc.metadata or {}
     doc.close()
 
-    title = _extract_title(metadata, file_path, full_text)
+    try:
+        title = _extract_title(metadata, file_path, full_text, first_page_blocks)
+    except Exception:
+        title = os.path.splitext(os.path.basename(file_path))[0]
     authors = _extract_authors(metadata)
     abstract = _extract_abstract(full_text)
     year = _extract_year(metadata, full_text)
@@ -131,23 +137,105 @@ def extract_pdfs(
 
 # ── 内部辅助 ──
 
-def _extract_title(metadata: dict, file_path: str, text: str) -> str:
-    """从 metadata、文件名、正文推断标题。"""
-    # 1. PDF metadata title
+def _has_mojibake(s: str) -> bool:
+    """检测疑似编码乱码（UTF-8 中文被错误解码为 latin-1 的典型特征）。
+
+    Latin-1 字母区 (U+00C0-U+00FF) 占比 > 40% 且无 CJK 字符时，
+    极可能是中文被当作 latin-1 解码。真实法语/德语等重音字母占比
+    通常不超过 20%，不会触发此检查。
+    """
+    if not s:
+        return False
+    garbled_range = sum(1 for c in s if 'À' <= c <= 'ÿ')
+    cjk = sum(1 for c in s if '一' <= c <= '鿿')
+    length = len(s)
+    if length > 0 and garbled_range / length > 0.4 and cjk == 0:
+        return True
+    return False
+
+
+def _is_valid_title(s: str) -> bool:
+    """检查字符串是否像有效标题（排除乱码、纯数字/符号）。"""
+    if len(s) < 5 or len(s) > 500:
+        return False
+    if s.lower().startswith("microsoft word"):
+        return False
+    if _has_mojibake(s):
+        return False
+    # 字母/数字/常见标点占的比例过低 → 疑似乱码
+    valid_chars = sum(c.isalnum() or c.isspace() or c in ".-,;:!?()[]'\"&/@#*+=<>_" for c in s)
+    if len(s) > 0 and valid_chars / len(s) < 0.4:
+        return False
+    # 至少要有几个字母/中文字符
+    letters = sum(c.isalpha() for c in s)
+    if letters < 3:
+        return False
+    return True
+
+
+def _extract_title_from_blocks(blocks: list) -> str | None:
+    """从 PyMuPDF 第一页文字块中，按最大字号定位标题。"""
+    candidates = []  # (font_size, y_pos, text)
+    for block in blocks:
+        if block.get("type") != 0:  # 只处理文字块
+            continue
+        bbox = block.get("bbox", (0, 0, 0, 0))
+        for line in block.get("lines", []):
+            line_text_parts = []
+            max_size = 0
+            for span in line.get("spans", []):
+                line_text_parts.append(span.get("text", "").strip())
+                max_size = max(max_size, span.get("size", 0))
+            line_text = " ".join(p for p in line_text_parts if p).strip()
+            if line_text and max_size > 0 and len(line_text) >= 3:
+                candidates.append((max_size, bbox[1], line_text))
+
+    if not candidates:
+        return None
+
+    # 按字号降序、y 坐标升序（最大字号的最高行优先）
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+
+    # 取最大字号 ±5% 内的所有行，按 y 排序拼接
+    best_size = candidates[0][0]
+    title_lines = [(y, text) for size, y, text in candidates if size >= best_size * 0.95]
+    title_lines.sort(key=lambda x: x[0])  # 按 y 坐标从上到下
+
+    title = " ".join(text for _, text in title_lines)
+    title = re.sub(r"\s+", " ", title).strip()
+
+    if len(title) >= 10 and _is_valid_title(title):
+        return title[:500]
+    return None
+
+
+def _extract_title(metadata: dict, file_path: str, text: str,
+                   first_page_blocks: list | None = None) -> str:
+    """从 metadata / 字号检测 / 正文 / 文件名推断标题。
+
+    metadata 优先，但乱码会被 _is_valid_title 过滤，
+    从而自然回退到字号检测。
+    """
+    # 1. PDF metadata title（通过 _is_valid_title 过滤乱码）
     mt = (metadata.get("title") or "").strip()
-    if mt and len(mt) > 5 and not mt.startswith("Microsoft Word"):
-        # 有些 metadata title 是文件名，需要排除
+    if _is_valid_title(mt):
         fname_no_ext = os.path.splitext(os.path.basename(file_path))[0]
         if mt.lower() != fname_no_ext.lower():
             return mt[:500]
 
-    # 2. 正文首行（长于 20 字符的非空行）
+    # 2. 第一页最大字号检测（metadata 不可用时最可靠的回退）
+    if first_page_blocks:
+        title = _extract_title_from_blocks(first_page_blocks)
+        if title:
+            return title
+
+    # 3. 正文首行（长于 20 字符的非空行）回退
     for line in text.split("\n"):
         stripped = line.strip()
         if len(stripped) > 20 and not stripped.lower().startswith(("abstract", "doi:", "http")):
             return stripped[:500]
 
-    # 3. 文件名（去掉扩展名和下划线/连字符替换）
+    # 4. 文件名（最后回退）
     name = os.path.splitext(os.path.basename(file_path))[0]
     name = name.replace("_", " ").replace("-", " ")
     name = re.sub(r"\s+", " ", name).strip()

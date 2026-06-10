@@ -191,6 +191,60 @@ class AIService:
 
         return ""
 
+    def _call_api_stream(
+        self,
+        messages: list[dict],
+        temperature: float = 0.3,
+        max_tokens: int = 2000,
+        timeout: int = 120,
+    ):
+        """流式调用 API，yield 每个 content delta 字符串（SSE 解析）。
+
+        使用 requests 的 stream=True + iter_lines() 确保逐行读取，
+        避免 urllib 的响应缓冲导致一次性吐出所有内容。
+        """
+        import requests as _requests
+
+        api_key, model = self._resolve_key_model()
+        if not api_key:
+            return
+
+        payload = {
+            "messages": messages,
+            "model": model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if "v4" in model.lower():
+            payload["thinking"] = _THINKING_DISABLED
+
+        resp = _requests.post(
+            _API_URL,
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            stream=True,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data: "):
+                continue
+            data_str = line[6:]  # strip "data: " prefix
+            if data_str == "[DONE]":
+                break
+            try:
+                body = json.loads(data_str)
+                delta = body.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                if delta:
+                    yield delta
+            except (json.JSONDecodeError, KeyError, IndexError):
+                pass
+
     def _parse_json_response(self, content: str) -> dict | list:
         """从 LLM 回复中提取 JSON 块，失败返回空 dict。"""
         if not content:
@@ -465,7 +519,7 @@ class AIService:
     _SCORE_CHUNK_SIZE = 25
 
     def score_papers(self, topic_desc: str, papers: list[dict],
-                     max_papers: int = 20) -> list[dict]:
+                     max_papers: int = 50) -> list[dict]:
         """AI 精排：基于摘要批量打分。
 
         Args:
@@ -717,6 +771,98 @@ class AIService:
             cm.add_assistant_message(reply)
 
         return {"reply": reply, "compressed": was_compressed}
+
+    def chat_stream(
+        self,
+        project_id: int,
+        project_name: str,
+        message: str,
+        topic_desc: str = "",
+        papers: list[dict] | None = None,
+        project_papers: list[dict] | None = None,
+    ):
+        """课题对话流式版：yield {"chunk": str} | {"done": dict} | {"error": str}。
+
+        与 chat() 逻辑相同，但通过 SSE 流式返回内容增量。
+        对话持久化在流结束后自动完成。
+        """
+        if not self.is_available:
+            yield {"error": "AI 服务未配置。请在 config.yaml 中设置 DeepSeek API Key。"}
+            return
+
+        from paperpilot.conversation import ConversationManager
+
+        if project_id not in self._conversations:
+            cm = ConversationManager(project_name, topic_desc)
+            self._conversations[project_id] = cm
+        else:
+            cm = self._conversations[project_id]
+            if topic_desc:
+                cm.update_topic_desc(topic_desc)
+
+        # 自动检测论文引用
+        auto_papers: list[dict] = []
+        if project_papers:
+            auto_papers = self._detect_paper_refs(message, project_papers)
+        all_papers: list[dict] = list(papers or [])
+        for ap in auto_papers:
+            ap_title = (ap.get("title") or "").strip().lower()
+            if not any((p.get("title") or "").strip().lower() == ap_title
+                       for p in all_papers):
+                all_papers.append(ap)
+
+        attached_refs = None
+        if all_papers:
+            attached_refs = []
+            for p in all_papers:
+                ref = p.get("doi") or p.get("title", "")[:60]
+                attached_refs.append(ref)
+        cm.add_user_message(message, attached_papers=attached_refs,
+                           paper_details=all_papers if all_papers else None)
+
+        # 压缩检查
+        was_compressed = False
+        if cm.needs_compression():
+            batch = cm.get_compress_batch()
+            if batch:
+                summary = self._compress_messages(batch)
+                if summary:
+                    cm.apply_compression(summary, batch)
+                    was_compressed = True
+
+        # 构建论文目录
+        paper_catalog = None
+        if all_papers:
+            paper_catalog = []
+            for p in all_papers:
+                title = (p.get("title") or "无标题")[:100]
+                authors = (p.get("authors") or "未知").split(",")[0].strip()
+                year = p.get("year", "")
+                paper_catalog.append(f"- {title} ({authors}, {year})")
+
+        sys_prompt = self._CHAT_SYSTEM
+        if topic_desc:
+            sys_prompt += f"\n\n当前课题：{project_name}\n课题描述：{topic_desc}"
+
+        messages = cm.build_api_messages(sys_prompt, paper_catalog)
+
+        full_reply = ""
+        try:
+            for delta in self._call_api_stream(messages, temperature=0.6,
+                                                max_tokens=3000, timeout=120):
+                full_reply += delta
+                yield {"chunk": delta}
+        except Exception as e:
+            logger.warning(f"Streaming chat failed: {e}")
+            if full_reply:
+                cm.add_assistant_message(full_reply + "\n\n[流输出中断]")
+            yield {"error": str(e)}
+            return
+
+        if full_reply:
+            cm.add_assistant_message(full_reply)
+
+        yield {"done": {"reply": full_reply, "compressed": was_compressed}}
 
     def _compress_messages(self, messages: list[dict]) -> str | None:
         """调用 API 将一批消息压缩为摘要。"""

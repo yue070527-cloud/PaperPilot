@@ -3,6 +3,7 @@
 提供课题管理、论文收藏、阅读状态追踪功能，复用 models.py 现有五张表。
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -158,9 +159,11 @@ def _find_or_create_paper(session: Session, paper_dict: dict) -> tuple[Paper, bo
     if doi:
         existing = session.query(Paper).filter(Paper.doi == doi).first()
         if existing:
-            if pdf_path and not existing.pdf_path:
-                existing.pdf_path = pdf_path
-                return existing, True
+            if pdf_path and os.path.isfile(pdf_path):
+                old_valid = existing.pdf_path and os.path.isfile(existing.pdf_path)
+                if not old_valid:
+                    existing.pdf_path = pdf_path
+                    return existing, True
             return existing, False
 
     # 2. 标题 + 年份匹配
@@ -175,9 +178,11 @@ def _find_or_create_paper(session: Session, paper_dict: dict) -> tuple[Paper, bo
         if not existing and year is not None:
             existing = session.query(Paper).filter(Paper.title == title).first()
         if existing:
-            if pdf_path and not existing.pdf_path:
-                existing.pdf_path = pdf_path
-                return existing, True
+            if pdf_path and os.path.isfile(pdf_path):
+                old_valid = existing.pdf_path and os.path.isfile(existing.pdf_path)
+                if not old_valid:
+                    existing.pdf_path = pdf_path
+                    return existing, True
             return existing, False
 
     # 3. 新建
