@@ -127,6 +127,27 @@ def update_project_name(project_id: int, new_name: str) -> bool:
         session.close()
 
 
+def update_project(project_id: int, name: str | None = None,
+                   description: str | None = None,
+                   push_interval_days: int | None = None) -> bool:
+    """更新课题信息（名称/描述/推送周期）。"""
+    session = _get_session()
+    try:
+        project = session.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return False
+        if name is not None and name.strip():
+            project.name = name.strip()
+        if description is not None:
+            project.description = description.strip()
+        if push_interval_days is not None:
+            project.push_interval_days = push_interval_days
+        session.commit()
+        return True
+    finally:
+        session.close()
+
+
 def delete_project(project_id: int) -> bool:
     """删除课题及其关联数据（级联删除 papers/keywords/feedback）。"""
     session = _get_session()
@@ -142,6 +163,24 @@ def delete_project(project_id: int) -> bool:
 
 
 # ── 论文管理 ──
+
+def _patch_existing_paper(existing: Paper, paper_dict: dict) -> None:
+    """用新数据补填已有论文的缺失字段（不覆盖已有内容）。"""
+    new_abstract = (paper_dict.get("abstract") or "").strip()
+    old_abstract = (existing.abstract or "").strip()
+    if new_abstract and len(new_abstract) > len(old_abstract):
+        existing.abstract = new_abstract
+    new_authors = (paper_dict.get("authors") or "").strip()
+    old_authors = (existing.authors or "").strip()
+    if new_authors and len(new_authors) > len(old_authors):
+        existing.authors = new_authors
+    new_source = paper_dict.get("source") or ""
+    if new_source and not (existing.source or "").strip():
+        existing.source = new_source
+    new_url = paper_dict.get("url") or ""
+    if new_url and not (existing.url or "").strip():
+        existing.url = new_url
+
 
 def _find_or_create_paper(session: Session, paper_dict: dict) -> tuple[Paper, bool]:
     """在 session 内查找或创建 Paper 记录。
@@ -159,6 +198,7 @@ def _find_or_create_paper(session: Session, paper_dict: dict) -> tuple[Paper, bo
     if doi:
         existing = session.query(Paper).filter(Paper.doi == doi).first()
         if existing:
+            _patch_existing_paper(existing, paper_dict)
             if pdf_path and os.path.isfile(pdf_path):
                 old_valid = existing.pdf_path and os.path.isfile(existing.pdf_path)
                 if not old_valid:
@@ -178,6 +218,7 @@ def _find_or_create_paper(session: Session, paper_dict: dict) -> tuple[Paper, bo
         if not existing and year is not None:
             existing = session.query(Paper).filter(Paper.title == title).first()
         if existing:
+            _patch_existing_paper(existing, paper_dict)
             if pdf_path and os.path.isfile(pdf_path):
                 old_valid = existing.pdf_path and os.path.isfile(existing.pdf_path)
                 if not old_valid:

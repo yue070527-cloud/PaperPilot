@@ -116,44 +116,58 @@ class ConversationManager:
 
     def add_user_message(self, content: str,
                          attached_papers: list[str] | None = None,
-                         paper_details: list[dict] | None = None) -> None:
+                         paper_details: list[dict] | None = None,
+                         display_content: str = "") -> None:
         """添加用户消息。
 
         Args:
             content: 用户输入文本
             attached_papers: 附带论文的简要引用（如 doi / 标题）
             paper_details: 附带论文的详细摘要/全文，进入消息体
+            display_content: UI 展示用文本，空则用 content
         """
         msg: dict = {
             "role": "user",
             "content": content,
+            "display_content": display_content or content,  # UI 展示用，不含论文详情
             "timestamp": datetime.now().isoformat(),
         }
         if attached_papers:
             msg["attached_papers"] = attached_papers
         if paper_details:
-            # 论文详情注入消息内容
             details_text = _format_paper_details(paper_details)
             msg["content"] = details_text + "\n\n—— 用户问题 ——\n" + content
         self._messages.append(msg)
         self._save()
 
-    def add_assistant_message(self, content: str) -> None:
-        """添加助手回复。"""
-        self._messages.append({
+    def add_assistant_message(self, content: str, display_content: str = "") -> None:
+        """添加助手回复。display_content 用于 UI 显示，content 保留完整版供 API 上下文。"""
+        msg = {
             "role": "assistant",
             "content": content,
             "timestamp": datetime.now().isoformat(),
-        })
+        }
+        if display_content:
+            msg["display_content"] = display_content
+        self._messages.append(msg)
         self._save()
 
     # ── 查询 ──
 
     @property
     def display_messages(self) -> list[dict]:
-        """最近 _DISPLAY_ROUNDS 轮对话，用于 UI 初始渲染。"""
-        # 一轮 = user + assistant，所以取 2 * N 条
-        return self._messages[-(_DISPLAY_ROUNDS * 2):]
+        """最近 _DISPLAY_ROUNDS 轮对话，用于 UI 初始渲染。
+
+        返回副本，用户消息用 display_content 替代 content，
+        避免 UI 显示注入的论文详情。
+        """
+        msgs = []
+        for m in self._messages[-(_DISPLAY_ROUNDS * 2):]:
+            copy = dict(m)
+            if m.get("display_content"):
+                copy["content"] = m["display_content"]
+            msgs.append(copy)
+        return msgs
 
     @property
     def has_more_history(self) -> bool:

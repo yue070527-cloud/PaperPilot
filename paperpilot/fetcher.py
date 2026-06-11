@@ -342,12 +342,12 @@ def _fetch_missing_abstracts(papers: list[dict]) -> list[dict]:
     """对缺少摘要的 OpenAlex 论文，单独请求完整摘要。
 
     OpenAlex 搜索结果常截断摘要，需用 works/{id} 端点获取完整数据。
-    最多处理 10 篇，速率 ~10 req/s，每请求 10s 超时。
+    速率 ~10 req/s，每请求 10s 超时。
     """
     to_fetch = [
         p for p in papers
         if p.get("openalex_id") and not (p.get("abstract") or "").strip()
-    ][:10]
+    ]
 
     if not to_fetch:
         return papers

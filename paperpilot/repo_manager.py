@@ -86,6 +86,18 @@ def _pdf_dir(project_name: str) -> Path:
     return _REPO_ROOT / safe / "pdfs"
 
 
+def rename_project(old_name: str, new_name: str) -> bool:
+    """重命名课题仓库文件夹（含 catalog + conversation + pdfs）。"""
+    old_safe = re.sub(r"[^\w\s\-]", "", old_name)[:80]
+    new_safe = re.sub(r"[^\w\s\-]", "", new_name)[:80]
+    old_dir = _REPO_ROOT / old_safe
+    new_dir = _REPO_ROOT / new_safe
+    if old_dir.is_dir() and not new_dir.exists() and old_safe != new_safe:
+        old_dir.rename(new_dir)
+        return True
+    return False
+
+
 def load_catalog(project_name: str) -> dict:
     """读取课题的 catalog.json，不存在则返回空结构。"""
     path = _catalog_path(project_name)

@@ -455,57 +455,71 @@ def _create_window(create_kwargs: dict) -> bool:
         json.dump(create_kwargs, f, ensure_ascii=False)
         args_path = f.name
 
+    create_kwargs.setdefault("on_top", True)
+
     script = (
         "import json,webview,os,sys,threading,time\n"
         f"with open({args_path!r},'r',encoding='utf-8') as f:\n"
         "  k=json.load(f)\n"
         f"os.unlink({args_path!r})\n"
-        # Background thread: bring window to foreground after it's created
-        "def _bring_front():\n"
+        "def _remove_topmost():\n"
         "    if sys.platform!='win32': return\n"
         "    import ctypes\n"
         "    ktitle=k.get('title','')\n"
-        "    ctypes.windll.user32.AllowSetForegroundWindow(-1)\n"
-        # Retry loop: window title may take a moment to appear
         "    hwnd=None\n"
-        "    for _ in range(15):\n"
-        "        time.sleep(0.2)\n"
+        "    for _ in range(20):\n"
+        "        time.sleep(0.3)\n"
         "        hwnd=ctypes.windll.user32.FindWindowW(None,ktitle)\n"
         "        if hwnd: break\n"
         "    if not hwnd:\n"
-        # Fallback: find any window whose title starts with ktitle
         "        import ctypes.wintypes as wt\n"
-        "        titles=[]\n"
+        "        found=[]\n"
         "        def _enum(h,_):\n"
         "            buf=wt.create_unicode_buffer(256)\n"
         "            ctypes.windll.user32.GetWindowTextW(h,buf,256)\n"
         "            t=buf.value\n"
-        "            if t and t.startswith(ktitle[:30]): titles.append(h); return False\n"
+        "            if t and t.startswith(ktitle[:30]): found.append(h); return False\n"
         "            return True\n"
         "        ctypes.windll.user32.EnumWindows(wt.WINFUNCTYPE(wt.BOOL,wt.HWND,wt.LPARAM)(_enum),0)\n"
-        "        if titles: hwnd=titles[0]\n"
+        "        if found: hwnd=found[0]\n"
         "    if hwnd:\n"
-        "        HWND_TOPMOST=-1; HWND_NOTOPMOST=-2\n"
-        "        SWP_NOMOVE=0x0002; SWP_NOSIZE=0x0001; SWP_SHOWWINDOW=0x0040\n"
-        "        ctypes.windll.user32.SetWindowPos(hwnd,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW)\n"
-        "        ctypes.windll.user32.ShowWindow(hwnd,9)\n"
-        "        ctypes.windll.user32.SetForegroundWindow(hwnd)\n"
-        "        time.sleep(0.3)\n"
-        "        ctypes.windll.user32.SetWindowPos(hwnd,HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE)\n"
-        "t=threading.Thread(target=_bring_front,daemon=True)\n"
+        "        try:\n"
+        "            fg=ctypes.windll.user32.GetForegroundWindow()\n"
+        "            fg_tid=ctypes.windll.user32.GetWindowThreadProcessId(fg,None)\n"
+        "            cur_tid=ctypes.windll.kernel32.GetCurrentThreadId()\n"
+        "            if fg_tid and fg_tid!=cur_tid:\n"
+        "                ctypes.windll.user32.AttachThreadInput(cur_tid,fg_tid,True)\n"
+        "            ctypes.windll.user32.ShowWindow(hwnd,9)\n"
+        "            ctypes.windll.user32.BringWindowToTop(hwnd)\n"
+        "            ctypes.windll.user32.SetForegroundWindow(hwnd)\n"
+        "            if fg_tid and fg_tid!=cur_tid:\n"
+        "                ctypes.windll.user32.AttachThreadInput(cur_tid,fg_tid,False)\n"
+        "        except Exception as _e:\n"
+        "            print(f'[pdf_viewer] foreground error: {_e}',file=sys.stderr)\n"
+        "        time.sleep(0.5)\n"
+        "        SWP_NOMOVE=0x0002;SWP_NOSIZE=0x0001\n"
+        "        ctypes.windll.user32.SetWindowPos(hwnd,-2,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE)\n"
+        "    else:\n"
+        "        print(f'[pdf_viewer] window not found: {ktitle[:50]}',file=sys.stderr)\n"
+        "t=threading.Thread(target=_remove_topmost,daemon=True)\n"
         "t.start()\n"
-        # Main thread: create and start webview (must be on main thread)
         "webview.create_window(**k)\n"
         "webview.start(gui='edgechromium')\n"
         f"{cleanup_script}\n"
     )
 
-    subprocess.Popen(
+    proc = subprocess.Popen(
         [sys.executable, "-c", script],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=None,
         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
     )
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.user32.AllowSetForegroundWindow(proc.pid)
+        except Exception:
+            pass
     return True
 
 

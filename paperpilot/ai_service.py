@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 _API_URL = "https://api.deepseek.com/v1/chat/completions"
 _DEFAULT_MODEL = "deepseek-v4-flash"
 _THINKING_DISABLED = {"type": "disabled"}
+_THINKING_ENABLED = {"type": "enabled"}
 _DEEP_READ_DIR = Path("outputs/deep_read")
 
 # ── RLM 参数 ──
@@ -136,17 +137,60 @@ class AIService:
                 model = ds.get("model", "").strip() or _DEFAULT_MODEL
         return key, model
 
+    def _resolve_task_model(self, task: str) -> str:
+        """获取任务专用模型名，从 config deepseek.{task}_model 读取。
+
+        Args:
+            task: 任务名，如 "score"、"chat"、"deep_read"
+        Returns:
+            模型名，config 未配置时回退到默认模型
+        """
+        cfg = load_config()
+        ds = cfg.get("deepseek", {})
+        task_model = ds.get(f"{task}_model", "").strip()
+        if task_model:
+            return task_model
+        _, default_model = self._resolve_key_model()
+        return default_model
+
     def _call_api(
         self,
         messages: list[dict],
         temperature: float = 0.3,
         max_tokens: int = 2000,
         timeout: int = 120,
+        model: str | None = None,
+        thinking: dict | None = None,
     ) -> str:
-        """通用 API 调用，含重试和 V4 thinking 禁用。"""
-        api_key, model = self._resolve_key_model()
+        """通用 API 调用，含重试。返回 content 字符串。
+
+        Args:
+            model: 覆盖默认模型（None = 使用 config 配置的模型）
+            thinking: 覆盖 thinking 设置（None = v4 模型默认关 thinking）
+        """
+        content, _ = self._call_api_full(
+            messages, temperature, max_tokens, timeout, model, thinking
+        )
+        return content
+
+    def _call_api_full(
+        self,
+        messages: list[dict],
+        temperature: float = 0.3,
+        max_tokens: int = 2000,
+        timeout: int = 120,
+        model: str | None = None,
+        thinking: dict | None = None,
+    ) -> tuple[str, str]:
+        """API 调用，返回 (content, reasoning_content) 元组。
+
+        reasoning_content 仅在 thinking=enabled 时由模型填充。
+        """
+        api_key, default_model = self._resolve_key_model()
         if not api_key:
-            return ""
+            return "", ""
+
+        model = model or default_model
 
         payload = {
             "messages": messages,
@@ -155,7 +199,9 @@ class AIService:
             "max_tokens": max_tokens,
             "stream": False,
         }
-        if "v4" in model.lower():
+        if thinking is not None:
+            payload["thinking"] = thinking
+        elif "v4" in model.lower():
             payload["thinking"] = _THINKING_DISABLED
 
         for attempt in (1, 2):
@@ -171,11 +217,12 @@ class AIService:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     raw = resp.read().decode("utf-8")
                     body = json.loads(raw)
-                content = body.get("choices", [{}])[0].get("message", {}).get("content", "")
-                # API 可能返回错误响应（非 choices 格式）
+                msg = body.get("choices", [{}])[0].get("message", {})
+                content = msg.get("content", "")
+                reasoning = msg.get("reasoning_content", "")
                 if not content and "error" in body:
                     logger.warning(f"API returned error: {body['error']}")
-                return content
+                return content, reasoning
             except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
                 if attempt == 1:
                     logger.warning(
@@ -189,7 +236,7 @@ class AIService:
                 logger.warning(f"API response parse error: {e}")
                 break
 
-        return ""
+        return "", ""
 
     def _call_api_stream(
         self,
@@ -197,6 +244,8 @@ class AIService:
         temperature: float = 0.3,
         max_tokens: int = 2000,
         timeout: int = 120,
+        model: str | None = None,
+        thinking: dict | None = None,
     ):
         """流式调用 API，yield 每个 content delta 字符串（SSE 解析）。
 
@@ -205,9 +254,11 @@ class AIService:
         """
         import requests as _requests
 
-        api_key, model = self._resolve_key_model()
+        api_key, default_model = self._resolve_key_model()
         if not api_key:
             return
+
+        model = model or default_model
 
         payload = {
             "messages": messages,
@@ -216,7 +267,9 @@ class AIService:
             "max_tokens": max_tokens,
             "stream": True,
         }
-        if "v4" in model.lower():
+        if thinking is not None:
+            payload["thinking"] = thinking
+        elif "v4" in model.lower():
             payload["thinking"] = _THINKING_DISABLED
 
         resp = _requests.post(
@@ -336,7 +389,8 @@ class AIService:
                 )},
             ]
 
-            content = self._call_api(messages, temperature=0.3, max_tokens=600, timeout=90)
+            content = self._call_api(messages, temperature=0.3, max_tokens=600,
+                                     timeout=90, thinking=_THINKING_ENABLED)
             if content:
                 notes_parts.append(f"## 片段 {i + 1}/{total_windows}\n\n{content}")
 
@@ -455,7 +509,8 @@ class AIService:
             )},
         ]
 
-        content = self._call_api(messages, temperature=0.3, max_tokens=1500, timeout=120)
+        content = self._call_api(messages, temperature=0.3, max_tokens=1500,
+                                 timeout=120, thinking=_THINKING_ENABLED)
         result = self._parse_json_response(content)
 
         if not result:
@@ -501,7 +556,7 @@ class AIService:
         "解释为什么给这个分数。不要写空洞套话。\n"
         "reason_overall 是综合判断，说明是否值得读全文及原因。\n\n"
         "## 无摘要处理\n"
-        "如果论文没有摘要（abstract 为空或短于 80 字符），将 method、novelty 两项标为 0，"
+        "如果论文没有摘要（abstract 为空或短于 50 字符），将 method、novelty 两项标为 0，"
         "仅基于标题评估 relevance 和 recency，tier 标注为 'no_abstract'，各 reason 写'仅标题，无法判断'。\n\n"
         "## 输出格式\n"
         "严格的 JSON 数组，按论文输入顺序，只输出 JSON 不要其他文字：\n"
@@ -515,8 +570,10 @@ class AIService:
         "注意：基于摘要内容判断，不要编造。"
     )
 
-    # 单批最多 25 篇，确保 max_tokens 不超 DeepSeek 8192 上限
-    _SCORE_CHUNK_SIZE = 25
+    # 单批最多 10 篇，确保 max_tokens 不超 DeepSeek 8192 上限
+    # 每篇 ~5 个理由字段 × 100+ 汉字 ≈ 1000+ tokens，10 篇 = 10000+
+    # 实际 max_tokens=8000 有一定截断风险，但 10 篇通常够用
+    _SCORE_CHUNK_SIZE = 10
 
     def score_papers(self, topic_desc: str, papers: list[dict],
                      max_papers: int = 50) -> list[dict]:
@@ -540,13 +597,23 @@ class AIService:
         candidates: list[tuple[int, dict, bool]] = []
         for i, p in enumerate(papers):
             abstract = (p.get("abstract") or "").strip()
-            has_abstract = bool(abstract and len(abstract) >= 80)
+            has_abstract = bool(abstract and len(abstract) >= 50)
             candidates.append((i, p, has_abstract))
             if len(candidates) >= max_papers:
                 break
 
         if not candidates:
             return []
+
+        # debug: 记录进入 score_papers 的论文摘要状态
+        abs_info = [(i, len((p.get("abstract") or "").strip()), ha) for i, p, ha in candidates]
+        logger.info(
+            "score_papers: topic=%s, total_candidates=%d, has_abstract=%d/%d, "
+            "abstract_details(first10)=%s",
+            topic_desc[:60], len(candidates),
+            sum(1 for _, _, ha in candidates if ha), len(candidates),
+            abs_info[:10],
+        )
 
         # 拆批：每批最多 _SCORE_CHUNK_SIZE 篇
         chunks = [
@@ -586,10 +653,11 @@ class AIService:
             {"role": "user", "content": "\n".join(lines)},
         ]
 
-        # token 配额：每篇 250 + 500 余量，上限 8000（DeepSeek 8192 安全边际）
-        dyn_tokens = min(8000, chunk_size * 250 + 500)
+        # token 配额：每篇 600 + 500 余量，上限 8000（DeepSeek 8192 安全边际）
+        dyn_tokens = min(8000, chunk_size * 600 + 500)
         content = self._call_api(
             messages, temperature=0.2, max_tokens=dyn_tokens, timeout=120,
+            model=self._resolve_task_model("score"),
         )
         if not content:
             logger.warning(
@@ -658,13 +726,42 @@ class AIService:
         "- 回答关于特定论文的问题：方法、结论、创新点、局限性等\n"
         "- 对比多篇论文：找出共同点、差异、各自优势\n"
         "- 课题讨论：分析研究趋势、建议技术路线、识别研究空白\n"
-        "- 文献推荐：基于用户需求从文献库中推荐相关论文\n\n"
+        "- 文献推荐：基于用户需求从文献库中推荐相关论文\n"
+        "- 当用户要求检索论文时，你可以通过 [ACTION:search] 标记触发系统的检索功能\n"
+        "- 当用户要求对搜索结果评分时，你可以通过 [ACTION:score] 标记触发 AI 精排\n"
+        "- 当用户要求将论文导入文献库时，你可以通过 [ACTION:import] 标记触发保存操作\n\n"
+        "## 可用操作标记\n"
+        "你可以输出以下标记来触发系统操作（标记不会显示给用户）：\n\n"
+        "### 1. 检索论文\n"
+        "[ACTION:search]\n"
+        '{"topic_name": "课题名称", "topic_desc": "课题描述（中文1-3句）", '
+        '"primary_keywords": ["核心英文关键词1-2个"], '
+        '"secondary_keywords": ["辅助英文关键词2-4个"]}\n'
+        "[/ACTION]\n"
+        "使用时机：用户要求查找/搜索/检索某方向的论文时。\n"
+        "先确认并拓展用户需求（用自然语言），然后输出标记。\n"
+        "关键词必须翻译为英文。primary 是论文必须包含的核心词（AND 逻辑），"
+        "secondary 是辅助扩展词，各 2-3 个为宜。\n\n"
+        "### 2. AI 精排打分\n"
+        "[ACTION:score]\n"
+        '{"scope": "all", "limit": 20}\n'
+        "[/ACTION]\n"
+        "使用时机：用户要求对检索结果进行 AI 打分/排序时。\n"
+        "前提是必须先有检索结果。\n\n"
+        "### 3. 导入文献库\n"
+        "[ACTION:import]\n"
+        '{"project": "目标课题名", "filter": "ai_score > 80"}\n'
+        "[/ACTION]\n"
+        "使用时机：用户要求将论文保存/导入到某课题时。\n"
+        "filter 是可选的筛选条件，如 \"ai_score > 80\"、\"ai_score >= 60\"。\n"
+        "如果不需筛选，省略 filter 字段。\n\n"
         "## 风格\n"
         "- 用中文回答，专业术语保留英文原名\n"
         "- 引用论文时使用「标题（作者, 年份）」格式\n"
         "- 如果问题超出文献库信息范围，诚实说明，可以基于常识补充建议\n"
         "- 保持学术但友好的语气，像实验室讨论一样自然\n"
-        "- 回答简洁但有深度，避免冗长的背景铺垫"
+        "- 回答简洁但有深度，避免冗长的背景铺垫\n"
+        "- 标记块放在回复末尾，不要在标记前后添加多余文字"
     )
 
     _COMPRESS_SYSTEM = (
@@ -684,6 +781,8 @@ class AIService:
         topic_desc: str = "",
         papers: list[dict] | None = None,
         project_papers: list[dict] | None = None,
+        thinking_enabled: bool = False,
+        display_message: str = "",
     ) -> dict:
         """课题对话：发送消息并获取 AI 回复（自动管理上下文）。
 
@@ -694,6 +793,7 @@ class AIService:
             topic_desc: 课题描述（首次对话时初始化 system prompt）
             papers: 用户显式选中的论文详情列表
             project_papers: 课题下全部论文（用于自动检测 @引用 / 标题匹配）
+            thinking_enabled: 是否开启深度思考模式（对比分析等场景推荐开启）
 
         Returns:
             {"reply": str, "compressed": bool}
@@ -734,7 +834,8 @@ class AIService:
                 ref = p.get("doi") or p.get("title", "")[:60]
                 attached_refs.append(ref)
         cm.add_user_message(message, attached_papers=attached_refs,
-                           paper_details=all_papers if all_papers else None)
+                           paper_details=all_papers if all_papers else None,
+                           display_content=display_message)
 
         # 压缩检查
         was_compressed = False
@@ -763,12 +864,56 @@ class AIService:
 
         messages = cm.build_api_messages(sys_prompt, paper_catalog)
 
-        # 调用 API
-        reply = self._call_api(messages, temperature=0.6, max_tokens=3000, timeout=120)
+        # 调用 API（支持双模型：pro 推理 → flash 输出）
+        reasoning_model = self._resolve_task_model("reasoning")
+        chat_model = self._resolve_task_model("chat")
 
-        # 添加助手回复
+        if reasoning_model:
+            # 两步模式：pro 深度推理 → flash 生成回复
+            logger.info(
+                f"chat: two-step mode — reasoning={reasoning_model}, output={chat_model}"
+            )
+            # Step 1: pro 模型推理
+            _, reasoning = self._call_api_full(
+                messages, temperature=0.6, max_tokens=2000,
+                timeout=120, thinking=_THINKING_ENABLED,
+                model=reasoning_model,
+            )
+            if reasoning:
+                # Step 2: flash 基于推理结果生成回复
+                messages.append({
+                    "role": "system",
+                    "content": f"[内部推理结果，基于此生成回复]\n{reasoning}"
+                })
+                reply = self._call_api(
+                    messages, temperature=0.6, max_tokens=3000,
+                    timeout=120, thinking=_THINKING_DISABLED,
+                    model=chat_model,
+                )
+            else:
+                # 推理失败，回退到单步 flash
+                logger.warning("chat: reasoning returned empty, falling back to single-step")
+                reply = self._call_api(
+                    messages, temperature=0.6, max_tokens=3000,
+                    timeout=120, thinking=_THINKING_DISABLED,
+                    model=chat_model,
+                )
+        else:
+            # 单步模式：直接调用 chat_model
+            thinking = _THINKING_ENABLED if thinking_enabled else None
+            reply = self._call_api(messages, temperature=0.6, max_tokens=3000,
+                                   timeout=120, thinking=thinking,
+                                   model=chat_model)
+
+        # 保存原始回复（含 ACTION 标签）供 API 上下文学习；UI 显示用剥离版
         if reply:
-            cm.add_assistant_message(reply)
+            clean = re.sub(
+                r'\s*\[ACTION:\w+\].+?\[/ACTION\]\s*', '', reply, flags=re.DOTALL
+            ).strip()
+            clean = re.sub(
+                r'\s*\[PROJECT_UPDATE\].+?\[/PROJECT_UPDATE\]\s*', '', clean, flags=re.DOTALL
+            ).strip()
+            cm.add_assistant_message(reply, display_content=clean if clean != reply else "")
 
         return {"reply": reply, "compressed": was_compressed}
 
@@ -780,6 +925,8 @@ class AIService:
         topic_desc: str = "",
         papers: list[dict] | None = None,
         project_papers: list[dict] | None = None,
+        thinking_enabled: bool = False,
+        display_message: str = "",
     ):
         """课题对话流式版：yield {"chunk": str} | {"done": dict} | {"error": str}。
 
@@ -818,7 +965,8 @@ class AIService:
                 ref = p.get("doi") or p.get("title", "")[:60]
                 attached_refs.append(ref)
         cm.add_user_message(message, attached_papers=attached_refs,
-                           paper_details=all_papers if all_papers else None)
+                           paper_details=all_papers if all_papers else None,
+                           display_content=display_message)
 
         # 压缩检查
         was_compressed = False
@@ -848,8 +996,29 @@ class AIService:
 
         full_reply = ""
         try:
+            reasoning_model = self._resolve_task_model("reasoning")
+            chat_model = self._resolve_task_model("chat")
+
+            if reasoning_model:
+                # 两步模式：pro 推理（同步）→ flash 流式输出
+                _, reasoning = self._call_api_full(
+                    messages, temperature=0.6, max_tokens=2000,
+                    timeout=120, thinking=_THINKING_ENABLED,
+                    model=reasoning_model,
+                )
+                if reasoning:
+                    messages.append({
+                        "role": "system",
+                        "content": f"[内部推理结果，基于此生成回复]\n{reasoning}"
+                    })
+                thinking = _THINKING_DISABLED
+            else:
+                thinking = _THINKING_ENABLED if thinking_enabled else None
+
             for delta in self._call_api_stream(messages, temperature=0.6,
-                                                max_tokens=3000, timeout=120):
+                                                max_tokens=3000, timeout=120,
+                                                thinking=thinking,
+                                                model=chat_model):
                 full_reply += delta
                 yield {"chunk": delta}
         except Exception as e:
@@ -860,7 +1029,13 @@ class AIService:
             return
 
         if full_reply:
-            cm.add_assistant_message(full_reply)
+            clean = re.sub(
+                r'\s*\[ACTION:\w+\].+?\[/ACTION\]\s*', '', full_reply, flags=re.DOTALL
+            ).strip()
+            clean = re.sub(
+                r'\s*\[PROJECT_UPDATE\].+?\[/PROJECT_UPDATE\]\s*', '', clean, flags=re.DOTALL
+            ).strip()
+            cm.add_assistant_message(full_reply, display_content=clean if clean != full_reply else "")
 
         yield {"done": {"reply": full_reply, "compressed": was_compressed}}
 

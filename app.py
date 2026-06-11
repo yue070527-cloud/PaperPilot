@@ -3,7 +3,10 @@ Phase 1: 课题输入 → 关键词提取 → 论文抓取 → 排序展示
 """
 
 import asyncio
+import json
+import logging
 import os
+import re
 import threading
 
 import flet as ft
@@ -18,6 +21,13 @@ from paperpilot.pdf_viewer import open_full_reader, render_preview, is_full_read
 from paperpilot.ai_service import AIService, save_deep_read_json, get_full_text_for_paper
 from paperpilot.library import save_deep_read_notes
 from paperpilot import repo_manager, downloader
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(name)s.%(levelname)s: %(message)s",
+    stream=__import__("sys").stdout,
+)
+logger = logging.getLogger(__name__)
 
 
 # ── 主题定义 ──
@@ -74,6 +84,7 @@ _refresh_library = None  # 文献页刷新函数引用，page_switcher 触发
 _search_selected_ids = set()  # 检索结果多选已选索引
 _agent_paper_selection: list = []  # 当前选中的论文列表，Agent 发送时自动作为上下文
 _clear_library_ui = None  # Agent 发消息后清除文献库复选框的回调
+_search_actions: dict = {}  # 检索页回调引用，Agent 通过 [ACTION:xxx] 触发
 
 # ── Agent 对话面板（全局常驻右侧）──
 _agent_msg_list: ft.ListView | None = None
@@ -82,6 +93,43 @@ _ai_service = AIService()  # DeepSeek API 封装实例
 _agent_project_id: int | None = None
 _agent_project_name: str = ""
 _agent_topic_desc: str = ""
+_thinking_active: bool = False
+
+# ── Agent 面板拖拽拉伸 ──
+_AGENT_PANEL_MIN = 290
+_AGENT_PANEL_MAX_RATIO = 0.5
+_agent_panel_width = 340
+_agent_panel_ref: ft.Container | None = None
+_resize_start_x: float = 0
+_resize_start_width: float = 0
+
+
+def _on_agent_resize_update(e):
+    global _agent_panel_width, _resize_start_x, _resize_start_width
+    if _resize_start_x == 0:
+        _resize_start_x = e.global_position.x
+        _resize_start_width = _agent_panel_width
+    page_w = _page.width if _page else 1200
+    delta_x = _resize_start_x - e.global_position.x
+    _agent_panel_width = _resize_start_width + delta_x
+    _agent_panel_width = max(_AGENT_PANEL_MIN, min(_agent_panel_width, int(page_w * _AGENT_PANEL_MAX_RATIO)))
+    if _agent_panel_ref:
+        _agent_panel_ref.width = _agent_panel_width
+        try:
+            _agent_panel_ref.update()
+        except Exception:
+            pass
+
+
+def _on_agent_resize_end(e):
+    global _resize_start_x
+    if _agent_panel_ref:
+        _agent_panel_ref.width = _agent_panel_width
+        try:
+            _agent_panel_ref.update()
+        except Exception:
+            pass
+    _resize_start_x = 0
 
 
 def _agent_theme_colors():
@@ -103,53 +151,38 @@ def _agent_theme_colors():
         }
 
 
-def _reformat_tables(text: str) -> str:
-    """将 markdown 表格转为窄面板友好的列表格式。
+def _format_agent_text(text: str):
+    """处理 Agent 消息：宽表格转列表，返回 (显示文本, [原始表格])。
 
-    3 列以上的表格会被转为列表：
-      原文: | 论文 | 方法 | 年份 |
-            |------|------|------|
-            | A    | BERT | 2023 |
-      输出: - **A**: 方法=BERT · 年份=2023
-
-    2 列以内的表格保持原始格式。
+    Returns:
+        (formatted_markdown, [table_data]) — 无表格时 table_data 为空列表
+        每个 table_data = (header, rows)
     """
+    if "|---" not in text and "| --" not in text:
+        return text, []
+
     lines = text.split('\n')
-    result = []
+    result_lines = []
+    tables: list[tuple[list[str], list[list[str]]]] = []
+    buf: list[str] = []
     header: list[str] = []
     rows: list[list[str]] = []
     in_table = False
 
-    def _flush():
+    def _flush_text():
+        nonlocal buf
+        if buf:
+            result_lines.extend(buf)
+            buf = []
+
+    def _flush_table():
         nonlocal header, rows, in_table
         if not rows:
             header, rows = [], []
             in_table = False
             return
-        if len(header) <= 2:
-            # 窄表保持原样
-            result.append('| ' + ' | '.join(header) + ' |')
-            result.append('|' + '|'.join(['---' for _ in header]) + '|')
-            for row in rows:
-                padded = row + [''] * (len(header) - len(row))
-                result.append('| ' + ' | '.join(padded[:len(header)]) + ' |')
-        else:
-            result.append('')
-            for row in rows:
-                parts = []
-                first = row[0] if row else ''
-                for j in range(1, min(len(row), len(header))):
-                    val = row[j]
-                    if val:
-                        h = header[j] if j < len(header) else ''
-                        parts.append(f'{h}={val}' if h else val)
-                if first and parts:
-                    result.append(f'- **{first}**: {" · ".join(parts)}')
-                elif first:
-                    result.append(f'- **{first}**')
-                elif parts:
-                    result.append(f'- {" · ".join(parts)}')
-            result.append('')
+        tables.append((list(header), [list(r) for r in rows]))
+        result_lines.append(f'<!--TABLE_{len(tables) - 1}-->')
         header, rows = [], []
         in_table = False
 
@@ -158,26 +191,62 @@ def _reformat_tables(text: str) -> str:
         if stripped.startswith('|') and '|' in stripped[1:]:
             cells = [c.strip() for c in stripped.split('|')[1:-1]]
             if not in_table:
+                _flush_text()
                 in_table = True
                 header = cells
             elif not all(c.replace('-', '').replace(':', '').strip() == '' for c in cells):
                 rows.append(cells)
         else:
             if in_table:
-                _flush()
-            result.append(line)
+                _flush_table()
+            buf.append(line)
 
     if in_table:
-        _flush()
+        _flush_table()
+    else:
+        _flush_text()
 
-    return '\n'.join(result)
+    result_text = '\n'.join(result_lines)
+    for i, (hdr, data_rows) in enumerate(tables):
+        list_repr = _table_to_list(hdr, data_rows)
+        result_text = result_text.replace(f'<!--TABLE_{i}-->', list_repr, 1)
+
+    return result_text, tables
 
 
-def send_agent_message(text: str, role: str = "user"):
-    """向 Agent 对话面板发送一条消息。"""
-    global _agent_msg_list
-    if _agent_msg_list is None:
-        return
+def _table_to_list(header: list[str], rows: list[list[str]]) -> str:
+    """将表格转为窄面板友好的列表。≤2 列保持原样，>2 列转列表。"""
+    if len(header) <= 2:
+        parts = ['| ' + ' | '.join(header) + ' |']
+        parts.append('|' + '|'.join(['---' for _ in header]) + '|')
+        for row in rows:
+            padded = row + [''] * (len(header) - len(row))
+            parts.append('| ' + ' | '.join(padded[:len(header)]) + ' |')
+        return '\n'.join(parts)
+
+    lines = ['']
+    for row in rows:
+        parts = []
+        first = row[0] if row else ''
+        for j in range(1, min(len(row), len(header))):
+            val = row[j]
+            if val:
+                h = header[j] if j < len(header) else ''
+                parts.append(f'{h}={val}' if h else val)
+        if first and parts:
+            lines.append(f'- **{first}**: {" · ".join(parts)}')
+        elif first:
+            lines.append(f'- **{first}**')
+        elif parts:
+            lines.append(f'- {" · ".join(parts)}')
+    lines.append('')
+    return '\n'.join(lines)
+
+
+
+
+def _make_bubble(text: str, role: str = "user") -> ft.Container:
+    """构建一条消息气泡（不追加到列表，不调用 update）。"""
     colors = _agent_theme_colors()
     if role == "user":
         bg = colors["user_bubble"]
@@ -190,17 +259,26 @@ def send_agent_message(text: str, role: str = "user"):
 
     if role == "agent":
         try:
-            body = ft.Markdown(
-                _reformat_tables(text),
-                selectable=True,
-                extension_set="gitHubWeb",
-            )
+            formatted, _ = _format_agent_text(text)
+            try:
+                body = ft.Markdown(
+                    formatted,
+                    selectable=True,
+                    extension_set="gitHubWeb",
+                )
+            except Exception:
+                logger.warning("Markdown gitHubWeb failed, fallback to plain", exc_info=True)
+                try:
+                    body = ft.Markdown(formatted, selectable=True)
+                except Exception:
+                    raise
         except Exception:
+            logger.warning("Markdown render failed, fallback to plain text", exc_info=True)
             body = ft.Text(text, size=13, color=fg, no_wrap=False, selectable=True)
     else:
         body = ft.Text(text, size=13, color=fg, no_wrap=False, selectable=True)
 
-    bubble = ft.Container(
+    return ft.Container(
         content=ft.Column([
             ft.Text(label, size=11, color=fg, weight=ft.FontWeight.W_600, opacity=0.7),
             body,
@@ -211,6 +289,14 @@ def send_agent_message(text: str, role: str = "user"):
         expand=True,
         clip_behavior=ft.ClipBehavior.HARD_EDGE,
     )
+
+
+def send_agent_message(text: str, role: str = "user"):
+    """向 Agent 对话面板发送一条消息。"""
+    global _agent_msg_list
+    if _agent_msg_list is None:
+        return
+    bubble = _make_bubble(text, role)
     _agent_msg_list.controls.append(bubble)
     if len(_agent_msg_list.controls) > 200:
         _agent_msg_list.controls.pop(0)
@@ -226,8 +312,12 @@ def _show_thinking_bubble():
     Returns:
         (content_text, stop_event) — 调用方在拿到结果后 stop_event.set()
         停止动画，然后直接改 content_text.value 原地替换文字。
+        若已有思考动画，返回 (None, None)。
     """
-    global _agent_msg_list
+    global _agent_msg_list, _thinking_active
+    if _thinking_active:
+        return None, None
+    _thinking_active = True
     colors = _agent_theme_colors()
     fg = colors["agent_text"]
 
@@ -275,20 +365,21 @@ def _show_thinking_bubble():
 
 def _scroll_agent_to_bottom():
     """将 Agent 消息列表滚到底部。"""
-    if _agent_msg_list is None:
+    global _page
+    if _agent_msg_list is None or _page is None:
         return
 
     async def _do():
         await asyncio.sleep(0.3)
-        await _agent_msg_list.scroll_to(offset=-1, duration=0)
+        if _agent_msg_list is not None:
+            await _agent_msg_list.scroll_to(offset=-1, duration=0)
 
-    try:
-        asyncio.get_running_loop().create_task(_do())
-    except RuntimeError:
-        pass
+    _page.run_task(_do)
 
 
-def _trigger_agent_chat(message: str, papers: list | None = None):
+def _trigger_agent_chat(message: str, papers: list | None = None,
+                        thinking_enabled: bool = False,
+                        display_message: str = ""):
     """统一的 Agent 对话入口：思考动画 + 后台调用 chat() + 原地显示回复。
 
     供 _on_agent_send 和 _trigger_compare_papers 共用。
@@ -334,8 +425,11 @@ def _trigger_agent_chat(message: str, papers: list | None = None):
             pass
 
     content_text, thinking_stop = _show_thinking_bubble()
+    if thinking_stop is None:
+        return  # 已有思考动画在进行中
 
     def _bg_chat():
+        global _thinking_active
         try:
             result = _ai_service.chat(
                 project_id=_agent_project_id or 0,
@@ -344,30 +438,74 @@ def _trigger_agent_chat(message: str, papers: list | None = None):
                 topic_desc=_agent_topic_desc,
                 papers=papers,
                 project_papers=_proj_papers,
+                thinking_enabled=thinking_enabled,
+                display_message=display_message,
             )
             reply = result.get("reply", "抱歉，AI 服务暂时无法回复。")
 
+            # DEBUG: 打印 AI 原始回复，检查是否包含 ACTION 标签
+            logger.info("[Agent] raw reply (%d chars): ...%s", len(reply), reply[-300:] if len(reply) > 300 else reply)
+
+            # 解析 [ACTION:xxx] 标记，提取动作并在主线程执行
+            reply, actions = _parse_agent_actions(reply)
+            logger.info("[Agent] parsed actions: %s", actions)
+
+            # 检测课题修改提案 [PROJECT_UPDATE]...[/PROJECT_UPDATE]
+            proposal = _parse_project_update(reply)
+            if proposal and _agent_project_id:
+                new_name, new_desc = proposal
+                reply = re.sub(r'\s*\[PROJECT_UPDATE\].*?\[/PROJECT_UPDATE\]', '', reply, flags=re.DOTALL).strip()
+
             thinking_stop.set()
-            content_text.italic = False
-            content_text.value = reply
-            try:
-                content_text.update()
-            except RuntimeError:
-                pass
+            _thinking_active = False
+            if _agent_msg_list and _agent_msg_list.controls:
+                try:
+                    _agent_msg_list.controls.pop()
+                    _agent_msg_list.update()
+                except RuntimeError:
+                    pass
+            send_agent_message(reply, role="agent")
+
+            # 弹出确认对话框
+            if proposal and _agent_project_id:
+                _show_project_update_dialog(_agent_project_id, new_name, new_desc)
+
+            # AI 没输出 ACTION 标签时，根据用户消息意图自动兜底
+            if not actions:
+                actions = _infer_actions_from_message(message, reply)
+                if actions:
+                    logger.info("[Agent] fallback inferred actions: %s", actions)
+
+            # 在主线程执行 Agent 动作（search 是异步的，后续动作需等搜索完成）
+            if actions and _page:
+                async def _run_actions():
+                    has_search = any(a["type"] == "search" for a in actions)
+                    if has_search and len(actions) > 1:
+                        _dispatch_agent_action(actions[0])
+                        remaining = [a["type"] for a in actions[1:]]
+                        send_agent_message(
+                            f"检索完成后请再次告诉我执行后续操作（{', '.join(remaining)}）。",
+                            role="system",
+                        )
+                    else:
+                        for action in actions:
+                            _dispatch_agent_action(action)
+                _page.run_task(_run_actions)
 
         except Exception as ex:
             thinking_stop.set()
-            content_text.italic = False
-            err_msg = f"出错了：{ex}"
-            content_text.value = err_msg
-            try:
-                content_text.update()
-            except RuntimeError:
-                pass
+            _thinking_active = False
+            if _agent_msg_list and _agent_msg_list.controls:
+                try:
+                    _agent_msg_list.controls.pop()
+                    _agent_msg_list.update()
+                except RuntimeError:
+                    pass
+            send_agent_message(f"出错了：{ex}", role="agent")
             if _agent_project_id is not None:
                 _ai_service.log_message(
                     _agent_project_id, _agent_project_name or "通用",
-                    "assistant", err_msg, _agent_topic_desc)
+                    "assistant", f"出错了：{ex}", _agent_topic_desc)
 
     threading.Thread(target=_bg_chat, daemon=True).start()
 
@@ -386,7 +524,7 @@ def _trigger_compare_papers(papers: list, source: str = "search"):
         f"从研究目标、方法、主要发现、创新点和局限性五个维度进行比较。"
         f"请用表格或分点形式组织输出，方便快速理解各论文之间的异同。"
     )
-    _trigger_agent_chat(prompt, papers=papers)
+    _trigger_agent_chat(prompt, papers=papers, thinking_enabled=True)
 
 
 def clear_agent_messages():
@@ -415,15 +553,24 @@ def load_agent_conversation():
     # 注入到 AI service 缓存，保证 chat() 能找到已有上下文
     _ai_service._conversations[_agent_project_id] = cm
 
-    # 显示压缩摘要
+    # 批量构建气泡，最后一次性 update + scroll
+    bubbles = []
+
     for cs in cm.compressed_summaries:
         text = f"📋 历史摘要：{cs.get('rounds_summary', '')}"
-        send_agent_message(text, role="agent")
+        bubbles.append(_make_bubble(text, role="agent"))
 
-    # 显示最近的对话消息
     for msg in cm.display_messages:
         role = "user" if msg["role"] == "user" else "agent"
-        send_agent_message(msg["content"], role=role)
+        bubbles.append(_make_bubble(msg["content"], role=role))
+
+    _agent_msg_list.controls.extend(bubbles)
+    if len(_agent_msg_list.controls) > 200:
+        _agent_msg_list.controls = _agent_msg_list.controls[-200:]
+    try:
+        _agent_msg_list.update()
+    except RuntimeError:
+        pass
 
     _scroll_agent_to_bottom()
 
@@ -433,16 +580,421 @@ def set_agent_project(project_id: int | None, project_name: str = "",
                       topic_desc: str = ""):
     """设置 Agent 当前关联的课题，自动加载历史对话。"""
     global _agent_project_id, _agent_project_name, _agent_topic_desc
-    if _agent_project_id != project_id:
-        _agent_project_id = project_id
-        _agent_project_name = project_name
-        _agent_topic_desc = topic_desc
-        if project_id is not None:
-            load_agent_conversation()
-    else:
-        _agent_project_id = project_id
-        _agent_project_name = project_name
-        _agent_topic_desc = topic_desc
+    name_changed = (project_id is not None and _agent_project_id == project_id
+                    and _agent_project_name and _agent_project_name != project_name)
+    if name_changed:
+        # 课题改名：重命名仓库文件夹，清除旧的 conversation 缓存
+        try:
+            from paperpilot import repo_manager
+            repo_manager.rename_project(_agent_project_name, project_name)
+        except Exception:
+            pass
+        if _ai_service:
+            _ai_service._conversations.pop(project_id, None)
+    _agent_project_id = project_id
+    _agent_project_name = project_name
+    _agent_topic_desc = topic_desc
+    if project_id is not None:
+        load_agent_conversation()
+
+def _parse_project_update(text: str) -> tuple | None:
+    """从 AI 回复中检测 [PROJECT_UPDATE] 标记，返回 (name, description)。"""
+    m = re.search(r'\[PROJECT_UPDATE\]\s*(.+?)\s*\[/PROJECT_UPDATE\]', text, re.DOTALL)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1))
+        name = (data.get("name") or "").strip()
+        desc = (data.get("description") or "").strip()
+        if name:
+            return name, desc
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    return None
+
+
+def _parse_agent_actions(reply: str) -> tuple[str, list[dict]]:
+    """从 AI 回复中提取 [ACTION:xxx] 标记，返回 (清理后文本, 动作列表)。
+
+    动作格式：
+        [ACTION:search]{"topic_name": "...", "topic_desc": "...", "keywords": [...]}[/ACTION]
+        [ACTION:score]{"scope": "all", "limit": 20}[/ACTION]
+        [ACTION:import]{"project": "...", "filter": "ai_score > 80"}[/ACTION]
+    """
+    import re as _re
+    actions: list[dict] = []
+
+    def _replacer(m: _re.Match) -> str:
+        action_type = m.group(1)
+        try:
+            params = json.loads(m.group(2))
+            if isinstance(params, dict):
+                actions.append({"type": action_type, "params": params})
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        return ""
+
+    cleaned = _re.sub(
+        r'\s*\[ACTION:(\w+)\]\s*(.+?)\s*\[/ACTION\]\s*',
+        _replacer, reply, flags=_re.DOTALL,
+    ).strip()
+    return cleaned, actions
+
+
+def _infer_actions_from_message(user_msg: str, ai_reply: str) -> list[dict]:
+    """当 AI 未输出 ACTION 标签时，根据用户消息意图兜底推断动作。"""
+    msg = user_msg.lower()
+    actions: list[dict] = []
+
+    _SEARCH_KW = ("检索", "搜索", "查找", "搜一下", "找论文", "找文章", "帮我找", "帮我搜", "查一下", "搜一搜")
+    _SCORE_KW = ("打分", "评分", "精排", "排序", "排一下", "打个分", "评个分", "ai打分", "ai评分")
+    _IMPORT_KW = ("保存到文献", "导入文献", "存到文献", "放到文献", "存入文献", "导入课题", "保存到课题",
+                   "加入文献", "放入文献", "存进文献", "导入到", "保存到库", "加入到文献", "加入到课题")
+
+    if any(k in msg for k in _SCORE_KW):
+        # 从用户消息中提取数字作为篇数限制
+        nums = re.findall(r'(\d+)\s*篇', user_msg)
+        if not nums:
+            nums = re.findall(r'(?:前|top)\s*(\d+)', user_msg, re.IGNORECASE)
+        limit = min(int(nums[0]), 50) if nums else 20
+        actions.append({"type": "score", "params": {"scope": "all", "limit": limit}})
+        return actions
+
+    if any(k in msg for k in _IMPORT_KW):
+        params = {}
+        # 提取分数筛选条件，如"60分以上" "大于80分"
+        fm = re.search(r'(\d+)\s*分以上', user_msg) or re.search(r'(?:大于|超过|>=?)\s*(\d+)\s*分', user_msg)
+        if fm:
+            params["filter"] = f"ai_score >= {fm.group(1)}"
+        actions.append({"type": "import", "params": params})
+        return actions
+
+    if any(k in msg for k in _SEARCH_KW):
+        # 从 AI 回复中提取英文词作为候选关键词
+        en_words = re.findall(r'\b[A-Za-z][\w-]{2,}\b', ai_reply)
+        _stop = {"the", "and", "for", "with", "from", "that", "this", "are", "was", "will",
+                 "can", "have", "has", "been", "but", "not", "also", "its", "such", "into",
+                 "which", "their", "these", "those", "more", "based", "using", "used"}
+        en_kw = list(dict.fromkeys(w for w in en_words if w.lower() not in _stop))[:6]
+
+        # 如果 AI 回复没有英文词，回退到搜索页已有关键词
+        if len(en_kw) < 2 and state.keywords:
+            en_kw = list(state.keywords)[:6]
+
+        desc = state.topic_desc or _agent_topic_desc or user_msg[:200]
+        primary = en_kw[:2] if en_kw else []
+        secondary = en_kw[2:] if en_kw else []
+        actions.append({"type": "search", "params": {
+            "topic_name": state.topic_name or _agent_project_name or "",
+            "topic_desc": desc,
+            "primary_keywords": primary,
+            "secondary_keywords": secondary,
+        }})
+        return actions
+
+    return actions
+
+
+def _dispatch_agent_action(action: dict):
+    """执行单个 Agent 动作（必须在主线程调用）。"""
+    global _search_actions, _search_selected_ids, _search_checkboxes
+    action_type = action["type"]
+    params = action.get("params", {})
+    sa = _search_actions
+    logger.info("[Agent dispatch] type=%s, params=%s, sa_keys=%s, has_scores=%d",
+                action_type, params, list(sa.keys()) if sa else "EMPTY", len(state.scores))
+
+    # 自动切换到检索页面
+    if action_type in ("search", "score", "import"):
+        try:
+            page_switcher(0)  # 0 = 检索页
+        except Exception:
+            pass
+
+    if action_type == "search":
+        if not sa:
+            send_agent_message("请先切换到检索页面。", role="system")
+            return
+
+        topic_name = params.get("topic_name", "").strip()
+        topic_desc = params.get("topic_desc", "").strip()
+        primary_kw = params.get("primary_keywords", [])
+        secondary_kw = params.get("secondary_keywords", [])
+        keywords = params.get("keywords", [])
+
+        # 兼容旧格式：无 primary/secondary 时，从 keywords 自动分配
+        if not primary_kw and not secondary_kw and keywords:
+            primary_kw = keywords[:2]
+            secondary_kw = keywords[2:]
+
+        if topic_name:
+            try:
+                sa["topic_name"].value = topic_name
+                sa["topic_name"].update()
+            except Exception:
+                pass
+        if topic_desc:
+            try:
+                sa["topic_desc"].value = topic_desc
+                sa["topic_desc"].update()
+            except Exception:
+                pass
+
+        if primary_kw or secondary_kw:
+            state.primary_keywords = list(primary_kw)
+            state.secondary_keywords = list(secondary_kw)
+            state.regular_keywords = []
+            state.keywords = list(primary_kw) + list(secondary_kw)
+            try:
+                sa["refresh_all_zones"]()
+            except Exception:
+                pass
+
+        # 没有关键词时，自动从描述提取再检索
+        if not state.keywords and topic_desc:
+            send_agent_message(f"正在提取关键词并检索：{topic_desc[:60]}...", role="system")
+            def _auto_extract_and_search():
+                try:
+                    weighted = extract_all_keywords(topic_desc, top_n=8)
+                    async def _set_and_go():
+                        state.keywords = [kw for kw, _ in weighted]
+                        core = [kw for kw, w in weighted if w >= 1.0]
+                        rest = [kw for kw, w in weighted if w < 1.0]
+                        # 高权重做主关键词；若全低权重则取前3个兜底
+                        state.primary_keywords = core if core else [kw for kw, _ in weighted[:3]]
+                        state.secondary_keywords = rest if core else [kw for kw, _ in weighted[3:]]
+                        state.regular_keywords = []
+                        try:
+                            sa["refresh_all_zones"]()
+                        except Exception:
+                            pass
+                        try:
+                            sa["on_start_search"](None)
+                        except Exception as ex:
+                            send_agent_message(f"检索启动失败：{ex}", role="system")
+                    _page.run_task(_set_and_go)
+                except Exception as ex:
+                    send_agent_message(f"关键词提取失败：{ex}", role="system")
+            threading.Thread(target=_auto_extract_and_search, daemon=True).start()
+            return
+
+        all_kw = list(primary_kw) + list(secondary_kw)
+        send_agent_message(
+            f"正在检索：{topic_desc or topic_name or ' '.join(all_kw[:3])}...",
+            role="system",
+        )
+        try:
+            sa["on_start_search"](None)
+        except Exception as ex:
+            send_agent_message(f"检索启动失败：{ex}", role="system")
+
+    elif action_type == "score":
+        if not sa:
+            send_agent_message("请先切换到检索页面。", role="system")
+            return
+        if not state.scores:
+            send_agent_message("当前没有检索结果可供评分。", role="system")
+            return
+
+        # 读取 Agent 指定的篇数限制
+        agent_limit = params.get("limit")
+        if isinstance(agent_limit, (int, float)) and agent_limit > 0:
+            agent_limit = min(int(agent_limit), 50)
+            try:
+                sa["ai_limit_dd"].value = str(agent_limit)
+                sa["ai_limit_dd"].update()
+            except Exception:
+                pass
+            send_agent_message(f"正在 AI 精排打分（上限 {agent_limit} 篇）...", role="system")
+        else:
+            send_agent_message("正在 AI 精排打分...", role="system")
+        try:
+            sa["on_ai_score"](None)
+        except Exception as ex:
+            send_agent_message(f"AI 评分启动失败：{ex}", role="system")
+
+    elif action_type == "import":
+        global _agent_project_id, _agent_project_name
+        if not state.scores:
+            send_agent_message("当前没有检索结果可供导入。", role="system")
+            return
+
+        # 确定目标课题：优先用 Agent 当前课题，否则弹窗选择
+        if _agent_project_id and _agent_project_name:
+            target_pid = _agent_project_id
+            target_name = _agent_project_name
+            auto_mode = True
+        else:
+            send_agent_message("请先在文献库中选择一个课题。", role="system")
+            if sa:
+                try:
+                    sa["on_save_to_library"](None)
+                except Exception as ex:
+                    send_agent_message(f"保存对话框打开失败：{ex}", role="system")
+            return
+
+        # 按条件筛选论文
+        filter_applied = False
+        filter_rule = params.get("filter", "")
+        if filter_rule and isinstance(filter_rule, str):
+            import re as _re
+            m = _re.match(r'(\w+)\s*(>=?|<=?|==)\s*(\d+(?:\.\d+)?)', filter_rule.strip())
+            if m:
+                filter_applied = True
+                field, op, val = m.group(1), m.group(2), float(m.group(3))
+                _search_selected_ids.clear()
+                for i, (p, _) in enumerate(state.scores):
+                    pv = p.get(field)
+                    if pv is None:
+                        continue
+                    try:
+                        pv = float(pv)
+                    except (TypeError, ValueError):
+                        continue
+                    if op == '>':
+                        match = pv > val
+                    elif op == '>=':
+                        match = pv >= val
+                    elif op == '<':
+                        match = pv < val
+                    elif op == '<=':
+                        match = pv <= val
+                    elif op == '==':
+                        match = abs(pv - val) < 0.01
+                    else:
+                        match = False
+                    if match:
+                        _search_selected_ids.add(i)
+                try:
+                    sa["refresh_results_table"]() if sa else None
+                except Exception:
+                    pass
+
+        # 收集待保存论文（筛选匹配 0 篇时不导入全部）
+        if _search_selected_ids:
+            sel_papers = [state.scores[i][0] for i in sorted(_search_selected_ids) if i < len(state.scores)]
+        elif filter_applied:
+            sel_papers = []
+        else:
+            sel_papers = [s[0] for s in state.scores]
+
+        if not sel_papers:
+            send_agent_message("没有符合条件的论文。", role="system")
+            return
+
+        # 直接保存到 Agent 当前课题
+        n, _ = library.save_papers_to_project(target_pid, sel_papers,
+            [(p, 0.0) for p in sel_papers])
+        _search_selected_ids.clear()
+
+        # 刷新检索结果表格
+        if sa and sa.get("refresh_results_table"):
+            try:
+                sa["refresh_results_table"]()
+            except Exception:
+                pass
+
+        # PDF 导入 + 自动下载
+        imported = 0
+        for paper in sel_papers:
+            pdf = paper.get("pdf_path", "")
+            if not pdf or not os.path.isfile(str(pdf)):
+                pdf = repo_manager.get_cached_pdf(paper)
+            if pdf and os.path.isfile(str(pdf)):
+                paper["pdf_path"] = pdf
+                repo_path = repo_manager.import_pdf(paper, target_name)
+                if repo_path:
+                    doi = paper.get("doi") or ""
+                    if doi:
+                        library.set_paper_pdf_path(doi, repo_path)
+                    else:
+                        title = paper.get("title") or ""
+                        if title:
+                            library.set_paper_pdf_path_by_title(title, repo_path, paper.get("year"))
+                imported += 1
+
+        # 立即刷新文献库（论文已保存），后台下载完成后再次刷新（绿标）
+        if _refresh_paper_list_cb is not None:
+            try:
+                _refresh_paper_list_cb(target_pid)
+            except Exception:
+                pass
+
+        # 后台下载缺失 PDF
+        _need_dl = [p for p in sel_papers if not (p.get("pdf_path") and os.path.isfile(str(p.get("pdf_path"))))]
+        if _need_dl:
+            def _auto_dl():
+                ok = 0
+                for paper in _need_dl:
+                    try:
+                        cache_path = downloader.cache_pdf(paper)
+                        if cache_path and os.path.isfile(cache_path):
+                            paper["pdf_path"] = cache_path
+                            repo_path = repo_manager.import_pdf(paper, target_name)
+                            if repo_path:
+                                doi = paper.get("doi") or ""
+                                if doi:
+                                    library.set_paper_pdf_path(doi, repo_path)
+                                else:
+                                    title = paper.get("title") or ""
+                                    if title:
+                                        library.set_paper_pdf_path_by_title(title, repo_path, paper.get("year"))
+                            ok += 1
+                    except Exception:
+                        pass
+                if ok:
+                    print(f"[auto-dl] Downloaded {ok}/{len(_need_dl)} papers for '{target_name}'", flush=True)
+                    global _refresh_paper_list_cb
+                    if _refresh_paper_list_cb is not None:
+                        try:
+                            _refresh_paper_list_cb(target_pid)
+                        except Exception:
+                            pass
+            threading.Thread(target=_auto_dl, daemon=True).start()
+
+        dl_note = f"（{len(_need_dl)} 篇后台下载中...）" if _need_dl else ""
+        send_agent_message(
+            f"已保存 {n} 篇论文到「{target_name}」{dl_note}",
+            role="system",
+        )
+
+
+def _show_project_update_dialog(pid: int, new_name: str, new_desc: str):
+    """AI 辅助完善课题的确认对话框。"""
+    if _page is None or pid is None:
+        return
+
+    def do_apply(e):
+        library.update_project(pid, name=new_name, description=new_desc)
+        set_agent_project(pid, new_name, new_desc)
+        if _refresh_library:
+            _refresh_library()
+        send_agent_message(f"已更新课题：**{new_name}**", role="system")
+        dlg.open = False
+        _page.update()
+
+    def do_cancel(e):
+        send_agent_message("已取消课题修改。", role="system")
+        dlg.open = False
+        _page.update()
+
+    dlg = ft.AlertDialog(
+        title=ft.Text("AI 建议修改课题"),
+        content=ft.Column([
+            ft.Text("是否应用以下修改？", size=14),
+            ft.Divider(height=4),
+            ft.Text(f"名称：{new_name}", size=13, weight=ft.FontWeight.W_500),
+            ft.Text(f"描述：{new_desc}", size=13),
+        ], spacing=8, tight=True),
+        actions=[
+            ft.TextButton("取消", on_click=do_cancel),
+            ft.FilledButton("确认修改", on_click=do_apply),
+        ],
+    )
+    _page.overlay.append(dlg)
+    dlg.open = True
+    _page.update()
+
 
 _search_select_count_ref = None  # 多选计数 UI
 _search_check_handler = None  # _on_search_check_one 引用
@@ -853,7 +1405,8 @@ def build_project_page():
     results_summary = summary
 
     # ── 检索结果多选（始终可见）──
-    _search_selected_ids = set()
+    global _search_selected_ids
+    _search_selected_ids.clear()
 
     search_select_count = ft.Text("未选中", size=13)
     search_compare_btn = ft.OutlinedButton(
@@ -928,11 +1481,11 @@ def build_project_page():
 
     ai_limit_dd = ft.Dropdown(
         options=[
-            ft.dropdown.Option("10", "10 篇"),
-            ft.dropdown.Option("20", "20 篇"),
             ft.dropdown.Option("50", "50 篇"),
+            ft.dropdown.Option("20", "20 篇"),
+            ft.dropdown.Option("10", "10 篇"),
         ],
-        value="20",
+        value="50",
         width=80,
         visible=False,
         text_size=12,
@@ -956,6 +1509,8 @@ def build_project_page():
         if not _ai_service.is_available:
             ai_score_btn.tooltip = "需要配置 DeepSeek API Key"
             ai_score_btn.update()
+            if e is None:
+                send_agent_message("AI 服务不可用，请检查 config.yaml 中的 API Key 配置。", role="system")
             return
 
         # 收集论文
@@ -970,27 +1525,35 @@ def build_project_page():
         candidates_idx: list[tuple[int, dict]] = []
 
         if _search_selected_ids:
+            # 手动选中：全量打分，上限50
             for i in sorted(_search_selected_ids):
                 if i >= len(state.scores):
                     continue
-                p = state.scores[i][0]
-                abstract = (p.get("abstract") or "").strip()
-                if abstract and len(abstract) >= 80:
-                    candidates_idx.append((i, p))
-                if len(candidates_idx) >= limit:
+                candidates_idx.append((i, state.scores[i][0]))
+                if len(candidates_idx) >= 50:
                     break
         else:
+            # 未选中：取前 N 篇，N 由下拉框控制
             for i, (p, _) in enumerate(state.scores):
-                abstract = (p.get("abstract") or "").strip()
-                if abstract and len(abstract) >= 80:
-                    candidates_idx.append((i, p))
+                candidates_idx.append((i, p))
                 if len(candidates_idx) >= limit:
                     break
 
         candidates = [p for _, p in candidates_idx]
 
+        # debug: 记录摘要长度分布
+        import logging as _log
+        _log.getLogger(__name__).info(
+            "on_ai_score: called from %s, total=%d, limit=%d, candidates=%d, "
+            "abstract_lens=%s, topic=%s",
+            "agent" if e is None else "manual",
+            len(all_papers), limit, len(candidates),
+            [len((p.get("abstract") or "").strip()) for p in candidates[:5]],
+            (state.topic_desc or state.topic_name)[:60],
+        )
+
         if not candidates_idx:
-            _ai_score_status.value = "没有可评分的论文（缺少摘要）"
+            _ai_score_status.value = "没有可评分的论文"
             _ai_score_status.visible = True
             _ai_score_status.update()
             return
@@ -1148,11 +1711,11 @@ def build_project_page():
             if _search_selected_ids:
                 sel_papers = [state.scores[i][0] for i in _search_selected_ids if i < len(state.scores)]
                 sel_scores = [(state.scores[i][0], state.scores[i][1]) for i in _search_selected_ids if i < len(state.scores)]
-                n = library.save_papers_to_project(pid, sel_papers, sel_scores)
+                n, _ = library.save_papers_to_project(pid, sel_papers, sel_scores)
                 papers_to_import = sel_papers
                 _search_selected_ids.clear()
             else:
-                n = library.save_papers_to_project(pid, state.papers, state.scores)
+                n, _ = library.save_papers_to_project(pid, state.papers, state.scores)
                 papers_to_import = [s[0] for s in state.scores]
 
             # ── PDF 导入 + DB 更新（DOI 优先，标题回退）──
@@ -1214,6 +1777,16 @@ def build_project_page():
                 result_text.value += f"（{len(_papers_need_dl)} 篇后台下载中...）"
             result_text.color = ft.Colors.GREEN
             result_text.update()
+
+            # 刷新检索结果表格（绿标）和文献库论文列表
+            refresh_results_table()
+            global _refresh_paper_list_cb
+            if _refresh_paper_list_cb is not None:
+                try:
+                    _refresh_paper_list_cb(pid)
+                except Exception:
+                    pass
+
             dlg.open = False
             dlg.update()
 
@@ -1319,11 +1892,15 @@ def build_project_page():
     manual_kw_field.on_submit = on_add_keyword
 
     def on_start_search(e):
+        logger.info("[on_start_search] called, topic_desc=%r, keywords=%s",
+                    topic_desc_field.value.strip()[:60], state.keywords[:5] if state.keywords else "EMPTY")
         if not topic_desc_field.value.strip():
+            logger.warning("[on_start_search] BLOCKED: empty topic_desc")
             status_text.value = "请先输入检索描述"
             status_text.update()
             return
         if not state.keywords:
+            logger.warning("[on_start_search] BLOCKED: empty keywords")
             status_text.value = "请先提取关键词"
             status_text.update()
             return
@@ -1470,6 +2047,21 @@ def build_project_page():
         results_area,
     ], spacing=0, expand=True)
 
+    # ── 注册检索页回调，供 Agent [ACTION:xxx] 标记使用 ──
+    global _search_actions
+    _search_actions = {
+        "on_start_search": on_start_search,
+        "on_ai_score": on_ai_score,
+        "on_save_to_library": on_save_to_library,
+        "on_extract": on_extract,
+        "topic_name": topic_name_field,
+        "topic_desc": topic_desc_field,
+        "ai_limit_dd": ai_limit_dd,
+        "refresh_all_zones": refresh_all_zones,
+        "refresh_results_table": refresh_results_table,
+        "update_search_count": _update_search_count,
+    }
+
     return ft.Stack([
         left_side,
         sidebar,
@@ -1603,24 +2195,68 @@ def show_paper_detail(paper: dict):
     read_btn.on_click = _on_read
 
     async def _on_import(e, p=_current_paper):
+        try:
+            import ctypes
+            ctypes.windll.user32.AllowSetForegroundWindow(-1)
+            print("[_on_import] AllowSetForegroundWindow(-1) OK", flush=True)
+        except Exception as ex:
+            print(f"[_on_import] AllowSetForegroundWindow failed: {ex}", flush=True)
+
         import_result = {"selected": None, "done": False}
 
         def _bg_pick():
+            print("[_bg_pick] started", flush=True)
             try:
-                import tkinter as _tk
-                from tkinter import filedialog as _fd
-                root = _tk.Tk()
-                root.withdraw()
-                root.attributes("-topmost", True)
-                selected = _fd.askopenfilename(
-                    title="选择下载好的 PDF 文件",
-                    filetypes=[("PDF Files", "*.pdf")],
+                import subprocess, tempfile, os as _os
+                script = (
+                    'Add-Type -AssemblyName System.Windows.Forms\n'
+                    'Add-Type -TypeDefinition @"\n'
+                    'using System; using System.Runtime.InteropServices;\n'
+                    'public class FH{\n'
+                    '  [DllImport("user32.dll")]public static extern void keybd_event(byte a,byte b,uint c,UIntPtr d);\n'
+                    '  [DllImport("user32.dll")]public static extern bool SetForegroundWindow(IntPtr h);\n'
+                    '}\n'
+                    '"@ -ErrorAction SilentlyContinue\n'
+                    '[FH]::keybd_event(0x12,0,0,[UIntPtr]::Zero)\n'
+                    '[FH]::keybd_event(0x12,0,2,[UIntPtr]::Zero)\n'
+                    '$owner=New-Object System.Windows.Forms.Form\n'
+                    '$owner.Size=New-Object System.Drawing.Size(0,0)\n'
+                    "$owner.StartPosition='Manual'\n"
+                    '$owner.Location=New-Object System.Drawing.Point(-32000,-32000)\n'
+                    "$owner.FormBorderStyle='None'\n"
+                    '$owner.ShowInTaskbar=$false\n'
+                    '$owner.TopMost=$true\n'
+                    '$owner.Show()\n'
+                    '[FH]::SetForegroundWindow($owner.Handle)\n'
+                    '[System.Windows.Forms.Application]::DoEvents()\n'
+                    '$f=New-Object System.Windows.Forms.OpenFileDialog\n'
+                    "$f.Filter='PDF Files (*.pdf)|*.pdf'\n"
+                    "$f.Title='选择下载好的 PDF 文件'\n"
+                    "if($f.ShowDialog($owner) -eq 'OK'){Write-Output $f.FileName}\n"
+                    '$owner.Close();$owner.Dispose()\n'
+                    ''
                 )
-                root.destroy()
-                if selected:
-                    import_result["selected"] = selected
-            except Exception:
-                pass
+                tmp = tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".ps1", delete=False, encoding="utf-8-sig"
+                )
+                tmp.write(script)
+                tmp.close()
+                try:
+                    r = subprocess.run(
+                        ["powershell", "-ExecutionPolicy", "Bypass", "-File", tmp.name],
+                        capture_output=True, text=True, timeout=120,
+                    )
+                    print(f"[_bg_pick] rc={r.returncode} stdout='{r.stdout.strip()[:100]}' stderr='{(r.stderr or '')[:200]}'", flush=True)
+                    selected = r.stdout.strip()
+                    if selected and _os.path.isfile(selected):
+                        import_result["selected"] = selected
+                finally:
+                    try:
+                        _os.unlink(tmp.name)
+                    except OSError:
+                        pass
+            except Exception as ex:
+                print(f"[_bg_pick] error: {ex}", flush=True)
             import_result["done"] = True
 
         import threading as _th
@@ -2019,8 +2655,8 @@ def build_results_page():
         dlg.open = True
         _page.update()
 
-    def on_rename_project(e):
-        """重命名当前选中课题。"""
+    def on_edit_project(e):
+        """编辑当前选中课题（名称 + 描述）。"""
         pid = _selected_project_id
         if pid is None:
             return
@@ -2028,21 +2664,29 @@ def build_results_page():
         if not proj:
             return
 
-        def do_rename(e):
+        def do_save(e):
             new_name = name_field.value.strip()
             if not new_name:
                 msg.value = "名称不能为空"
                 msg.color = ft.Colors.ERROR
                 msg.update()
                 return
-            if library.update_project_name(pid, new_name):
+            new_desc = desc_field.value.strip()
+            if library.update_project(pid, name=new_name, description=new_desc):
                 selected_project_title.value = new_name
+                set_agent_project(pid, new_name, new_desc)
                 refresh_project_list()
                 selected_project_title.update()
                 dlg.open = False
                 dlg.update()
 
-        name_field = ft.TextField(value=proj.name, label="课题名称", autofocus=True, on_submit=do_rename)
+        name_field = ft.TextField(value=proj.name, label="课题名称", autofocus=True)
+        desc_field = ft.TextField(
+            value=proj.description or "",
+            label="课题描述",
+            hint_text="输入1-3句描述研究方向，用于论文匹配",
+            multiline=True, min_lines=2, max_lines=4,
+        )
         msg = ft.Text("", size=12)
 
         def close_dlg(e):
@@ -2050,9 +2694,9 @@ def build_results_page():
             dlg.update()
 
         dlg = ft.AlertDialog(
-            title=ft.Text("重命名课题"),
-            content=ft.Column([name_field, msg], spacing=12, tight=True),
-            actions=[ft.TextButton("取消", on_click=close_dlg), ft.FilledButton("确认", on_click=do_rename)],
+            title=ft.Text("编辑课题"),
+            content=ft.Column([name_field, desc_field, msg], spacing=12, tight=True, height=240),
+            actions=[ft.TextButton("取消", on_click=close_dlg), ft.FilledButton("保存", on_click=do_save)],
         )
         _page.overlay.append(dlg)
         dlg.open = True
@@ -2550,8 +3194,39 @@ def build_results_page():
     # 文件选择 → PowerShell 调用 Windows 原生对话框
     def _run_ps_dialog(script: str) -> str:
         import subprocess, tempfile, os
+        try:
+            import ctypes
+            ctypes.windll.user32.AllowSetForegroundWindow(-1)
+        except Exception:
+            pass
+        _FOCUS_HELPER = (
+            'Add-Type -TypeDefinition @"\n'
+            'using System; using System.Runtime.InteropServices;\n'
+            'public class FH{\n'
+            '  [DllImport("user32.dll")]public static extern void keybd_event(byte a,byte b,uint c,UIntPtr d);\n'
+            '  [DllImport("user32.dll")]public static extern bool SetForegroundWindow(IntPtr h);\n'
+            '}\n'
+            '"@ -ErrorAction SilentlyContinue\n'
+            '[FH]::keybd_event(0x12,0,0,[UIntPtr]::Zero)\n'
+            '[FH]::keybd_event(0x12,0,2,[UIntPtr]::Zero)\n'
+            '$owner=New-Object System.Windows.Forms.Form\n'
+            '$owner.Size=New-Object System.Drawing.Size(0,0)\n'
+            "$owner.StartPosition='Manual'\n"
+            '$owner.Location=New-Object System.Drawing.Point(-32000,-32000)\n'
+            "$owner.FormBorderStyle='None'\n"
+            '$owner.ShowInTaskbar=$false\n'
+            '$owner.TopMost=$true\n'
+            '$owner.Show()\n'
+            '[FH]::SetForegroundWindow($owner.Handle)\n'
+            '[System.Windows.Forms.Application]::DoEvents()\n'
+        )
+        script = script.replace(
+            '$owner=New-Object System.Windows.Forms.Form -Property @{TopMost=$true}\n',
+            _FOCUS_HELPER,
+        )
+        script = script.replace('$owner.Dispose()\n', '$owner.Close()\n$owner.Dispose()\n')
         tmp = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".ps1", delete=False, encoding="utf-8"
+            mode="w", suffix=".ps1", delete=False, encoding="utf-8-sig"
         )
         tmp.write(script)
         tmp.close()
@@ -2560,17 +3235,28 @@ def build_results_page():
                 ["powershell", "-ExecutionPolicy", "Bypass", "-File", tmp.name],
                 capture_output=True, text=True, timeout=120,
             )
+            if r.stderr:
+                print(f"[_run_ps_dialog] stderr: {r.stderr[:200]}", flush=True)
+            print(f"[_run_ps_dialog] rc={r.returncode} stdout='{r.stdout.strip()[:100]}'", flush=True)
             return r.stdout.strip()
+        except Exception as ex:
+            print(f"[_run_ps_dialog] error: {ex}", flush=True)
+            return ""
         finally:
-            os.unlink(tmp.name)
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
 
     def _pick_single_file():
         script = (
             'Add-Type -AssemblyName System.Windows.Forms\n'
+            '$owner=New-Object System.Windows.Forms.Form -Property @{TopMost=$true}\n'
             '$f=New-Object System.Windows.Forms.OpenFileDialog\n'
             "$f.Filter='PDF Files (*.pdf)|*.pdf'\n"
             "$f.Title='选择 PDF 文件'\n"
-            "if($f.ShowDialog() -eq 'OK'){Write-Output $f.FileName}\n"
+            "if($f.ShowDialog($owner) -eq 'OK'){Write-Output $f.FileName}\n"
+            '$owner.Dispose()\n'
         )
         out = _run_ps_dialog(script)
         if out:
@@ -2579,11 +3265,13 @@ def build_results_page():
     def _pick_multiple_files():
         script = (
             'Add-Type -AssemblyName System.Windows.Forms\n'
+            '$owner=New-Object System.Windows.Forms.Form -Property @{TopMost=$true}\n'
             '$f=New-Object System.Windows.Forms.OpenFileDialog\n'
             "$f.Filter='PDF Files (*.pdf)|*.pdf'\n"
             "$f.Title='选择 PDF 文件'\n"
             '$f.Multiselect=$true\n'
-            "if($f.ShowDialog() -eq 'OK'){$f.FileNames|%{Write-Output $_}}\n"
+            "if($f.ShowDialog($owner) -eq 'OK'){$f.FileNames|%{Write-Output $_}}\n"
+            '$owner.Dispose()\n'
         )
         out = _run_ps_dialog(script)
         if out:
@@ -2592,9 +3280,11 @@ def build_results_page():
     def _pick_folder():
         script = (
             'Add-Type -AssemblyName System.Windows.Forms\n'
+            '$owner=New-Object System.Windows.Forms.Form -Property @{TopMost=$true}\n'
             '$f=New-Object System.Windows.Forms.FolderBrowserDialog\n'
             "$f.Description='选择包含 PDF 的文件夹'\n"
-            "if($f.ShowDialog() -eq 'OK'){Write-Output $f.SelectedPath}\n"
+            "if($f.ShowDialog($owner) -eq 'OK'){Write-Output $f.SelectedPath}\n"
+            '$owner.Dispose()\n'
         )
         out = _run_ps_dialog(script)
         if out:
@@ -3263,22 +3953,66 @@ def build_results_page():
 
         def _bg_dialog():
             try:
-                import tkinter as _tk
-                from tkinter import filedialog as _fd
-                root = _tk.Tk()
-                root.withdraw()
-                root.attributes("-topmost", True)
-                selected = _fd.asksaveasfilename(
-                    title=f"导出为 {label}",
-                    defaultextension=f".{ext}",
-                    initialfile=default_name,
-                    filetypes=[(f"{label} 文件", f"*.{ext}")],
+                import subprocess, tempfile, os as _os
+                try:
+                    import ctypes
+                    ctypes.windll.user32.AllowSetForegroundWindow(-1)
+                except Exception:
+                    pass
+                _label = label.replace("'", "''")
+                _defname = default_name.replace("'", "''")
+                script = (
+                    'Add-Type -AssemblyName System.Windows.Forms\n'
+                    'Add-Type -TypeDefinition @"\n'
+                    'using System; using System.Runtime.InteropServices;\n'
+                    'public class FH{\n'
+                    '  [DllImport("user32.dll")]public static extern void keybd_event(byte a,byte b,uint c,UIntPtr d);\n'
+                    '  [DllImport("user32.dll")]public static extern bool SetForegroundWindow(IntPtr h);\n'
+                    '}\n'
+                    '"@ -ErrorAction SilentlyContinue\n'
+                    '[FH]::keybd_event(0x12,0,0,[UIntPtr]::Zero)\n'
+                    '[FH]::keybd_event(0x12,0,2,[UIntPtr]::Zero)\n'
+                    '$owner=New-Object System.Windows.Forms.Form\n'
+                    '$owner.Size=New-Object System.Drawing.Size(0,0)\n'
+                    "$owner.StartPosition='Manual'\n"
+                    '$owner.Location=New-Object System.Drawing.Point(-32000,-32000)\n'
+                    "$owner.FormBorderStyle='None'\n"
+                    '$owner.ShowInTaskbar=$false\n'
+                    '$owner.TopMost=$true\n'
+                    '$owner.Show()\n'
+                    '[FH]::SetForegroundWindow($owner.Handle)\n'
+                    '[System.Windows.Forms.Application]::DoEvents()\n'
+                    '$f=New-Object System.Windows.Forms.SaveFileDialog\n'
+                    f"$f.Title='导出为 {_label}'\n"
+                    f"$f.DefaultExt='.{ext}'\n"
+                    f"$f.FileName='{_defname}'\n"
+                    f"$f.Filter='{_label} 文件 (*.{ext})|*.{ext}'\n"
+                    "if($f.ShowDialog($owner) -eq 'OK'){Write-Output $f.FileName}\n"
+                    '$owner.Close();$owner.Dispose()\n'
+                    ''
                 )
-                root.destroy()
-                if selected:
-                    result["path"] = selected
-            except Exception:
-                pass
+                tmp = tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".ps1", delete=False, encoding="utf-8-sig"
+                )
+                tmp.write(script)
+                tmp.close()
+                try:
+                    r = subprocess.run(
+                        ["powershell", "-ExecutionPolicy", "Bypass", "-File", tmp.name],
+                        capture_output=True, text=True, timeout=120,
+                    )
+                    if r.stderr:
+                        print(f"[_bg_dialog] ps stderr: {r.stderr[:200]}", flush=True)
+                    selected = r.stdout.strip()
+                    if selected:
+                        result["path"] = selected
+                finally:
+                    try:
+                        _os.unlink(tmp.name)
+                    except OSError:
+                        pass
+            except Exception as ex:
+                print(f"[_bg_dialog] error: {ex}", flush=True)
             result["done"] = True
 
         import threading as _th
@@ -3381,8 +4115,8 @@ def build_results_page():
                         tooltip="课题操作",
                         items=[
                             ft.PopupMenuItem(
-                                content=ft.Text("重命名课题", size=13),
-                                on_click=on_rename_project,
+                                content=ft.Text("编辑课题", size=13),
+                                on_click=on_edit_project,
                             ),
                             ft.PopupMenuItem(
                                 content=ft.Text("删除课题", size=13),
@@ -3643,6 +4377,7 @@ def build_settings_page():
 def main(page: ft.Page):
     global _page, top_nav_ref
     global container_project, container_results, container_settings
+    global _agent_panel_ref, _agent_msg_list, _agent_input
 
     _page = page
     page.title = "PaperPilot"
@@ -3710,6 +4445,9 @@ def main(page: ft.Page):
     _agent_msg_list = ft.ListView(expand=True, spacing=6, padding=ft.padding.Padding(top=4, bottom=4))
 
     def _on_agent_send(e):
+        if _thinking_active:
+            send_agent_message("AI 正在思考中，请稍候...", role="system")
+            return
         text = _agent_input.value.strip()
         if not text:
             return
@@ -3720,6 +4458,83 @@ def main(page: ft.Page):
 
     _agent_input.on_submit = _on_agent_send
 
+    def _send_preset_prompt(prompt: str):
+        """发送预设课题讨论 prompt，开启深度思考。"""
+        send_agent_message(prompt, role="user")
+        _agent_input.value = ""
+        _agent_input.update()
+        _trigger_agent_chat(prompt, thinking_enabled=True)
+
+    def _send_project_refine(e=None):
+        """发送 AI 辅助完善课题 prompt。"""
+        if not _agent_project_id:
+            send_agent_message("请先在文献库中选择一个课题。", role="system")
+            return
+        prompt = (
+            f"你是一个课题设计顾问。请帮助我完善当前研究课题的设计。\n\n"
+            f"**当前课题信息：**\n"
+            f"- 名称：{_agent_project_name or '未设置'}\n"
+            f"- 描述：{_agent_topic_desc or '未设置'}\n\n"
+            f"请先分析当前课题名称和描述存在的问题，然后与我讨论如何改进。"
+            f"重点讨论方向：\n"
+            f"1. 课题名称是否准确、简洁、有学术辨识度？\n"
+            f"2. 课题描述是否清晰界定了研究范围和核心问题？\n"
+            f"3. 文献库中的论文覆盖了哪些子方向？描述是否与之匹配？\n\n"
+            f"**流程要求：**\n"
+            f"- 先和我讨论，逐步收敛，不要一上来就给最终答案\n"
+            f"- 在我明确表示满意并请你输出最终方案时，用以下格式在回复末尾给出修改结果：\n"
+            f"[PROJECT_UPDATE]\n"
+            f'{{"name": "新课题名称", "description": "新课题描述"}}\n'
+            f"[/PROJECT_UPDATE]\n"
+            f"- 如果无需修改，直接告知我即可，不要输出上述标记"
+        )
+        send_agent_message("帮我完善课题设计", role="user")
+        _agent_input.value = ""
+        _agent_input.update()
+        _trigger_agent_chat(prompt, thinking_enabled=True,
+                           display_message="帮我完善课题设计")
+
+    _preset_menu = ft.PopupMenuButton(
+        icon=ft.Icons.AUTO_AWESOME,
+        tooltip="课题讨论",
+        items=[
+            ft.PopupMenuItem(
+                content=ft.Text("梳理研究现状"),
+                on_click=lambda e: _send_preset_prompt(
+                    "请基于文献库中的所有论文，梳理当前课题的研究现状：\n"
+                    "1. 该领域要解决的核心问题是什么？\n"
+                    "2. 主流方法可以分为哪几类？各自的演进脉络如何？\n"
+                    "3. 有哪些关键的突破性成果？\n"
+                    "4. 不同研究组/流派之间是否存在观点分歧？"
+                ),
+            ),
+            ft.PopupMenuItem(
+                content=ft.Text("发现研究空白"),
+                on_click=lambda e: _send_preset_prompt(
+                    "请基于文献库分析当前课题的研究空白和机会：\n"
+                    "1. 现有方法在哪些场景下表现不佳或未覆盖？\n"
+                    "2. 哪些关键问题被普遍忽视？\n"
+                    "3. 跨领域的方法或思路是否可以引入？\n"
+                    "4. 有哪些低垂果实值得优先尝试？"
+                ),
+            ),
+            ft.PopupMenuItem(
+                content=ft.Text("建议技术路线"),
+                on_click=lambda e: _send_preset_prompt(
+                    "请基于文献库中的研究进展，为我建议可行的技术路线：\n"
+                    "1. 如果我要在这个课题上发一篇顶会/顶刊，最值得做的方向是什么？\n"
+                    "2. 需要哪些基础模块和数据资源？\n"
+                    "3. 可能的技术难点和应对策略？\n"
+                    "4. 建议的实验验证方案"
+                ),
+            ),
+            ft.PopupMenuItem(
+                content=ft.Text("AI 辅助完善课题"),
+                on_click=_send_project_refine,
+            ),
+        ],
+    )
+
     agent_panel = ft.Container(
         content=ft.Column([
             ft.Row([
@@ -3729,13 +4544,26 @@ def main(page: ft.Page):
             _agent_msg_list,
             ft.Divider(height=1),
             ft.Row([
+                _preset_menu,
                 _agent_input,
                 ft.IconButton(icon=ft.Icons.SEND, on_click=_on_agent_send, icon_size=20),
             ], spacing=6),
         ], spacing=4),
-        expand=1,
+        width=_agent_panel_width,
         padding=ft.padding.Padding(left=8, top=12, right=8, bottom=12),
         border=ft.Border(left=ft.BorderSide(1, ft.Colors.OUTLINE_VARIANT)),
+    )
+    _agent_panel_ref = agent_panel
+
+    resize_handle = ft.GestureDetector(
+        content=ft.Container(
+            width=8,
+            bgcolor=ft.Colors.OUTLINE_VARIANT,
+            border_radius=4,
+        ),
+        mouse_cursor=ft.MouseCursor.RESIZE_LEFT_RIGHT,
+        on_horizontal_drag_update=_on_agent_resize_update,
+        on_horizontal_drag_end=_on_agent_resize_end,
     )
 
     page.add(
@@ -3746,7 +4574,8 @@ def main(page: ft.Page):
                     container_project,
                     container_results,
                     container_settings,
-                ], expand=3),
+                ], expand=True),
+                resize_handle,
                 agent_panel,
             ], expand=True),
         ], expand=True),
