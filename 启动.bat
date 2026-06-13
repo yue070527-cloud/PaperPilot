@@ -4,18 +4,17 @@ chcp 65001 >nul 2>&1
 title PaperPilot
 
 echo.
-echo   ╔══════════════════════════════════════╗
-echo   ║   PaperPilot 智能文献工作流系统      ║
-echo   ╚══════════════════════════════════════╝
+echo   ==========================================
+echo        PaperPilot - Smart Literature Tool
+echo   ==========================================
 echo.
 
-REM ── 检测 Python ──
+REM -- Check Python --
 where python >nul 2>&1
 if %errorlevel% neq 0 (
-    echo   [!] 未检测到 Python
-    echo       请安装 Python 3.10 或以上版本
-    echo       下载地址: https://python.org
-    echo       安装时请勾选 "Add Python to PATH"
+    echo   [ERROR] Python not found.
+    echo   Please install Python 3.10+ from https://python.org
+    echo   Make sure to check "Add Python to PATH"
     echo.
     pause
     exit /b 1
@@ -24,31 +23,42 @@ if %errorlevel% neq 0 (
 for /f "tokens=2" %%v in ('python --version 2^>^&1') do set PYVER=%%v
 echo   [OK] Python %PYVER%
 
-REM ── 安装依赖 ──
-echo   [..] 正在安装依赖...
+REM -- Install dependencies --
+echo   [..] Installing dependencies...
 echo.
 python -m pip install -r requirements.txt --disable-pip-version-check
 if %errorlevel% neq 0 (
     echo.
-    echo   [!] 安装失败，请检查网络连接后重试
+    echo   [ERROR] Install failed. Check your network and retry.
     pause
     exit /b 1
 )
 echo.
-echo   [OK] 依赖就绪
+echo   [OK] Dependencies ready
 
-REM ── 生成配置文件 ──
+REM -- Generate config --
 if not exist config.yaml (
     copy config.example.yaml config.yaml >nul
-    echo   [OK] 已生成 config.yaml
+    echo   [OK] config.yaml created
 )
 
-REM ── 启动 ──
-echo   [OK] 正在启动 PaperPilot...
+REM -- Desktop shortcut --
+if exist .shortcut_created goto :skip_shortcut
+echo.
+set /p CREATESC="  [?] Create desktop shortcut? (Y/N): "
+if /i not "%CREATESC%"=="Y" goto :mark_shortcut
+powershell -Command "$ws=New-Object -ComObject WScript.Shell;$s=$ws.CreateShortcut([Environment]::GetFolderPath('Desktop')+'\PaperPilot.lnk');$s.TargetPath=(Get-Command python).Source;$s.Arguments='app.py';$s.WorkingDirectory='%~dp0';$s.Description='PaperPilot Smart Literature Tool';$s.Save()" >nul 2>&1
+echo   [OK] Desktop shortcut created
+:mark_shortcut
+echo.>.shortcut_created
+:skip_shortcut
+
+REM -- Launch --
+echo   [OK] Starting PaperPilot...
 echo.
 python app.py
 if %errorlevel% neq 0 (
     echo.
-    echo   [!] 程序异常退出
+    echo   [ERROR] Program exited abnormally
     pause
 )

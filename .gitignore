@@ -42,6 +42,7 @@ paper-scraper-main/
 
 # Local config
 .env
+.shortcut_created
 .env.local
 config.yaml
 
