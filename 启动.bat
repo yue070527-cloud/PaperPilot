@@ -1,4 +1,5 @@
 @echo off
+cd /d "%~dp0"
 chcp 65001 >nul 2>&1
 title PaperPilot
 
@@ -24,18 +25,16 @@ for /f "tokens=2" %%v in ('python --version 2^>^&1') do set PYVER=%%v
 echo   [OK] Python %PYVER%
 
 REM ── 安装依赖 ──
-echo   [..] 正在检查依赖...
-python -m pip install -r requirements.txt -q --disable-pip-version-check 2>nul
+echo   [..] 正在安装依赖...
+echo.
+python -m pip install -r requirements.txt --disable-pip-version-check
 if %errorlevel% neq 0 (
-    echo   [!] 依赖安装失败，正在重试...
-    python -m pip install -r requirements.txt --disable-pip-version-check
-    if %errorlevel% neq 0 (
-        echo.
-        echo   [!] 安装失败，请检查网络连接后重试
-        pause
-        exit /b 1
-    )
+    echo.
+    echo   [!] 安装失败，请检查网络连接后重试
+    pause
+    exit /b 1
 )
+echo.
 echo   [OK] 依赖就绪
 
 REM ── 生成配置文件 ──
