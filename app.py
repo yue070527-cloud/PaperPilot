@@ -1644,7 +1644,12 @@ def build_project_page():
 
     def on_save_to_library(e):
         """弹出对话框，选择课题保存检索结果。有选中时保存选中，否则保存全部。"""
-        projects = library.get_all_projects()
+        print("[save_to_library] clicked!", flush=True)
+        try:
+            projects = library.get_all_projects()
+        except Exception as ex:
+            print(f"[save_to_library] ERROR: {type(ex).__name__}: {ex}", flush=True)
+            return
         project_options = [ft.dropdown.Option(str(p.id), p.name) for p in projects]
         project_dd = ft.Dropdown(
             options=project_options,
@@ -2235,7 +2240,7 @@ def show_paper_detail(paper: dict):
                     '$owner.ShowInTaskbar=$false\n'
                     '$owner.TopMost=$true\n'
                     '$owner.Show()\n'
-                    '[FH]::SetForegroundWindow($owner.Handle)\n'
+                    '[void][FH]::SetForegroundWindow($owner.Handle)\n'
                     '[System.Windows.Forms.Application]::DoEvents()\n'
                     '$f=New-Object System.Windows.Forms.OpenFileDialog\n'
                     "$f.Filter='PDF Files (*.pdf)|*.pdf'\n"
@@ -3225,7 +3230,7 @@ def build_results_page():
             '$owner.ShowInTaskbar=$false\n'
             '$owner.TopMost=$true\n'
             '$owner.Show()\n'
-            '[FH]::SetForegroundWindow($owner.Handle)\n'
+            '[void][FH]::SetForegroundWindow($owner.Handle)\n'
             '[System.Windows.Forms.Application]::DoEvents()\n'
         )
         script = script.replace(
@@ -3988,7 +3993,7 @@ def build_results_page():
                     '$owner.ShowInTaskbar=$false\n'
                     '$owner.TopMost=$true\n'
                     '$owner.Show()\n'
-                    '[FH]::SetForegroundWindow($owner.Handle)\n'
+                    '[void][FH]::SetForegroundWindow($owner.Handle)\n'
                     '[System.Windows.Forms.Application]::DoEvents()\n'
                     '$f=New-Object System.Windows.Forms.SaveFileDialog\n'
                     f"$f.Title='导出为 {_label}'\n"
