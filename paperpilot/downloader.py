@@ -102,8 +102,8 @@ def _direct_download(paper: dict) -> bytes | None:
             kwargs["impersonate"] = impersonate
         return _http.get(url, **kwargs)
 
-    doi = paper.get("doi", "")
-    url = paper.get("url", "")
+    doi = paper.get("doi") or ""
+    url = paper.get("url") or ""
 
     headers = {
         "User-Agent": UA,
@@ -186,8 +186,8 @@ def _direct_download(paper: dict) -> bytes | None:
 
 def _guess_pdf_url(paper: dict) -> str | None:
     """根据 DOI/URL 构造常见出版商 PDF 直链。"""
-    doi = paper.get("doi", "")
-    url = (paper.get("url", "") or "").lower()
+    doi = paper.get("doi") or ""
+    url = (paper.get("url") or "").lower()
 
     if "10.1021/" in doi or "pubs.acs.org" in url:
         return f"https://pubs.acs.org/doi/pdf/{doi}"
@@ -239,7 +239,7 @@ def cache_pdf(
         PDF 文件路径, 或 None
     """
     target = Path(cache_dir) if cache_dir else DEFAULT_CACHE_DIR
-    doi = paper.get("doi", "")
+    doi = paper.get("doi") or ""
     if doi:
         safe = doi.replace("/", "_").replace("\\", "_")
         filename = f"{safe}.pdf"
