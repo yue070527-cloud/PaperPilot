@@ -1726,8 +1726,8 @@ def build_project_page():
                 papers_to_import = sel_papers
                 _search_selected_ids.clear()
             else:
-                n, _ = library.save_papers_to_project(pid, state.papers, state.scores)
                 papers_to_import = [s[0] for s in state.scores]
+                n, _ = library.save_papers_to_project(pid, papers_to_import, state.scores)
 
             # ── PDF 导入 + DB 更新（DOI 优先，标题回退）──
             def _update_db_pdf(paper: dict, pdf_path: str) -> bool:
@@ -4197,7 +4197,7 @@ arxiv_switch = ft.Switch(label="arXiv", value=True)
 arxiv_switch.on_change = lambda e: _save_setting("data_sources.arxiv", e.control.value)
 openalex_switch = ft.Switch(label="OpenAlex", value=True)
 openalex_switch.on_change = lambda e: _save_setting("data_sources.openalex", e.control.value)
-max_results_slider = ft.Slider(min=100, max=500, value=100, divisions=40,
+max_results_slider = ft.Slider(min=100, max=500, value=250, divisions=40,
                                 label="{value} 篇")
 max_results_slider.on_change = lambda e: _on_slider_saved(e, "search.max_results")
 top_k_slider = ft.Slider(min=10, max=200, value=50, divisions=19,
