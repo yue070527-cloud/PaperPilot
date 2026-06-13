@@ -2006,6 +2006,8 @@ def build_project_page():
                 progress_bar.update()
                 search_btn.update()
                 status_text.update()
+                if _page:
+                    _page.update()
 
         _page.run_task(_poll)
 
