@@ -293,7 +293,7 @@ def _make_bubble(text: str, role: str = "user") -> ft.Container:
 
 def send_agent_message(text: str, role: str = "user"):
     """向 Agent 对话面板发送一条消息。"""
-    global _agent_msg_list
+    global _agent_msg_list, _page
     if _agent_msg_list is None:
         return
     bubble = _make_bubble(text, role)
@@ -304,6 +304,12 @@ def send_agent_message(text: str, role: str = "user"):
         _agent_msg_list.update()
     except RuntimeError:
         pass
+    if _page:
+        try:
+            _page.update()
+        except RuntimeError:
+            pass
+    _scroll_agent_to_bottom()
 
 
 def _show_thinking_bubble():
